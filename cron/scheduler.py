@@ -3719,6 +3719,20 @@ def run_job(
 {logged_response}
 """
         
+        # A failed pre-run script means the job never did its work, even though
+        # the agent ran and described the failure. Record the run as FAILED so
+        # execution history reflects reality instead of showing green; the
+        # caller's failure path also guarantees delivery, so the operator is
+        # told rather than the failure passing silently.
+        if prerun_script is not None and not prerun_script[0]:
+            _script_err = (prerun_script[1] or "").strip()
+            _first_line = _script_err.splitlines()[0] if _script_err else "pre-run script failed"
+            logger.warning(
+                "Job '%s': agent ran but the pre-run script failed - marking run failed: %s",
+                job_name, _first_line,
+            )
+            return False, output, final_response, f"pre-run script failed: {_first_line}"
+
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
         
