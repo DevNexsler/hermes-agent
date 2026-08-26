@@ -31,7 +31,7 @@ try:
     import msvcrt
 except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
@@ -735,6 +735,48 @@ def _recoverable_oneshot_run_at(
     return None
 
 
+def _cron_wall_time_candidates(wall_time: datetime, tz: Any) -> List[datetime]:
+    """Return real instants represented by a naive local wall time.
+
+    A spring-forward gap returns no candidates. A fall-back overlap returns two,
+    ordered by absolute time. Ordinary wall times return one.
+    """
+    naive = wall_time.replace(tzinfo=None)
+    candidates: List[datetime] = []
+    seen: Set[float] = set()
+    for fold in (0, 1):
+        candidate = naive.replace(tzinfo=tz, fold=fold)
+        round_trip = candidate.astimezone(timezone.utc).astimezone(tz)
+        if round_trip.replace(tzinfo=None) != naive or round_trip.fold != fold:
+            continue
+        instant = candidate.timestamp()
+        if instant not in seen:
+            seen.add(instant)
+            candidates.append(candidate)
+    return sorted(candidates, key=lambda value: value.timestamp())
+
+
+def _next_cron_run(expr: str, base_time: datetime) -> Optional[datetime]:
+    """Compute cron's next configured-local wall time without DST offset drift."""
+    tz = _hermes_now().tzinfo
+    base = _ensure_aware(base_time).astimezone(tz)
+    iterator = croniter(expr, base.replace(tzinfo=None))
+    # A valid cron expression can repeatedly name a nonexistent local time
+    # (for example 02:30 on spring-transition Sundays). Advance through those
+    # wall-clock matches until one maps to a real instant.
+    for _ in range(10000):
+        wall_time = iterator.get_next(datetime).replace(tzinfo=None)
+        future = [
+            candidate
+            for candidate in _cron_wall_time_candidates(wall_time, tz)
+            if candidate.timestamp() > base.timestamp()
+        ]
+        if future:
+            return future[0]
+    logger.error("Could not resolve a real local instant for cron schedule %r", expr)
+    return None
+
+
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
@@ -757,9 +799,10 @@ def _compute_grace_seconds(schedule: dict) -> int:
         if expr:
             try:
                 now = _hermes_now()
-                cron = croniter(expr, now)
-                first = cron.get_next(datetime)
-                second = cron.get_next(datetime)
+                first = _next_cron_run(expr, now)
+                second = _next_cron_run(expr, first) if first is not None else None
+                if first is None or second is None:
+                    raise ValueError("cron schedule has no resolvable next run")
                 period_seconds = int((second - first).total_seconds())
                 grace = period_seconds // 2
                 return max(MIN_GRACE, min(grace, MAX_GRACE))
@@ -824,9 +867,8 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
             except Exception:
                 base_time = now
-        cron = croniter(expr, base_time)
-        next_run = cron.get_next(datetime)
-        return next_run.isoformat()
+        next_run = _next_cron_run(expr, base_time)
+        return next_run.isoformat() if next_run is not None else None
 
     return None
 
