@@ -2432,6 +2432,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if runtime_model:
             model = runtime_model
 
+        # OpenAI-compatible callers may need a smaller output ceiling for a
+        # bounded packet. Keep this request-scoped; never mutate gateway-wide
+        # model configuration. The cap prevents input + configured 65k output
+        # budget from exceeding a provider context window.
+        request_max_tokens = model_options.get("max_tokens") if isinstance(model_options, dict) else None
+        if isinstance(request_max_tokens, int) and 256 <= request_max_tokens <= 8192:
+            runtime_kwargs["max_tokens"] = request_max_tokens
+
         request_reasoning_config = _request_reasoning_config(model_options)
         if request_reasoning_config is not None:
             reasoning_config = request_reasoning_config
