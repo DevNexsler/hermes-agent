@@ -428,10 +428,19 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
+    #
+    # HERMES_HOME is also excluded: the snapshot is shared by every turn in the
+    # process (the top-level agent keys its terminal env as ``"default"``), and
+    # it is sourced before each command, so a captured ``declare -x
+    # HERMES_HOME=…`` overrides the per-turn value ``_make_run_env`` injects
+    # from the profile-scope contextvar. Under ``gateway.multiplex_profiles``
+    # that pinned every profile's shell — including the default profile — to
+    # whichever profile first used the terminal (observed 2026-09-16). Leaving
+    # it out lets the Popen env win, which is the per-turn profile home.
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
+        "HERMES_UI_SESSION_ID HERMES_HOME 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
