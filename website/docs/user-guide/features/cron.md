@@ -460,6 +460,21 @@ cron:
 
 Or set the `HERMES_CRON_SCRIPT_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 3600s default.
 
+## Agent run limits
+
+Skill / LLM-driven jobs have two independent limits:
+
+- **Inactivity** — `HERMES_CRON_TIMEOUT` (default 600s). Trips only when the agent produces no tool call, API call, or stream token for that long.
+- **Max runtime** — a hard wall-clock cap (default 7200s, 2 hours). Trips regardless of activity. This is what ends a job that keeps retrying a failing provider forever, which the inactivity limit cannot see. Because an agent run holds the scheduler's workdir lock for its whole duration, one unbounded run can stall every later workdir job, so leave the cap on.
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  max_runtime_seconds: 7200   # 2 hours; 0 = unlimited
+```
+
+Or set the `HERMES_CRON_MAX_RUNTIME` environment variable. Resolution order: env var → config.yaml → 7200s default. A capped run is recorded as failed with reason `exceeded max runtime`.
+
 ## No-agent mode (script-only jobs)
 
 For recurring jobs that don't need LLM reasoning — classic watchdogs, disk/memory alerts, heartbeats, CI pings — pass `no_agent=True` at creation time. The scheduler runs your script on schedule and delivers its stdout directly, skipping the agent entirely:

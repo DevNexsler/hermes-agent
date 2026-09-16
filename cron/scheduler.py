@@ -115,6 +115,13 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
+    if "exceeded max runtime" in lower:
+        return (
+            f"⚠️ Cron '{job_name}' failed: exceeded the max runtime cap "
+            "(HERMES_CRON_MAX_RUNTIME / cron.max_runtime_seconds). "
+            "Full details saved in cron output."
+        )
+
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
@@ -2132,6 +2139,54 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+_DEFAULT_CRON_MAX_RUNTIME = 7200  # seconds (2 hours) wall-clock cap per agent cron run
+
+
+def _resolve_cron_max_runtime_seconds() -> Optional[float]:
+    """Wall-clock cap for one agent cron run, in seconds. None = unlimited.
+
+    Resolution order: ``HERMES_CRON_MAX_RUNTIME`` env var, then
+    ``cron.max_runtime_seconds`` in config.yaml, then the 2-hour default.
+    ``0`` disables the cap.
+
+    This is a hard cap, unlike ``HERMES_CRON_TIMEOUT`` which is an *inactivity*
+    limit. A run that keeps failing provider calls and retrying looks active to
+    the inactivity watchdog forever; the cap is what ends it. It matters because
+    an agent run holds ``_terminal_cwd_lock`` for its whole duration, so one
+    unbounded run can stall every later workdir job behind the writer-preferring
+    lock (2026-09-15 incident: 25-hour Calendar Review run wedged the schedule).
+    """
+    def _parse(raw, source):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; ignoring", source, raw)
+            return "invalid"
+        if value < 0:
+            logger.warning("Invalid %s=%r (negative); ignoring", source, raw)
+            return "invalid"
+        return value
+
+    env_value = os.getenv("HERMES_CRON_MAX_RUNTIME", "").strip()
+    if env_value:
+        parsed = _parse(env_value, "HERMES_CRON_MAX_RUNTIME")
+        if parsed != "invalid":
+            return parsed or None
+
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        configured = cron_cfg.get("max_runtime_seconds")
+        if configured is not None:
+            parsed = _parse(configured, "cron.max_runtime_seconds")
+            if parsed != "invalid":
+                return parsed or None
+    except Exception as exc:
+        logger.debug("Failed to load cron max runtime from config: %s", exc)
+
+    return float(_DEFAULT_CRON_MAX_RUNTIME)
+
+
 def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     cfg_path = venv_dir / "pyvenv.cfg"
     try:
@@ -3568,22 +3623,13 @@ def run_job(
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
+        _max_runtime_timeout = False
+        _cron_max_runtime = _resolve_cron_max_runtime_seconds()
+        _run_started_mono = time.monotonic()
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
+            if _cron_inactivity_limit is None and _cron_max_runtime is None and not _is_oneshot:
+                # Fully unlimited and no run_claim heartbeat needed: block.
+                result = _cron_future.result()
             else:
                 result = None
                 while True:
@@ -3594,6 +3640,14 @@ def run_job(
                         result = _cron_future.result()
                         break
                     _heartbeat_run_claim_if_due()
+                    # Hard wall-clock cap. Checked first: a run that keeps
+                    # retrying failed provider calls never looks idle.
+                    if (_cron_max_runtime is not None
+                            and time.monotonic() - _run_started_mono >= _cron_max_runtime):
+                        _max_runtime_timeout = True
+                        break
+                    if _cron_inactivity_limit is None:
+                        continue
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
                     if hasattr(agent, "get_activity_summary"):
@@ -3610,6 +3664,31 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _max_runtime_timeout:
+            _activity = {}
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    _activity = agent.get_activity_summary()
+                except Exception:
+                    pass
+            _elapsed = time.monotonic() - _run_started_mono
+            logger.error(
+                "Job '%s' exceeded max runtime %.0fs (ran %.0fs) "
+                "| last_activity=%s | iteration=%s/%s | tool=%s",
+                job_name, _cron_max_runtime, _elapsed,
+                _activity.get("last_activity_desc", "unknown"),
+                _activity.get("api_call_count", 0),
+                _activity.get("max_iterations", 0),
+                _activity.get("current_tool") or "none",
+            )
+            if hasattr(agent, "interrupt"):
+                agent.interrupt("Cron job timed out (max runtime)")
+            raise TimeoutError(
+                f"Cron job '{job_name}' exceeded max runtime "
+                f"{int(_cron_max_runtime)}s (ran {int(_elapsed)}s) "
+                f"— last activity: {_activity.get('last_activity_desc', 'unknown')}"
+            )
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
