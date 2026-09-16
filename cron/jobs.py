@@ -2066,6 +2066,67 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         return False
 
 
+def suppress_stale_catchup(max_age_seconds: float, *, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Stop long-overdue jobs from firing as "catch-up" on a store's first tick.
+
+    ``get_due_jobs`` deliberately fires an overdue job ONCE when a ticker picks
+    it up (#33315). That is right for a ticker that was briefly down and wrong
+    for a store that had NO ticker for weeks: when ``gateway.multiplex_profiles``
+    first adopted secondary profiles on 2026-09-16, one-time reminders and a
+    collections follow-up scheduled in July/August fired at once, carrying SMS
+    authorization for customers whose situation had long moved on.
+
+    For every enabled job whose ``next_run_at`` is more than ``max_age_seconds``
+    in the past: a ``once`` job is disabled (never fired), a recurring job gets
+    ``next_run_at`` recomputed from now (it resumes on its next real slot). Each
+    change is recorded on the job under ``stale_catchup`` so an operator can see
+    why. Returns the list of affected jobs (id, name, action).
+    """
+    if max_age_seconds is None or max_age_seconds <= 0:
+        return []
+    current = now or _hermes_now()
+    affected: List[Dict[str, Any]] = []
+    with _jobs_lock():
+        jobs = load_jobs()
+        changed = False
+        for job in jobs:
+            if job.get("enabled") is False:
+                continue
+            raw = job.get("next_run_at")
+            if not isinstance(raw, str):
+                continue
+            try:
+                scheduled = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if scheduled.tzinfo is None:
+                scheduled = scheduled.replace(tzinfo=current.tzinfo)
+            overdue = (current - scheduled).total_seconds()
+            if overdue <= max_age_seconds:
+                continue
+            schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+            if schedule.get("kind") == "once":
+                job["enabled"] = False
+                action = "disabled"
+            else:
+                new_next = compute_next_run(schedule, current.isoformat())
+                if not new_next:
+                    continue
+                job["next_run_at"] = new_next
+                action = "advanced"
+            job["stale_catchup"] = {
+                "at": current.isoformat(),
+                "was_due_at": raw,
+                "overdue_seconds": int(overdue),
+                "action": action,
+            }
+            changed = True
+            affected.append({"id": job.get("id"), "name": job.get("name"), "action": action, "was_due_at": raw})
+        if changed:
+            _save_jobs_unlocked(jobs)
+    return affected
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 

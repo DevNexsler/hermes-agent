@@ -159,6 +159,31 @@ def resolve_cron_scheduler() -> "CronScheduler":
         return InProcessCronScheduler()
 
 
+
+def _resolve_multiplex_stale_catchup_seconds() -> float:
+    """Age past which an overdue job in a newly adopted profile store is NOT
+    fired as catch-up. Resolution: ``HERMES_CRON_MULTIPLEX_STALE_CATCHUP`` env,
+    then ``cron.multiplex_stale_catchup_seconds`` in config.yaml, then 24 h.
+    ``0`` disables the guard (legacy fire-once-on-catch-up for every profile)."""
+    import os
+
+    raw = os.getenv("HERMES_CRON_MULTIPLEX_STALE_CATCHUP", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        value = (cfg.get("cron") or {}).get("multiplex_stale_catchup_seconds")
+        if value is not None:
+            return max(0.0, float(value))
+    except Exception:
+        pass
+    return 86400.0
+
 class InProcessCronScheduler(CronScheduler):
     """Default provider: the historical in-process 60s ticker.
 
@@ -281,6 +306,7 @@ class InProcessCronScheduler(CronScheduler):
         import logging
         from cron.scheduler import tick as cron_tick
         from cron.jobs import (
+            suppress_stale_catchup,
             clear_ticker_error,
             record_ticker_error,
             record_ticker_heartbeat,
@@ -295,12 +321,27 @@ class InProcessCronScheduler(CronScheduler):
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
 
+        stale_after = _resolve_multiplex_stale_catchup_seconds()
+
         # Recovery + initial heartbeat for every profile.
         for entry in profile_homes:
+            name = entry[0] if isinstance(entry, tuple) else None
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
+                    # A secondary profile's store may never have had a ticker
+                    # (before multiplexing it was silently ignored). Do not
+                    # "catch up" jobs that are weeks overdue on first adoption;
+                    # the default profile keeps the normal fire-once-on-catch-up.
+                    if name not in (None, "default") and stale_after > 0:
+                        for job in suppress_stale_catchup(stale_after):
+                            logger.warning(
+                                "Cron job %s (%s) for profile %s was due %s and is %s "
+                                "instead of firing as stale catch-up",
+                                job.get("id"), job.get("name"), name,
+                                job.get("was_due_at"), job.get("action"),
+                            )
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(

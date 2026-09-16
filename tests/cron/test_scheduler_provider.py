@@ -414,3 +414,36 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+
+
+def test_multiplex_start_guards_stale_catchup_on_secondary_profiles_only(tmp_path, monkeypatch):
+    """On multiplex start the guard runs once per SECONDARY profile store; the
+    default profile keeps the legacy fire-once-on-catch-up behaviour."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "home-ops"
+    for d in (p1, p2):
+        (d / "cron").mkdir(parents=True)
+    profile_homes = [("default", p1), ("home-ops", p2)]
+    guarded: list = []
+
+    def _fake_suppress(max_age):
+        from cron.jobs import _current_cron_store
+        guarded.append((str(_current_cron_store().jobs_file.parent.parent), max_age))
+        return [{"id": "j1", "name": "stale", "action": "disabled", "was_due_at": "2026-08-08T09:00:00"}]
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=lambda *a, **k: 0), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None), \
+         patch("cron.jobs.suppress_stale_catchup", side_effect=_fake_suppress), \
+         patch("cron.scheduler_provider._resolve_multiplex_stale_catchup_seconds", lambda: 86400.0):
+        t = threading.Thread(target=prov.start, args=(stop,), kwargs={"interval": 0, "profile_homes": profile_homes}, daemon=True)
+        t.start()
+        assert _wait_until(lambda: len(guarded) >= 1)
+        stop.set()
+        t.join(timeout=5)
+
+    assert [g[0] for g in guarded] == [str(p2.resolve())]
+    assert guarded[0][1] == 86400.0

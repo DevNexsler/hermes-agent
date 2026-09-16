@@ -1069,3 +1069,47 @@ class TestJobsJsonUtf8Bom:
         assert [j["id"] for j in loaded] == ["plainjob01"]
 
 
+
+
+class TestSuppressStaleCatchup:
+    """A store that had no ticker for weeks must not fire its overdue jobs as
+    catch-up when a multiplexer first adopts it (2026-09-16 incident)."""
+
+    def _job(self, job_id, *, kind, due, enabled=True):
+        schedule = {"kind": "once", "at": due.isoformat()} if kind == "once" else {"kind": "cron", "expr": "0 7 * * *"}
+        return {
+            "id": job_id, "name": job_id, "schedule": schedule, "prompt": "x",
+            "enabled": enabled, "next_run_at": due.isoformat(), "created_at": due.isoformat(),
+            "deliver": "local",
+        }
+
+    def test_stale_once_is_disabled_and_stale_recurring_is_advanced(self, tmp_cron_dir):
+        from cron.jobs import load_jobs, save_jobs, suppress_stale_catchup
+
+        now = datetime.now(timezone.utc)
+        save_jobs([
+            self._job("old-once", kind="once", due=now - timedelta(days=30)),
+            self._job("old-cron", kind="cron", due=now - timedelta(days=9)),
+            self._job("fresh-once", kind="once", due=now - timedelta(hours=2)),
+            self._job("already-off", kind="once", due=now - timedelta(days=30), enabled=False),
+        ])
+
+        affected = suppress_stale_catchup(24 * 3600, now=now)
+
+        by_id = {j["id"]: j for j in load_jobs()}
+        assert {(a["id"], a["action"]) for a in affected} == {("old-once", "disabled"), ("old-cron", "advanced")}
+        assert by_id["old-once"]["enabled"] is False
+        assert by_id["old-once"]["stale_catchup"]["action"] == "disabled"
+        assert datetime.fromisoformat(by_id["old-cron"]["next_run_at"]) > now
+        assert by_id["old-cron"]["enabled"] is True
+        # A job within the window keeps the normal fire-once catch-up.
+        assert by_id["fresh-once"]["enabled"] is True and "stale_catchup" not in by_id["fresh-once"]
+        assert "stale_catchup" not in by_id["already-off"]
+
+    def test_zero_threshold_is_a_no_op(self, tmp_cron_dir):
+        from cron.jobs import load_jobs, save_jobs, suppress_stale_catchup
+
+        now = datetime.now(timezone.utc)
+        save_jobs([self._job("old-once", kind="once", due=now - timedelta(days=30))])
+        assert suppress_stale_catchup(0, now=now) == []
+        assert load_jobs()[0]["enabled"] is True
