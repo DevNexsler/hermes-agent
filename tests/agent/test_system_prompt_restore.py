@@ -36,6 +36,10 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    # Likewise the SOUL.md drift check would load the test HERMES_HOME's
+    # SOUL.md, which these hand-written stored prompts never contain.
+    agent.load_soul_identity = False
+    agent.skip_context_files = True
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -381,3 +385,40 @@ class TestReconstructStaticPrefixMemoization:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestSoulDriftOnRestore:
+    """A continuing session picks up a SOUL.md edit on its next turn."""
+
+    def _soul_agent(self, db):
+        agent = _make_agent(session_db=db, prebuilt_prompt="# Persona\nNew policy.\n\nModel: test-model")
+        agent.load_soul_identity = True
+        agent.context_compressor = None
+        return agent
+
+    def test_edited_soul_rebuilds_the_stored_prompt(self):
+        from unittest.mock import patch
+
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": "# Persona\nOld policy.\n\nModel: test-model"}
+        agent = self._soul_agent(db)
+
+        with patch("run_agent.load_soul_md", return_value="# Persona\nNew policy."):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == "# Persona\nNew policy.\n\nModel: test-model"
+        agent._build_system_prompt.assert_called_once()
+
+    def test_unchanged_soul_reuses_the_stored_prompt(self):
+        from unittest.mock import patch
+
+        stored = "# Persona\nSame policy.\n\nModel: test-model"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = self._soul_agent(db)
+
+        with patch("run_agent.load_soul_md", return_value="# Persona\nSame policy."):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
