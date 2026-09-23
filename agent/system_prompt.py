@@ -70,6 +70,31 @@ def _ra():
     return run_agent
 
 
+def _context_length_for(agent: Any) -> Optional[int]:
+    """The model context window used to cap embedded context files, or None."""
+    _cc = getattr(agent, "context_compressor", None)
+    if _cc is not None:
+        _cc_len = getattr(_cc, "context_length", None)
+        if isinstance(_cc_len, int) and _cc_len > 0:
+            return _cc_len
+    return None
+
+
+def _loads_soul_identity(agent: Any) -> bool:
+    return bool(agent.load_soul_identity or not agent.skip_context_files)
+
+
+def current_soul_identity(agent: Any) -> Optional[str]:
+    """SOUL.md exactly as :func:`build_system_prompt_parts` would embed it now.
+
+    Returns None when this agent does not load SOUL.md or the file is absent.
+    Used to detect a stored session prompt built from an older SOUL.md.
+    """
+    if not _loads_soul_identity(agent):
+        return None
+    return _ra().load_soul_md(_context_length_for(agent))
+
+
 def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> str:
     """Apply a per-platform prompt-hint override to the default hint.
 
@@ -176,12 +201,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
     # None falls back to the historical flat default. This value is stable for
     # the life of the conversation, so it does not threaten prompt caching.
-    _ctx_len: Optional[int] = None
-    _cc = getattr(agent, "context_compressor", None)
-    if _cc is not None:
-        _cc_len = getattr(_cc, "context_length", None)
-        if isinstance(_cc_len, int) and _cc_len > 0:
-            _ctx_len = _cc_len
+    _ctx_len = _context_length_for(agent)
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
@@ -190,7 +210,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
-    if agent.load_soul_identity or not agent.skip_context_files:
+    if _loads_soul_identity(agent):
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
@@ -665,6 +685,7 @@ def format_tools_for_system_message(agent: Any) -> str:
 
 __all__ = [
     "build_system_prompt_parts",
+    "current_soul_identity",
     "build_system_prompt",
     "invalidate_system_prompt",
     "format_tools_for_system_message",

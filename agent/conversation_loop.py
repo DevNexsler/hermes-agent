@@ -629,6 +629,21 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
 
+    # Detect identity drift: SOUL.md is the profile's standing policy, so a
+    # stored prompt built from an older SOUL.md must not outlive the edit.
+    # Without this, a long-lived gateway chat (and every retried wake routed
+    # back to it) keeps running the old policy indefinitely. Costs one prefix
+    # cache miss per SOUL.md edit; an unchanged file still matches verbatim.
+    try:
+        from agent.system_prompt import current_soul_identity
+
+        current_soul = current_soul_identity(agent)
+    except Exception:
+        logger.debug("SOUL.md drift check failed; keeping stored prompt", exc_info=True)
+        current_soul = None
+    if current_soul and current_soul not in prompt:
+        return False
+
     return True
 
 

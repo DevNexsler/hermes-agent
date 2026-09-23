@@ -496,6 +496,52 @@ class TestStoredPromptCwdDrift:
 
 
 
+    def _soul_agent(self):
+        agent = self._make_agent()
+        agent.load_soul_identity = True
+        agent.skip_context_files = True
+        agent.context_compressor = None
+        return agent
+
+    def test_stored_prompt_stale_when_soul_md_changed(self):
+        """A SOUL.md edit must reach continuing sessions, not only new ones.
+
+        Gateway chats restore the stored prompt every turn, and a retried wake
+        is routed back to its original chat, so without this check a policy
+        edit never reaches the session that needs it.
+        """
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._soul_agent()
+        stored_prompt = "# Persona\nOld closeout policy.\n\nModel: test/model\nProvider: openrouter\n"
+
+        with patch("run_agent.load_soul_md", return_value="# Persona\nNew closeout policy."):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is False
+
+    def test_stored_prompt_fresh_when_soul_md_unchanged(self):
+        """🔴 CACHE INVARIANT: an unchanged SOUL.md must keep the stored prompt."""
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._soul_agent()
+        soul = "# Persona\nSame policy."
+        stored_prompt = f"{soul}\n\nModel: test/model\nProvider: openrouter\n"
+
+        with patch("run_agent.load_soul_md", return_value=soul):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is True
+
+    def test_soul_drift_check_ignored_when_agent_skips_soul(self):
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._soul_agent()
+        agent.load_soul_identity = False
+        stored_prompt = "Old persona\n\nModel: test/model\nProvider: openrouter\n"
+
+        with patch("run_agent.load_soul_md", return_value="New persona"):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is True
+
     def test_built_prompt_contains_platform_line(self):
         """The built system prompt must carry a Platform: line so drift detection works."""
         import tempfile
