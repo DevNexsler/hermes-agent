@@ -3440,6 +3440,10 @@ class MCPServerTask:
                     return
             finally:
                 self.session = None
+                # An RPC on the retired transport may still hold the old lock
+                # until its outer timeout. Discovery on the next connection
+                # must use a fresh lock or the replacement stays unavailable.
+                self._rpc_lock = asyncio.Lock()
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
@@ -4793,16 +4797,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            # A reconnect can replace the session while an old RPC is still
+            # waiting. Keep each call paired with its own session and lock;
+            # never dispatch an old request into the replacement session.
+            session = server.session
+            rpc_lock = server._rpc_lock
+            async with rpc_lock:
+                if server.session is not session:
+                    raise RuntimeError("MCP session changed before request dispatch")
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
-                server._pending_call_context = contextvars.copy_context()
+                pending_context = contextvars.copy_context()
+                server._pending_call_context = pending_context
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await session.call_tool(tool_name, arguments=args)
                 finally:
-                    server._pending_call_context = None
+                    if server._pending_call_context is pending_context:
+                        server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).
@@ -4949,9 +4962,13 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            session = server.session
+            rpc_lock = server._rpc_lock
+            async with rpc_lock:
+                if server.session is not session:
+                    raise RuntimeError("MCP session changed before request dispatch")
                 all_resources = await _paginate_full_list(
-                    server.session.list_resources, "resources", server_name
+                    session.list_resources, "resources", server_name
                 )
             resources = []
             for r in all_resources:
@@ -5009,8 +5026,12 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
-                result = await server.session.read_resource(uri)
+            session = server.session
+            rpc_lock = server._rpc_lock
+            async with rpc_lock:
+                if server.session is not session:
+                    raise RuntimeError("MCP session changed before request dispatch")
+                result = await session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
             contents = result.contents if hasattr(result, "contents") else []
@@ -5066,9 +5087,13 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
+            session = server.session
+            rpc_lock = server._rpc_lock
+            async with rpc_lock:
+                if server.session is not session:
+                    raise RuntimeError("MCP session changed before request dispatch")
                 all_prompts = await _paginate_full_list(
-                    server.session.list_prompts, "prompts", server_name
+                    session.list_prompts, "prompts", server_name
                 )
             prompts = []
             for p in all_prompts:
@@ -5132,8 +5157,12 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             _mark_server_call_started(server)
-            async with server._rpc_lock:
-                result = await server.session.get_prompt(name, arguments=arguments)
+            session = server.session
+            rpc_lock = server._rpc_lock
+            async with rpc_lock:
+                if server.session is not session:
+                    raise RuntimeError("MCP session changed before request dispatch")
+                result = await session.get_prompt(name, arguments=arguments)
             # GetPromptResult has .messages list
             messages = []
             for msg in (result.messages if hasattr(result, "messages") else []):
