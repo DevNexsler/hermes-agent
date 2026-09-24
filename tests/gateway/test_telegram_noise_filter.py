@@ -308,6 +308,13 @@ def test_provider_client_error_stays_out_of_server_retry_category():
     assert "temporarily unavailable" not in sanitized
 
 
+def test_provider_5xx_status_takes_priority_over_policy_words_in_body():
+    raw = "API call failed after 3 retries: HTTP 500: request was blocked by upstream service"
+    assert _sanitize_gateway_final_response("slack", raw) == (
+        "⏳ The model provider is temporarily unavailable. Please retry shortly."
+    )
+
+
 def test_telegram_final_response_redacts_auth_secrets():
     """Authentication errors should be useful without leaking key material."""
     raw = (

@@ -504,6 +504,10 @@ def _gateway_provider_error_reply(text: str) -> str:
             "⚠️ Provider authentication failed. Check the configured credentials; "
             "raw provider details are in the gateway logs."
         )
+    if _GATEWAY_SERVER_ERROR_RE.search(text):
+        # Preserve a safe retry signal for wake reconcilers without exposing
+        # raw provider bodies, request IDs, or credentials in chat.
+        return "⏳ The model provider is temporarily unavailable. Please retry shortly."
     if _GATEWAY_PROVIDER_POLICY_RE.search(text):
         return (
             "⚠️ The model provider rejected the request. I kept the raw provider "
@@ -511,10 +515,6 @@ def _gateway_provider_error_reply(text: str) -> str:
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
         return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
-    if _GATEWAY_SERVER_ERROR_RE.search(text):
-        # Preserve a safe retry signal for wake reconcilers without exposing
-        # raw provider bodies, request IDs, or credentials in chat.
-        return "⏳ The model provider is temporarily unavailable. Please retry shortly."
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."
