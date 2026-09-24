@@ -286,6 +286,35 @@ def test_telegram_final_response_sanitizes_raw_provider_errors():
     assert "req_abc" not in sanitized
 
 
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+@pytest.mark.parametrize("status", (500, 502, 503))
+def test_provider_server_error_keeps_retry_category_without_raw_details(platform, status):
+    raw = (
+        f"API call failed after 3 retries: HTTP {status} Internal error; "
+        "Authorization: Bearer sk-ABCDEF0123456789abcdef0123"
+    )
+
+    sanitized = _sanitize_gateway_final_response(platform, raw)
+
+    assert sanitized == "⏳ The model provider is temporarily unavailable. Please retry shortly."
+    assert _prepare_gateway_status_message(platform, "warn", raw) == sanitized
+    assert str(status) not in sanitized
+    assert "sk-ABCDEF" not in sanitized
+
+
+def test_provider_client_error_stays_out_of_server_retry_category():
+    raw = "API call failed after 3 retries: HTTP 400 Invalid request"
+    sanitized = _sanitize_gateway_final_response("slack", raw)
+    assert "temporarily unavailable" not in sanitized
+
+
+def test_provider_5xx_status_takes_priority_over_policy_words_in_body():
+    raw = "API call failed after 3 retries: HTTP 500: request was blocked by upstream service"
+    assert _sanitize_gateway_final_response("slack", raw) == (
+        "⏳ The model provider is temporarily unavailable. Please retry shortly."
+    )
+
+
 def test_telegram_final_response_redacts_auth_secrets():
     """Authentication errors should be useful without leaking key material."""
     raw = (
