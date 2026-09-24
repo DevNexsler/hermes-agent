@@ -233,6 +233,11 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GATEWAY_SERVER_ERROR_RE = re.compile(
+    r"\b(?:http(?:\s+error)?|error\s+code:?)\s*5\d{2}\b",
+    re.IGNORECASE,
+)
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -506,6 +511,10 @@ def _gateway_provider_error_reply(text: str) -> str:
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
         return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+    if _GATEWAY_SERVER_ERROR_RE.search(text):
+        # Preserve a safe retry signal for wake reconcilers without exposing
+        # raw provider bodies, request IDs, or credentials in chat.
+        return "⏳ The model provider is temporarily unavailable. Please retry shortly."
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."
