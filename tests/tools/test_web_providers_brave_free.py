@@ -13,6 +13,8 @@ Covers:
 from __future__ import annotations
 
 import json
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -44,6 +46,15 @@ class TestBraveFreeProviderSearch:
             ]
         }
     }
+
+    @pytest.fixture(autouse=True)
+    def _fast_queue(self, monkeypatch, tmp_path):
+        from plugins.web.brave_free import request_queue
+        monkeypatch.setattr(request_queue, "_queue_path", lambda _key: tmp_path / "brave.sqlite3")
+        monkeypatch.setattr(
+            "tools.web_tools._load_web_config",
+            lambda: {"brave_min_interval_seconds": 0, "brave_queue_max_wait_seconds": 1},
+        )
 
     @staticmethod
     def _mock_resp(json_data, status_code=200):
@@ -107,6 +118,46 @@ class TestBraveFreeProviderSearch:
         result = BraveFreeWebSearchProvider().search("q", limit=5)
         assert result["success"] is False
         assert "BRAVE_SEARCH_API_KEY" in result["error"]
+
+
+def test_brave_queue_serializes_concurrent_calls(tmp_path, monkeypatch):
+    from plugins.web.brave_free import request_queue
+    monkeypatch.setattr(request_queue, "_queue_path", lambda _key: tmp_path / "brave.sqlite3")
+    starts = []
+    barrier = threading.Barrier(3)
+
+    def call():
+        barrier.wait()
+        def request():
+            starts.append(time.monotonic())
+            return MagicMock(status_code=200)
+        request_queue.queued_request("same-key", request, interval=0.06, max_wait=1)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    assert len(starts) == 2
+    assert abs(starts[1] - starts[0]) >= 0.05
+
+
+def test_brave_429_cools_queue_without_another_request(tmp_path, monkeypatch):
+    from plugins.web.brave_free import request_queue
+    monkeypatch.setattr(request_queue, "_queue_path", lambda _key: tmp_path / "brave.sqlite3")
+    response = MagicMock(status_code=429, headers={"Retry-After": "0.2"})
+    assert request_queue.queued_request("same-key", lambda: response, interval=0, cooldown=0.2) is response
+    called = False
+
+    def request():
+        nonlocal called
+        called = True
+
+    with pytest.raises(request_queue.BraveQueueBusy):
+        request_queue.queued_request("same-key", request, interval=0, max_wait=0.02)
+    assert called is False
 
 
 # ---------------------------------------------------------------------------

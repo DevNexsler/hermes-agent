@@ -10,7 +10,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from plugins.web._common import BaseWebSearchProvider, http_get_json, provider_env, search_fail, search_ok, setup_schema, titled_rows
+import httpx
+
+from plugins.web._common import BaseWebSearchProvider, provider_env, search_fail, search_ok, setup_schema, titled_rows
+from plugins.web.brave_free.request_queue import BraveQueueBusy, queued_request
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +31,37 @@ class BraveFreeWebSearchProvider(BaseWebSearchProvider):
         api_key = provider_env("BRAVE_SEARCH_API_KEY")
         if not api_key:
             return search_fail("BRAVE_SEARCH_API_KEY is not set")
-        data, failure = http_get_json(
-            "Brave Search", _BRAVE_ENDPOINT,
-            params={"q": query, "count": max(1, min(int(limit), 20))},  # Brave caps count at 20
-            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
-            timeout=15, logger=logger,
-        )
-        if failure is not None:
-            return failure
+        from tools.web_tools import _load_web_config
+        web_config = _load_web_config()
+        try:
+            response = queued_request(
+                api_key,
+                lambda: httpx.get(
+                    _BRAVE_ENDPOINT,
+                    params={"q": query, "count": max(1, min(int(limit), 20))},
+                    headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+                    timeout=15,
+                ),
+                interval=float(web_config.get("brave_min_interval_seconds", 2.0)),
+                max_wait=float(web_config.get("brave_queue_max_wait_seconds", 30.0)),
+                cooldown=float(web_config.get("brave_429_cooldown_seconds", 60.0)),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except BraveQueueBusy as exc:
+            return search_fail(str(exc))
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Brave Search HTTP error: %s", exc)
+            return search_fail(
+                f"Brave Search returned HTTP {exc.response.status_code}; "
+                "use the web-usage Chrome browser if search cannot wait"
+            )
+        except httpx.RequestError as exc:
+            logger.warning("Brave Search request error: %s", exc)
+            return search_fail(f"Could not reach Brave Search: {exc}")
+        except (TypeError, ValueError) as exc:
+            logger.warning("Brave Search response/config error: %s", exc)
+            return search_fail(f"Could not parse Brave Search response: {exc}")
         raw_results = (data.get("web") or {}).get("results", []) or []
         web_results = titled_rows(raw_results[:limit], "description")
         logger.info("Brave Search '%s': %d results (from %d raw, limit %d)", query, len(web_results), len(raw_results), limit)
