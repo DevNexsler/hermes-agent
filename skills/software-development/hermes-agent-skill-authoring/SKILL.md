@@ -165,6 +165,26 @@ Pick the closest existing category. Don't invent new top-level categories casual
 - **Adding supporting files:** `write_file` to `skills/<category>/<name>/references/<file>.md`, `templates/<file>`, or `scripts/<file>`. `skill_manage(action='write_file')` also works and enforces the references/templates/scripts/assets subdir allowlist.
 - **Always commit** the edit — in-repo skills are source, not runtime state.
 
+## Profile Copies — a Directive Must Reach Every Tree That Owns It
+
+Skills are duplicated per profile, not shared. `~/.hermes/skills/`, `~/.hermes/hermes-agent/skills/`, and each `~/.hermes/profiles/<profile>/skills/` hold independent files with independent inodes. Patching the copy your own session loaded changes behavior for your profile only.
+
+For wake-driven work this is a correctness issue, not housekeeping: the profile that receives a directive is usually not the profile that acts on the traffic the directive is about. Each rule carries its own profile — `cliq-nigel-mention` (where Dan's @mention directives arrive) runs as `general-qa`, `quo-listing-inbound` runs as `appointment-setter`, the maintenance and TenantCloud rules run as `maintenance-supervisor`. Confirm before patching:
+
+```sql
+SELECT id, name, profile, channel_id_allowlist FROM hermes_wakeup_rules WHERE enabled ORDER BY priority;
+```
+
+When an operator directive changes policy ("update the skill accordingly"):
+
+1. Name the behavior surface, then find every copy that governs it — grep for the wording you are replacing **and** for the topic, since a tree missing the old wording still needs the new rule:
+   `grep -rln "<old rule text>" ~/.hermes/skills ~/.hermes/profiles/*/skills ~/.hermes/hermes-agent/skills`
+2. Patch each copy. Absence of the old text is not proof that tree is fine; it usually means that tree never received the previous directive either.
+3. Report the exact file list changed, and name any tree deliberately skipped, with the reason.
+4. Re-grep afterwards to confirm each patched file now contains the new rule.
+
+**Verified failure (2026-08-17).** Dan directed that non-emergency PFG Listing-line items go to Joycelyn with no channel notification. The acking wake ran as `general-qa` and patched four `general-qa` skills. One hour later a listing-line wake ran as `appointment-setter`, loaded `listing-line-inbound-routing` (last touched 2026-07-30, never patched), and escalated a non-emergency photo follow-up to Dan's DM and #Tenant-Leads — the exact behavior the directive prohibited. The acknowledgement was truthful about which files it edited and still wrong about the effect.
+
 ## Common Pitfalls
 
 1. **Using `skill_manage(action='create')` for an in-repo skill.** It writes to `~/.hermes/skills/`, not the repo tree. Use `write_file` for in-repo creation.
@@ -205,3 +225,4 @@ Pick the closest existing category. Don't invent new top-level categories casual
 - [ ] No-op prose and duplicated rules removed
 - [ ] `related_skills` references resolve in-repo (or are explicitly OK to be user-local)
 - [ ] `git add skills/<category>/<name>/ && git commit` completed on the intended branch
+- [ ] Every profile tree that governs the changed behavior was patched, not only the tree this session loaded

@@ -2638,6 +2638,11 @@ class APIServerAdapter(BasePlatformAdapter):
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = _current_max_iterations()
+        # Request-scoped budgets may tighten, never raise, the configured cap.
+        # Keep this out of provider model parameters: it controls the agent loop.
+        requested_iterations = model_options.get("max_iterations") if isinstance(model_options, dict) else None
+        if type(requested_iterations) is int and requested_iterations > 0:
+            max_iterations = min(max_iterations, requested_iterations)
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).

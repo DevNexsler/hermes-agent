@@ -1,5 +1,6 @@
 """Tests for hermes-api-server toolset and API server tool availability."""
 from unittest.mock import patch, MagicMock
+import pytest
 
 
 from toolsets import resolve_toolset, get_toolset, validate_toolset
@@ -50,6 +51,20 @@ class TestApiServerPlatformConfig:
 
 
 class TestApiServerAdapterToolset:
+    @pytest.mark.parametrize("requested,expected", [(12, 12), (100, 80), (None, 80), (0, 80), (-1, 80), (True, 80), ("12", 80)])
+    def test_request_iteration_cap_only_reduces_configured_limit(self, requested, expected):
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+        adapter = APIServerAdapter(PlatformConfig())
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key", "base_url": None, "provider": None, "api_mode": None, "command": None, "args": []}), \
+             patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("gateway.run._current_max_iterations", return_value=80), \
+             patch("run_agent.AIAgent") as agent_cls:
+            agent_cls.return_value = MagicMock()
+            adapter._create_agent(model_options={"max_iterations": requested})
+            assert agent_cls.call_args.kwargs["max_iterations"] == expected
+
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_reads_config_toolsets(self):
         """API server resolves toolsets from config like all other platforms."""
@@ -79,4 +94,3 @@ class TestApiServerAdapterToolset:
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
-

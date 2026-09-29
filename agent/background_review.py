@@ -185,8 +185,13 @@ _SKILL_REVIEW_PROMPT = (
     "not a neutral outcome.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
-    "Not a long flat list of narrow one-session-one-skill entries. This "
-    "shapes HOW you update, not WHETHER you update.\n\n"
+    "Not a long flat list of narrow one-session-one-skill entries — but "
+    "equally NOT one omnibus skill that absorbs many subsystems. Each "
+    "class-level skill covers ONE subsystem/domain; prefer several focused "
+    "skills over a single mega-skill. A skill approaching its size cap must "
+    "be SPLIT by subsystem (leaving a thin router skill that points to the "
+    "parts), never crammed further. This shapes HOW you update, not "
+    "WHETHER you update.\n\n"
     "Signals to look for (any one of these warrants action):\n"
     "  • User corrected your style, tone, format, legibility, or "
     "verbosity. Frustration signals like 'stop doing X', 'this is too "
@@ -205,14 +210,25 @@ _SKILL_REVIEW_PROMPT = (
     "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
     "Preference order — prefer the earliest action that fits, but do "
     "pick one when a signal above fired:\n"
-    "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
-    "conversation for skills the user loaded via /skill-name or you "
-    "read via skill_view. If any of them covers the territory of the "
-    "new learning, PATCH that one first. It is the skill that was in "
-    "play, so it's the right one to extend — but only if it is "
-    "curator-managed. Bundled, hub, pinned, and user-owned skills are "
-    "off-limits to you no matter how relevant (see Protected skills "
-    "below); for those, fall through to the next option.\n"
+    "  1. UPDATE THE MOST SPECIFIC CURATOR-MANAGED SKILL THE LEARNING "
+    "BELONGS TO. Look "
+    "back through the conversation for skills that were loaded via "
+    "/skill-name or read via skill_view. Patch the one whose scope MOST "
+    "NARROWLY covers the learning — an email-tool detail belongs in "
+    "`agent-email-server`, a factbook query pattern in `factbook`, a "
+    "collections step in the collections skill — NOT in a broad ops skill "
+    "that merely happened to be loaded. Do NOT default to the broadest "
+    "loaded skill. Two hard rules that override everything else here: "
+    "(a) if the loaded skill is a thin ROUTER/INDEX (mostly one-line "
+    "pointers to other skills), patch the specific skill it points to, "
+    "NEVER the router itself; (b) never keep growing one catch-all skill "
+    "toward its size cap — if the right home is a focused subsystem skill, "
+    "patch THAT (create it via (4) if it does not exist yet). Distributing "
+    "learnings to the right focused skill is the goal; funnelling everything "
+    "into one loaded mega-skill is the failure mode. Only curator-managed "
+    "skills may be patched: bundled, hub, pinned, and user-owned skills are "
+    "off-limits no matter how relevant (see Protected skills below); for "
+    "those, fall through to the next option.\n"
     "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). "
     "If no loaded skill fits but an existing class-level skill does, "
     "patch it. Add a subsection, a pitfall, or broaden a trigger.\n"
@@ -844,6 +860,12 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            # smart_skill_view is a skill-retrieval tool from the hermes-skill-retrieve
+            # plugin (registered under toolset "skill_retrieve", outside the base "skills"
+            # toolset), so it isn't in the set above — add it explicitly. Background review
+            # is meant to allow skill tools (see deny message); denying the smart skill
+            # viewer defeats its purpose (#0102).
+            review_whitelist.add("smart_skill_view")
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
