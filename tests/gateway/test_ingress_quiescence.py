@@ -21,7 +21,7 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 async def _server(handler):
     app = web.Application()
     app.router.add_post('/wake', handler)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, shutdown_timeout=0.1)
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()

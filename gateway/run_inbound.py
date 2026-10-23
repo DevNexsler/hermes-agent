@@ -1279,14 +1279,8 @@ class GatewayInboundMixin:
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
-        # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
-        # not on the adapter's raw inbound: profile routing, the ignored-channel
-        # guard, plugin hooks and user authorization all reject events above,
-        # and a rejected event must not be able to clear a refusal belonging to
-        # an active turn. This is also the single entry point every lane shares
-        # — Discord interaction passthrough builds its own MessageEvent and
-        # calls handle_message directly, so a teardown on the relay's inbound
-        # handler left those turns muted.
+        # Terminal-decline teardown follows authorization: rejected input must not clear a
+        # running turn's refusal. Direct Discord interactions reach this same entry point.
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
@@ -1316,15 +1310,15 @@ class GatewayInboundMixin:
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
-            # Pre-fence transport reservations remain counted until their handoff finishes.
-            from gateway.admission import ingress_admitted
-            if self._external_drain_active and not ingress_admitted(self):
-                logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
-                return (
-                    "⏳ This agent is draining for a maintenance action and isn't "
-                    "accepting new turns right now. It'll be back in a moment — "
-                    "please resend shortly."
-                )
+        # All new turns, including internal producers, honor closure; pre-fence leases finish.
+        from gateway.admission import ingress_admitted
+        if self._external_drain_active and not ingress_admitted(self):
+            logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
+            return (
+                "⏳ This agent is draining for a maintenance action and isn't "
+                "accepting new turns right now. It'll be back in a moment — "
+                "please resend shortly."
+            )
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
@@ -1891,7 +1885,7 @@ class GatewayInboundMixin:
         if adapter is None:
             return False
 
-        await adapter.handle_message(MessageEvent(
+        event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
             allow_gateway_control=False,
             metadata={
@@ -1899,7 +1893,10 @@ class GatewayInboundMixin:
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
             },
-        ))
+        )
+        await adapter.handle_message(event)
+        if not event._gateway_accepted:
+            return False
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,

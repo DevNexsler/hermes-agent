@@ -1229,18 +1229,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
-        # Per-profile single-flight locks for the off-loop store construction in
-        # _artifact_store_for_async(); a lost race would strand receipts (in-memory index).
+        # Per-profile _artifact_store_for_async locks prevent stranded in-memory receipts.
         self._browser_control_artifact_locks: Dict[str, asyncio.Lock] = {}
 
-    def active_agent_work_count(self) -> int:
-        """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
-        (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
+    def active_agent_work_count(self, *, strict: bool = False) -> int:
+        """Pending admissions + turns + live tasks; strict reads propagate unavailable counters."""
         try:
-            return (int(getattr(self, "_pending_agent_requests", 0))
+            return (int(self._pending_agent_requests if strict else getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
                     + sum(not task.done() for task in self._active_run_tasks.values()))
         except Exception:
+            if strict:
+                raise
             return 0
 
     def interrupt_active_runs(self, reason: str) -> int:

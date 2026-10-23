@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
+from gateway.admission import admit_gateway_message
 
 logger = logging.getLogger(__name__)
 
@@ -3946,6 +3947,7 @@ class BasePlatformAdapter(ABC):
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    @admit_gateway_message
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
@@ -3991,13 +3993,9 @@ class BasePlatformAdapter(ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
-        # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
-        # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
-        # calling the message handler directly and sending the response.  Do NOT use
-        # _process_message_background — it manages session lifecycle and its cleanup
-        # races with the running task (split-brain, see PR #4926).
-        # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
-        # runner. Without this, they are queued as pending messages and either: See #4926.
+        # Bypass commands run inline: queueing deadlocks /approve and leaks /new as user text.
+        # A second background lifecycle races the owner task (#4926).
+        from gateway.admission import GatewayDraining, refuse_queued_ingress
         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
@@ -4038,8 +4036,11 @@ class BasePlatformAdapter(ABC):
             try:
                 if await self._busy_session_handler(event, session_key):
                     return
+            except GatewayDraining:
+                raise
             except Exception as e:
                 logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+        refuse_queued_ingress(self.gateway_runner)
         # Without a runner FIFO, do not merge a wake into an occupied human slot
         # (or collapse distinct wakes into one turn). Its caller can retry admission.
         if event.internal and session_key in self._pending_messages:

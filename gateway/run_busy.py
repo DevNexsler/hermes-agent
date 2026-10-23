@@ -87,6 +87,8 @@ class GatewayBusySessionMixin:
 
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
+        from gateway.admission import refuse_queued_ingress
+        refuse_queued_ingress(self)
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
             return
@@ -356,16 +358,14 @@ class GatewayBusySessionMixin:
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+        from gateway.admission import refuse_queued_ingress
+        refuse_queued_ingress(self)
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return
-        # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
-        # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
+        # FIFO preserves turn boundaries; only photo bursts merge into the head slot.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        # #28503 — Previously this called ``merge_pending_message_event`` with the default
-        # ``merge_text=False``, which silently OVERWROTE the single pending slot when consecutive text
-        # messages arrived in ``busy_input_mode: queue``.
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
         same_security_context = existing is not None and (
             getattr(existing, "internal", False) == getattr(event, "internal", False)
@@ -377,11 +377,8 @@ class GatewayBusySessionMixin:
                 for key in self._SECURITY_METADATA_KEYS
             )
         )
-        # Only a photo burst (PHOTO on either side, the other side TEXT or PHOTO) merges into the
-        # head slot. Every other media follow-up — voice, audio, video, document — is an
-        # independent message and takes its own FIFO turn like text does; merging on *any*
-        # ``media_urls`` collapsed three voice notes into one turn (#114363). Telegram albums
-        # (``media_group_id``, photos and videos) are already coalesced by the adapter upstream.
+        # Merging on any media_urls collapsed independent voice notes (#114363).
+        # Telegram albums are already coalesced upstream.
         merge_types = {
             getattr(existing, "message_type", None),
             getattr(event, "message_type", None),

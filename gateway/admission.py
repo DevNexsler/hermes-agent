@@ -9,6 +9,7 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from functools import partial
+from functools import wraps
 import logging
 from pathlib import Path
 import threading
@@ -18,7 +19,7 @@ _ingress = ContextVar('gateway_ingress', default=None)
 
 
 class GatewayDraining(RuntimeError):
-    """No admission occurred. Retry the same delivery after readiness returns."""
+    """No transport turn accepted. Retry the same delivery after readiness/busy state clears."""
 
     status = 503
     headers = {'Retry-After': '1'}
@@ -178,6 +179,28 @@ def adopt_ingress_task(runner, task):
     return task
 
 
+def refuse_queued_ingress(runner):
+    """Retryable ingress starts/steers directly; its caller retains work instead of a memory queue."""
+    if ingress_admitted(runner):
+        raise GatewayDraining('retryable ingress cannot enter an in-memory follow-up queue')
+
+
+def admit_gateway_message(handler):
+    """Native internal producers acquire the same fence and refund on refusal, before dispatch."""
+    @wraps(handler)
+    async def admitted(adapter, event):
+        runner = adapter.gateway_runner
+        if not event.internal or ingress_admitted(runner):
+            return await handler(adapter, event)
+        event._gateway_accepted = False
+        try:
+            with gateway_ingress(runner):
+                return await handler(adapter, event)
+        except GatewayDraining:
+            return  # admit_internal_event converts the false receipt to refundable WakeNotAccepted
+    return admitted
+
+
 async def ingress_to_thread(function, /, *args, **kwargs):
     """Like to_thread, but cancellation retains admission until the actual worker exits.
 
@@ -204,6 +227,24 @@ def ingress_work_count(runner):
     return status['ingress'] + status['adopted']
 
 
+def _observer_work_count(adapters):
+    """Optional extension lifecycle counters. A broken declared contract never means idle."""
+    total = 0
+    for adapter in adapters:
+        hook = getattr(adapter, 'admission_observer_status', None)
+        if hook is None:
+            continue
+        status = hook()
+        if not isinstance(status, dict) or status.get('known') is not True:
+            raise GatewayDraining('extension observer status unavailable')
+        for key in ('active_tasks', 'active_threads'):
+            value = status.get(key)
+            if type(value) is not int or value < 0:
+                raise GatewayDraining('invalid extension observer count')
+            total += value
+    return total
+
+
 def gateway_admission_status(runner):
     """Strict in-process readback. Unknown counters never mean idle.
 
@@ -216,19 +257,28 @@ def gateway_admission_status(runner):
         if not status['hold']['known']:
             raise GatewayDraining('persistent admission hold unreadable')
         from gateway.platforms.api_server_runs import api_worker_live_count
+        from gateway.config import Platform
+        api = runner.adapters.get(Platform.API_SERVER)
+        api_count = 0 if api is None else api.active_agent_work_count(strict=True)
+        if type(api_count) is not int or api_count < 0:
+            raise GatewayDraining('invalid API work count')
+        deferred = getattr(runner, '_deferred_agent_workers', {})
+        if not isinstance(deferred, dict):
+            raise GatewayDraining('deferred worker registry unreadable')
         work = (runner._running_agent_count() + runner._running_cron_job_count()
-                + runner._api_server_hook('active_agent_work_count') + api_worker_live_count()
-                + runner._active_deferred_agent_worker_count())
+                + api_count + api_worker_live_count()
+                + sum(not future.done() for future in list(deferred)))
         # A base task can be waiting on routing/auth before the runner has claimed a session.
         adapters = list(runner.adapters.values())
         for profile_adapters in getattr(runner, '_profile_adapters', {}).values():
             adapters.extend(profile_adapters.values())
+        observers = _observer_work_count(adapters)
         work += sum(not task.done() for adapter in adapters
                     for task in adapter._session_tasks.values())
-        status.update(known=True, active_work=work,
-                      quiescent=status['closed'] and not (work + status['ingress'] + status['adopted']))
+        status.update(known=True, observers=observers, active_work=work + observers,
+                      quiescent=status['closed'] and not (work + observers + status['ingress'] + status['adopted']))
         return status
     except Exception:
         logger.warning('Gateway quiescence readback unavailable', exc_info=True)
         return {'known': False, 'closed': None, 'ingress': None, 'adopted': None,
-                'active_work': None, 'quiescent': None}
+                'active_work': None, 'observers': None, 'quiescent': None}

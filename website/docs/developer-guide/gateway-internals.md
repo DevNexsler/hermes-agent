@@ -323,9 +323,9 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 work before a core session exists. After synchronous authentication, enter
 `with gateway_ingress(adapter.gateway_runner):` **before the first await or mutation**, including
 body parsing, deduplication, SQLite and journal setup. Keep the scope through response creation.
-`GatewayDraining` means no reservation was acquired: answer JSON HTTP 503 with `exc.headers`
-(`Retry-After: 1`), without journals, dedup claims, delivery receipts or core dispatch. A missing
-or unready native capability also raises this exception. Test doubles must install an explicit
+`GatewayDraining` means no transport turn was accepted: answer JSON HTTP 503 with `exc.headers`
+(`Retry-After: 1`). A closed-fence refusal happens before journals, dedup claims, delivery receipts
+or core dispatch. A missing or unready native capability also raises this exception. Test doubles must install an explicit
 admission fixture; a missing runner never means acceptance.
 
 Reservations acquired before fence closure finish naturally. The base adapter adopts the task it
@@ -333,6 +333,13 @@ spawns before that task can run; its completion callback releases the reservatio
 before its first step. Only the reserving handler and explicitly adopted task identities can pass
 the core external-drain gate. An unrelated task inheriting context cannot borrow admission.
 Extension-created tasks use `adopt_ingress_task(runner, task)` before the handler exits.
+
+Retryable ingress supports direct starts and actual steering. In-memory queue/FIFO/debounce
+fallback raises `GatewayDraining` before storage, so callers retain the original durable item
+and retry; refund provisional dedup claims on every unaccepted exit, including cancellation.
+Native internal producers use the same reservation; their refused receipt becomes
+`WakeNotAccepted`, preserving refund/retry semantics. Ordinary unleased human queues keep their
+existing behavior. A consumer must never record delivery after a refused steer or queue fallback.
 
 Use `await ingress_to_thread(fn, *args, **kwargs)` for work under this reservation. Cancellation
 raises `asyncio.CancelledError` promptly while the shielded executor future remains counted until
@@ -342,13 +349,21 @@ execution path; do not fabricate ingress or silently fall back from this helper.
 transport receipt, not authorization, model completion or proof of an outbound business effect.
 
 `gateway_admission_status(runner)` returns `known`, `closed`, `ingress`, `adopted`, `active_work`,
-`quiescent`, plus public `hold` identity when known. `adopted` includes background tasks and executor
+`quiescent`, `observers`, plus public `hold` identity when known. `adopted` includes background tasks and executor
 futures. Counters overlap intentionally: only zero matters. Unknown capability, hold or work counters
 return `known=False` and `quiescent=None`; never convert that to zero. Read this synchronously on the
 gateway loop. Before treating quiescence as an activation fence, hold the existing cron tick lock
 for **every** home returned by `_cron_tick_profile_homes`, verify no home was added, and separately
 exclude manual/external producers. Tick locks cover scan/advance/register/submit, not job lifetime:
 hold them before checking running-job counters. Snapshot zero or producer shutdown alone is insufficient.
+
+Extensions with work outside authenticated handlers implement optional synchronous
+`admission_observer_status() -> {known: True, active_tasks: int, active_threads: int}`. These
+nonnegative integer counts participate in strict readiness. Missing hooks mean no declared extra
+work; a present hook that raises, returns unknown, or supplies invalid counts means unknown
+readiness. The hook reads counters on the gateway loop without filesystem/secret/config I/O.
+Track actual executor completion through observer cancellation; a cancelled asyncio task alone
+does not prove its thread stopped. Lifecycle observers do not acquire HTTP admission permission.
 
 `gateway.admission_hold` supplies separate persistent maintenance control:
 
