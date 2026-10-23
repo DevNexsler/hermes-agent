@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from gateway.config import GatewayConfig, Platform
+from gateway.admission import initialize_gateway_admission
 from gateway.platforms.base import (
     BasePlatformAdapter,
     PlatformConfig,
@@ -50,6 +51,9 @@ def _runner(entry: SessionEntry | None, adapter=None) -> GatewayRunner:
     runner._profile_adapters = {}
     runner._running = True
     runner._draining = False
+    initialize_gateway_admission(runner)
+    if adapter is not None:
+        adapter.gateway_runner = runner
     runner._background_tasks = set()
     runner._is_user_authorized = MagicMock(return_value=True)
     return runner
@@ -108,6 +112,9 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
     runner._gateway_loop = asyncio.get_running_loop()
     runner._running = True
     runner._draining = False
+    initialize_gateway_admission(runner)
+    if adapter is not None:
+        adapter.gateway_runner = runner
     runner._background_tasks = set()
     runner._queued_events = {}
     runner._is_user_authorized = MagicMock(return_value=True)
@@ -133,13 +140,11 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
         await asyncio.sleep(0)
 
         assert adapter._pending_messages[entry.session_key] is pending_user_event
-        queued = runner._queued_events[entry.session_key][0]
+        assert task.result() is False  # inject_message True promises scheduling only.
+        assert not runner._queued_events
         assert pending_user_event.text == "human follow-up"
         assert pending_user_event.media_urls == ["human.jpg"]
         assert pending_user_event.allow_gateway_control is True
-        assert queued.text == "/approve always"
-        assert queued.allow_gateway_control is False
-        assert queued.metadata["gateway_session_id"] == entry.session_id
         adapter._message_handler.assert_not_awaited()
 
         runner._clear_plugin_message_injector()
@@ -149,6 +154,9 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
 @pytest.mark.asyncio
 async def test_dispatch_uses_stored_origin_and_adapter_message_path():
     adapter = SimpleNamespace(handle_message=AsyncMock())
+    async def accepted(event):
+        event._gateway_accepted = True  # Explicit transport receipt fixture.
+    adapter.handle_message.side_effect = accepted
     entry = _entry()
     runner = _runner(entry, adapter)
 
@@ -291,8 +299,9 @@ async def test_dispatch_stops_when_gateway_drains_during_lookup():
 
 
 @pytest.mark.asyncio
-async def test_base_adapter_queues_non_control_plugin_text_for_exact_session():
+async def test_base_adapter_refuses_busy_internal_text_without_memory_queue():
     adapter = _RoutingAdapter()
+    _runner(_entry(), adapter)
     adapter.set_message_handler(AsyncMock())
     source = _entry().origin
     session_key = build_session_key(source)
@@ -309,13 +318,14 @@ async def test_base_adapter_queues_non_control_plugin_text_for_exact_session():
     await adapter.handle_message(event)
 
     adapter._message_handler.assert_not_awaited()
-    assert adapter._pending_messages[session_key] is event
+    assert not event._gateway_accepted and not adapter._pending_messages
     assert adapter._active_sessions[session_key].is_set() is False
 
 
 @pytest.mark.asyncio
 async def test_base_adapter_rejects_derived_session_mismatch():
     adapter = _RoutingAdapter()
+    _runner(_entry(), adapter)
     adapter.set_message_handler(AsyncMock())
     event = MessageEvent(
         text="ordinary input",

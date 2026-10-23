@@ -64,12 +64,16 @@ class GatewayStartupMixin:
         """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
         until it finishes, else a user message can race it)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.admission import GatewayDraining, startup_resume_ingress
         try:
-            await adapter.handle_message(event)
+            with startup_resume_ingress(self, event, session_key):
+                await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
             if task is not None:
                 await asyncio.shield(task)
+        except GatewayDraining:
+            return  # Durable resume_pending survives closure; no accepted receipt.
         finally:
             # Release the pre-claimed slot if handle_message raised before _handle_message took ownership.
             _pre_state = self._peek_session_state(session_key)
@@ -607,7 +611,6 @@ class GatewayStartupMixin:
             _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
             _resume_state.turn.started_ts = time.time()
             self._persist_active_agents()
-            # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
@@ -1455,10 +1458,7 @@ class GatewayStartupMixin:
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():
             self._booted_from_restart = True
-        # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
-        # control sleep here once froze every platform).
-        # Restart notification, home-channel startup notice, and obligation redelivery all call
-        # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
+        # Bound lifecycle sends: a Telegram flood sleep must not freeze restore (#91969).
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
@@ -1556,11 +1556,8 @@ class GatewayStartupMixin:
         if self._start_check_access_policy():
             return True
         await self._start_recover_previous_run()
-        # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
-        # demand-time site (provider resolution, /login, the connector token) is a read that needs the
-        # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
-        # first DM from arriving with nothing to resolve. With the launch gate unset this is a local
-        # inventory and no network.
+        # Bootstrap identity before adapters connect, so a fast first DM can resolve it.
+        # With launch gate unset this remains local inventory, without network.
         await self._run_free_tier_bootstrap()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.

@@ -567,6 +567,8 @@ class GatewayInboundMixin:
         self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
     ) -> None:
         """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
+        from gateway.admission import refuse_queued_ingress
+        refuse_queued_ingress(self)
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
@@ -1245,14 +1247,12 @@ class GatewayInboundMixin:
         never promoted, e.g. a compression-demoted follow-up) silently orphaned those events. The
         oldest orphan runs as THIS turn and the incoming event is parked behind the chain. Skipped
         for control commands and internal events."""
+        from gateway.admission import ingress_admitted
+        if ingress_admitted(self):
+            return event, source, is_internal  # Never lend this arrival to previously accepted work.
         try:
             # ── FIFO orphan rescue (#99882) ──────────────────────────────── If this session went idle with
-            # a populated overflow (queued during a busy window whose post-turn drain never promoted — e.g.
-            # a compression-demoted follow-up after the compression window ended through an exit that
-            # skipped the promotion site), those events were silently orphaned. We are starting the next
-            # turn for this session NOW: re-stage the orphans in FIFO order and enqueue the incoming event
-            # behind them, so arrival order (#28503) holds: oldest orphan runs as this turn, the rest drain
-            # in order, the new message last.
+            # a populated overflow, re-stage FIFO: oldest first, incoming last (#28503).
             _orphan_adapter = self._delivery_adapter_for(source)
             if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
                 return event, source, is_internal
@@ -1295,7 +1295,8 @@ class GatewayInboundMixin:
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
-        if self._is_session_running(_quick_key):
+        from gateway.admission import startup_resume_admitted
+        if self._is_session_running(_quick_key) and not startup_resume_admitted(self, event, _quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)

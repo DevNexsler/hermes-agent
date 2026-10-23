@@ -3953,8 +3953,7 @@ class BasePlatformAdapter(ABC):
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
         if not self._message_handler:
-            # No handler = every inbound silently discarded on an adapter that still polls and sends;
-            # say so once per adapter (#102260).
+            # A connected adapter without a handler silently discards inbound (#102260).
             if not getattr(self, "_no_message_handler_logged", False):
                 self._no_message_handler_logged = True
                 logger.error(
@@ -3971,8 +3970,7 @@ class BasePlatformAdapter(ABC):
         if self._drop_unresolved(event):
             return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
-        # Explicitly routed events already name their destination; recovering a
-        # different topic would redirect them and yield before the session claim.
+        # Routed events already name their destination; topic recovery would redirect it.
         if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
             await asyncio.to_thread(self._apply_topic_recovery, event)
@@ -3981,7 +3979,9 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
-        # On-entry self-heal: clear a guard whose owner task already exited.
+        from gateway.admission import prepare_ingress_dispatch
+        if await prepare_ingress_dispatch(self, event, session_key):
+            return
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:

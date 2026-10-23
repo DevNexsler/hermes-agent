@@ -26,7 +26,8 @@ class GatewayDraining(RuntimeError):
 
 
 class _IngressLease:
-    def __init__(self, barrier, owner):
+    def __init__(self, barrier, owner, startup=None):
+        self.startup = startup
         self.barrier = barrier
         self.owners = {owner}
 
@@ -52,17 +53,17 @@ class GatewayAdmission:
             if not self.runner._draining and not self.hold['active']:
                 self._closed = False
 
-    def _ready(self):
+    def _ready(self, *, startup=False):
         return (self.runner._running and not self.runner._draining
                 and not self.runner._external_drain_active
-                and not getattr(self.runner, '_startup_restore_in_progress', False))
+                and (startup or not getattr(self.runner, '_startup_restore_in_progress', False)))
 
-    def reserve(self, owner):
+    def reserve(self, owner, *, startup=None):
         with self._lock:
-            if self._closed or not self._ready():
+            if self._closed or not self._ready(startup=startup is not None):
                 raise GatewayDraining('gateway admission closed or not ready')
             self._ingress += 1
-            return _IngressLease(self, owner)
+            return _IngressLease(self, owner, startup)
 
     def held(self, lease, owner):
         with self._lock:
@@ -145,22 +146,51 @@ def _barrier(runner):
     return barrier
 
 
-@contextmanager
 def gateway_ingress(runner):
     """Reserve one authenticated handler through its response/ack. Refusal has no side effects.
 
     The base adapter adopts its spawned task automatically. Extension-owned detached tasks must
     be adopted explicitly before this scope exits. Cancellation never releases a still-live task.
     """
+    return _reserve_ingress(runner)
+
+
+@contextmanager
+def _reserve_ingress(runner, *, startup=None):
     barrier = _barrier(runner)
     owner = asyncio.current_task()
-    lease = barrier.reserve(owner)
+    lease = barrier.reserve(owner, startup=startup)
     token = _ingress.set(lease)
     try:
         yield
     finally:
         _ingress.reset(token)
         barrier.release(lease, owner)
+
+
+
+def startup_resume_ingress(runner, event, session_key):
+    """Native lifecycle owner only: resume its preclaimed slot while HTTP readiness stays closed."""
+    return _reserve_ingress(runner, startup=(event, session_key))
+
+
+def startup_resume_admitted(runner, event, session_key):
+    lease = _ingress.get()
+    return (ingress_admitted(runner) and lease.startup is not None
+            and lease.startup[0] is event and lease.startup[1] == session_key)
+
+
+async def prepare_ingress_dispatch(adapter, event, session_key):
+    """Refuse backlog before Base acknowledges; route another adapter's live turn inline."""
+    runner = adapter.gateway_runner
+    if not ingress_admitted(runner) or startup_resume_admitted(runner, event, session_key):
+        return False
+    if adapter._pending_messages.get(session_key) or runner._overflow_queue(session_key):
+        raise GatewayDraining('accepted session backlog must finish before retryable ingress')
+    if runner._is_session_running(session_key) and session_key not in adapter._active_sessions:
+        await adapter._handle_message_while_active(event, session_key)
+        return True
+    return False
 
 
 def ingress_admitted(runner):
