@@ -11,6 +11,8 @@ from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_noti
 
 class RecordingAdapter:
     supports_async_delivery = True
+    from gateway.platforms.base import BasePlatformAdapter
+    extract_local_files = staticmethod(BasePlatformAdapter.extract_local_files)
 
     def __init__(self):
         self.sent = []
@@ -34,6 +36,8 @@ def setup_runner(tmp_path, monkeypatch):
         profile.mkdir(parents=True)
         (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
     runner = GatewayRunner.__new__(GatewayRunner)
+    from tests.gateway.restart_test_helpers import install_native_admission
+    install_native_admission(runner, home=home)
     runner.adapters = {Platform.DISCORD: RecordingAdapter()}
     runner._profile_adapters = {"yuki": {}}
     runner._primary_profile_name = "default"

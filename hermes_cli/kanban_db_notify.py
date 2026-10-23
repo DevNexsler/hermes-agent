@@ -8,6 +8,8 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
+import uuid
 import sqlite3
 import time
 from pathlib import Path
@@ -43,7 +45,7 @@ def _encode_notify_delivery_metadata(metadata: Optional[Mapping[str, Any]]) -> O
     clean = {
         str(key): value
         for key, value in metadata.items()
-        if value is not None and isinstance(value, _SCALAR_TYPES)
+        if str(key) == 'notification_attention_v1' or (value is not None and isinstance(value, _SCALAR_TYPES))
     }
     if not clean:
         return None
@@ -58,10 +60,11 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     try:
         data = json.loads(str(raw))
     except Exception:
-        return {}
+        return {'notification_attention_v1': raw}
     if not isinstance(data, dict):
-        return {}
-    return {str(key): value for key, value in data.items() if isinstance(value, _SCALAR_TYPES)}
+        return {'notification_attention_v1': raw}
+    return {str(key): value for key, value in data.items()
+            if key == 'notification_attention_v1' or isinstance(value, _SCALAR_TYPES)}
 
 
 def add_notify_sub(
@@ -293,19 +296,21 @@ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int 
     if days <= 0:
         return 0
     cutoff = int(time.time()) - days * 86400
+    removed = 0
     with _kb.write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id IN ("
-            " SELECT t.id FROM tasks t"
-            " WHERE t.status IN ('done', 'blocked')"
-            " AND COALESCE("
-            "  (SELECT MAX(e.created_at) FROM task_events e"
-            "   WHERE e.task_id = t.id),"
-            "  t.completed_at, t.created_at, 0"
-            " ) < ?)",
-            (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+        candidates = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id IN ("
+            " SELECT t.id FROM tasks t WHERE t.status IN ('done', 'blocked') AND COALESCE("
+            " (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id),"
+            " t.completed_at, t.created_at, 0) < ?)", (cutoff,)).fetchall()
+        for row in candidates:
+            metadata = _decode_notify_delivery_metadata(row['delivery_metadata'])
+            if 'notification_attention_v1' in metadata:
+                continue
+            cur = conn.execute('DELETE FROM kanban_notify_subs ' + _SUB_KEY_WHERE,
+                               _sub_key(row['task_id'], row['platform'], row['chat_id'], row['thread_id']))
+            removed += cur.rowcount
+    return removed
 
 
 def _notify_cursor(
@@ -357,6 +362,7 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    attention_context: Optional[dict] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen events for one subscription.
 
@@ -368,7 +374,14 @@ def claim_unseen_events_for_sub(
     delivery failure.
     """
     with _kb.write_txn(conn):
+        key = _sub_key(task_id, platform, chat_id, thread_id)
+        row = conn.execute("SELECT * FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
+        metadata = json.loads(row['delivery_metadata'] or '{}') if row is not None else {}
+        if not isinstance(metadata, dict):
+            raise ValueError('notification metadata unreadable')
         old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
+        if 'notification_attention_v1' in metadata:
+            return old_cursor or 0, old_cursor or 0, []
         if old_cursor is None:
             return 0, 0, []
         new_cursor, events = unseen_events_for_sub(
@@ -377,8 +390,49 @@ def claim_unseen_events_for_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
-        _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
+        if attention_context is not None:
+            record = dict(attention_context, version=1, outcome='UNKNOWN', attempt_id=uuid.uuid4().hex,
+                reason='notification claimed; effect outcome unconfirmed', created_at=time.time(),
+                database_realpath=str(Path(conn.execute('PRAGMA database_list').fetchone()[2]).resolve()),
+                required_action='Inspect exact attempt/events and transport effects; assign accountable operator. No automatic retry/refund/completion.',
+                task=asdict(_kb.get_task(conn, task_id)), subscription=dict(row),
+                original_cursor=old_cursor, claimed_cursor=new_cursor, events=[asdict(event) for event in events])
+            metadata['notification_attention_v1'] = json.dumps(record, sort_keys=True)
+            conn.execute('UPDATE kanban_notify_subs SET delivery_metadata = ? ' + _SUB_KEY_WHERE,
+                         (json.dumps(metadata, sort_keys=True), *key))
+        _cas_cursor(conn, key, new_cursor, old_cursor)
+        if attention_context is not None:
+            saved = conn.execute('SELECT delivery_metadata, last_event_id FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
+            if saved['last_event_id'] != new_cursor or json.loads(saved['delivery_metadata']) != metadata:
+                raise RuntimeError('notification intent readback unconfirmed')
         return old_cursor, new_cursor, events
+
+
+def checkpoint_notify_delivery(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, expected_attention: str, outcome: str,
+) -> None:
+    """Inspect/settle only this exact durable attempt; uncertainty never calls settlement."""
+    if outcome not in {'inspect', 'accepted', 'refused'}:
+        raise ValueError('invalid notification checkpoint outcome')
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    with _kb.write_txn(conn):
+        row = conn.execute('SELECT * FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
+        metadata = json.loads(row['delivery_metadata'] or '{}') if row is not None else {}
+        if metadata.get('notification_attention_v1') != expected_attention:
+            raise RuntimeError('notification attention changed; existing owner preserved')
+        record = json.loads(expected_attention)
+        if record.get('version') != 1 or row['last_event_id'] != record['claimed_cursor']:
+            raise RuntimeError('notification cursor ownership changed')
+        if outcome == 'inspect':
+            return
+        del metadata['notification_attention_v1']
+        cursor = record['claimed_cursor'] if outcome == 'accepted' else record['original_cursor']
+        conn.execute('UPDATE kanban_notify_subs SET delivery_metadata = ?, last_event_id = ? ' + _SUB_KEY_WHERE,
+                     (json.dumps(metadata, sort_keys=True), cursor, *key))
+        saved = conn.execute('SELECT delivery_metadata, last_event_id FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
+        if saved['last_event_id'] != cursor or json.loads(saved['delivery_metadata']) != metadata:
+            raise RuntimeError('notification settlement readback unconfirmed')
 
 
 def _cas_cursor(conn: sqlite3.Connection, key: tuple, new_cursor: int, expected: int) -> sqlite3.Cursor:

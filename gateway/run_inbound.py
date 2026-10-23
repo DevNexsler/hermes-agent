@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
-from gateway.admission import native_to_thread
+from gateway.admission import native_to_thread, startup_resume_admitted
 import concurrent.futures
 import dataclasses
 import json
@@ -200,7 +200,6 @@ class GatewayInboundMixin:
             with suppress(Exception):
                 _slack_adapter = self._intake_adapter_for(source)
         if (
-            # See #51899.
             not is_internal
             and getattr(source, "platform", None) == Platform.SLACK
             and _is_slack_ignored_channel(_config, _chat_id, _slack_adapter)
@@ -212,6 +211,7 @@ class GatewayInboundMixin:
             getattr(self, "_startup_restore_in_progress", False)
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not startup_resume_admitted(self, event, self._session_key_for_source(source))
         ):
             self._queue_startup_restore_event(event)
             return None
@@ -634,18 +634,19 @@ class GatewayInboundMixin:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
     def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
-        """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
         steered = False
         if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
             try:
                 steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
             except Exception as exc:
+                from gateway.admission import ingress_admitted
+                if ingress_admitted(self):
+                    raise
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
         if steered:
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
-        logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
         self._queue_or_replace_pending_event(_quick_key, event)
 
     async def _hm_busy_interrupt(
@@ -653,8 +654,9 @@ class GatewayInboundMixin:
     ) -> None:
         """Interrupt path: redirect text-only corrections when supported, else ``agent.interrupt()``."""
         from gateway.run import _build_media_placeholder
-        # Text-only corrections redirect the live turn (preserving displayed context) when the
-        # runtime supports it; media/voice and older runtimes use the interrupt path below.
+        from gateway.admission import refuse_queued_ingress
+        refuse_queued_ingress(self)
+        # Unleased human corrections keep native redirect/interrupt behavior.
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
         if self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect"):
             if self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):

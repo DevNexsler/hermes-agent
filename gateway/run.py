@@ -10,7 +10,8 @@ except ModuleNotFoundError:
     pass  # a partial ``hermes update`` can leave the bootstrap unregistered; only Windows UTF-8 stdio suffers
 
 import asyncio
-from gateway.admission import native_to_thread
+from gateway.admission import native_to_thread, native_session_offload
+from functools import partial
 import concurrent.futures
 import dataclasses
 import json
@@ -1844,9 +1845,9 @@ def _profile_runtime_scope(
 
 
 @_asynccontextmanager
-async def _async_profile_runtime_scope(profile_home: "Path"):
+async def _async_profile_runtime_scope(profile_home: "Path", *, offload=None):
     """Enter a profile scope without loading secret files on the event loop."""
-    secrets = await native_to_thread(_load_profile_secret_scope, Path(profile_home))
+    secrets = await (offload or native_to_thread)(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
 
@@ -3559,7 +3560,7 @@ class GatewayRunner(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key))
-        self._async_session_store = AsyncSessionStore(self.session_store, offload=native_to_thread)
+        self._async_session_store = AsyncSessionStore(self.session_store, offload=partial(native_session_offload, self))
         self.delivery_router = DeliveryRouter(self.config)
 
     def _init_lifecycle_state(self) -> None:
@@ -3809,7 +3810,7 @@ class GatewayRunner(
             store = getattr(self, "session_store", None)
             borrowed = getattr(store, "_db", None) if store is not None else None
             if borrowed is not None:
-                wrapper = AsyncSessionDB(borrowed, offload=native_to_thread)
+                wrapper = AsyncSessionDB(borrowed, offload=partial(native_session_offload, self))
                 # close_all_session_db_handles() must not close what the store owns (its sweep runs first).
                 wrapper.__dict__["_hermes_borrowed_handle"] = True
                 return wrapper
@@ -3817,7 +3818,7 @@ class GatewayRunner(
                 # Store handle unavailable: opening our own would resurrect the duplicate borrowed away.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                return AsyncSessionDB(acquire(), offload=native_to_thread)
+                return AsyncSessionDB(acquire(), offload=partial(native_session_offload, self))
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise
@@ -4124,7 +4125,7 @@ class GatewayRunner(
         """Return the single async facade for this runner's SessionStore."""
         facade = getattr(self, "_async_session_store", None)
         if facade is None or facade._store is not self.session_store:
-            facade = AsyncSessionStore(self.session_store, offload=native_to_thread)
+            facade = AsyncSessionStore(self.session_store, offload=partial(native_session_offload, self))
             self._async_session_store = facade
         return facade
 

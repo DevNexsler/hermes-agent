@@ -65,7 +65,8 @@ async def test_real_core_executor_stays_counted_after_base_task_cancel(native, m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('boundary', ['store', 'db'])
-async def test_real_sqlite_facade_worker_survives_cancel(native, monkeypatch, boundary, executor_futures):
+@pytest.mark.parametrize('leased', [True, False])
+async def test_real_sqlite_facade_worker_survives_cancel(native, monkeypatch, boundary, executor_futures, leased):
     entered, exited, release = asyncio.Event(), asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
     if boundary == 'store':
@@ -86,7 +87,8 @@ async def test_real_sqlite_facade_worker_survives_cancel(native, monkeypatch, bo
             loop.call_soon_threadsafe(exited.set)
     monkeypatch.setattr(target, method, pending)
     async def request():
-        with gateway_ingress(native.runner):
+        from contextlib import nullcontext
+        with gateway_ingress(native.runner) if leased else nullcontext():
             await getattr(facade, method)(*args)
     task = asyncio.create_task(request())
     try:
@@ -96,7 +98,8 @@ async def test_real_sqlite_facade_worker_survives_cancel(native, monkeypatch, bo
         with pytest.raises(asyncio.CancelledError):
             await task
         status = gateway_admission_status(native.runner)
-        assert not status['quiescent'] and status['adopted'] >= 1
+        assert not status['quiescent']
+        assert status['adopted' if leased else 'active_work'] >= 1
     finally:
         release.set()
         await asyncio.wait_for(exited.wait(), 5)
@@ -150,6 +153,39 @@ async def test_native_turn_worker_handoff_keeps_physical_owner_after_cancel(nati
             await worker.executor_task
         status = gateway_admission_status(native.runner)
         assert status['adopted'] >= 1 and not status['quiescent']
+    finally:
+        release.set()
+        await asyncio.wait_for(exited.wait(), 5)
+        await settled(executor_futures)
+    assert gateway_admission_status(native.runner)['quiescent']
+
+
+@pytest.mark.asyncio
+async def test_unleased_pre_session_base_thread_remains_owned_after_cancel(native, monkeypatch, executor_futures):
+    entered, exited, release = asyncio.Event(), asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    native.adapter._topic_recovery_fn = lambda *args: None
+    original = native.adapter._apply_topic_recovery
+    def pending(event):
+        try:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(10)
+            return original(event)
+        finally:
+            loop.call_soon_threadsafe(exited.set)
+    monkeypatch.setattr(native.adapter, '_apply_topic_recovery', pending)
+    event = MessageEvent(text='unleased pre-session thread', source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id='123456', user_id='u1', chat_type='dm'))
+    task = asyncio.create_task(native.adapter.handle_message(event))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        native.runner._enter_external_drain()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        status = gateway_admission_status(native.runner)
+        assert not status['quiescent'] and status['active_work'] >= 1
+        assert not native.effects
     finally:
         release.set()
         await asyncio.wait_for(exited.wait(), 5)

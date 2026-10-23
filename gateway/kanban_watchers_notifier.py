@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 from functools import partial
 from pathlib import Path
@@ -46,22 +47,8 @@ def diagnostic_event(ev) -> bool:
     if ev.kind in {"blocked", "block_loop_detected"}:
         return (ev.payload or {}).get("kind") != "needs_input"
     return ev.kind == "status" and (ev.payload or {}).get("status") in {"blocked", "triage"}
-# Consecutive send failures (adapter raised OR reported SendResult(success=False))
-# before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
-# API outage must not permanently unsubscribe a live review-gate channel.
-# Subscriptions are removed only when the task reaches the irreversible archived status. ``done`` is
-# reversible in review/controller flows, so removing its subscription would silence a later reopen. We used
-# to also unsub on any terminal event kind (gave_up / crashed / timed_out / blocked), but that silently
-# dropped the user out of the loop whenever the dispatcher respawned the task: a worker that crashes, gets
-# reclaimed, runs again, and crashes a second time would only notify on the first crash because the
-# subscription was deleted after the first event. Same shape as the reblock-after-unblock cycle that PR
-# #22941 fixed for `blocked`. Keeping the subscription alive until the task is archived lets the cursor
-# (advanced atomically by claim_unseen_events_for_sub) handle dedup, and any retry-loop event reaches the
-# user. Per-subscription send-failure counter. Adapter.send raising means the chat is dead (deleted, bot
-# kicked, etc.) — after N consecutive send failures the sub is dropped so we don't spin against a dead chat
-# every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
-# unattended gate where a false drop means silent work pileup.
-MAX_SEND_FAILURES = 12
+# Unknown notification effects retain durable subscription attention indefinitely.
+# Completion is reversible; only an explicitly settled attempt may advance delivery.
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
@@ -288,6 +275,10 @@ class _Collector:
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
         """Claim one subscription's unseen events; None when skipped or nothing new."""
         owner_profile = sub.get("notifier_profile") or None
+        if 'notification_attention_v1' in (sub.get('delivery_metadata') or {}):
+            logger.warning('kanban notification UNKNOWN: task=%s owner=%s; inspect `hermes kanban notify-list %s --json`; no resend',
+                           sub['task_id'], owner_profile or 'default', sub['task_id'])
+            return None
         platform = (sub.get("platform") or "").lower()
         if platform not in self.active_platforms:
             logger.debug("kanban notifier: subscription for %s on %s skipped; adapter not connected",
@@ -297,12 +288,20 @@ class _Collector:
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
+        from gateway.session import SessionSource
+        profile = owner_profile or self.notifier_profile or 'default'
+        source = SessionSource(platform=Platform(platform), chat_id=sub['chat_id'], profile=owner_profile)
+        profile_home = self.runner._resolve_profile_home_for_source(source).resolve()
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+            attention_context={'owner': f"profile:{profile}/{platform}:subscriber:{sub.get('user_id') or sub['chat_id']}",
+                               'profile': profile, 'profile_home': str(profile_home), 'board': slug},
         )
         if not events:
             return None
+        sub = next(item for item in _kbn().list_notify_subs(conn, sub['task_id'])
+                   if all(item.get(field) == sub.get(field) for field in ('platform', 'chat_id', 'thread_id')))
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
@@ -316,7 +315,10 @@ class _Collector:
         try:
             conn = _kbc().connect(board=slug)
         except Exception as exc:
-            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+            barrier = getattr(self.runner, '_ingress_barrier', None)
+            if barrier is not None:
+                barrier.fail_quiescence()
+            logger.error("kanban notifier: board %s unreadable; readiness unknown", slug)
             return
         try:
             if self.gc_due:
@@ -333,7 +335,10 @@ class _Collector:
                     if claimed is not None:
                         self.deliveries.append(claimed)
                 except Exception as sub_exc:
-                    # One bad subscription must not block the rest of the tick.
+                    barrier = getattr(self.runner, '_ingress_barrier', None)
+                    if barrier is not None:
+                        barrier.fail_quiescence()
+                    # Keep other obligations visible; never turn unreadability into idle.
                     logger.warning("kanban notifier: subscription for %s on board %s failed: %s",
                                    sub.get("task_id"), slug, sub_exc)
         finally:
@@ -477,9 +482,9 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
 class _KanbanNotification:
     """Deliver one subscription's claimed events, then settle the cursor.
 
-    Both legs of notify+wake must succeed before settling. Sent pings have a
-    separate durable checkpoint so wake retries do not resend them. Admission
-    is at-least-once queueing, not an execution or final-response receipt.
+    Sent pings have independent durable checkpoints. Only a proven pre-effect wake
+    refusal may retry; generic failures retain UNKNOWN attention. Transport admission
+    is not an execution or final-response receipt.
     """
 
     def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
@@ -509,17 +514,31 @@ class _KanbanNotification:
         self.plat: Any = None
         self.adapter: Any = None
         self.is_push_adapter = True
+        self.attention = (sub.get('delivery_metadata') or {}).get('notification_attention_v1')
         self.wake_kinds: set = set()
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
+    async def _checkpoint(self, outcome):
+        """Actual SQLite future remains owned through cancellation; failures block readiness."""
+        from gateway.admission import native_in_executor
+        from gateway.kanban_watchers_common import _run_in_fresh_context
+        def checkpoint():
+            try:
+                self.runner._kanban_sub_op(self.board_slug, 'checkpoint_notify_delivery', self.sub,
+                    expected_attention=self.attention, outcome=outcome)
+            except Exception:
+                barrier = getattr(self.runner, '_ingress_barrier', None)
+                if barrier is not None:
+                    barrier.fail_quiescence()
+                raise
+        await native_in_executor(self.runner, None, _run_in_fresh_context, checkpoint)
+
     async def rewind(self) -> None:
-        await _to_thread_process_service(
-            self.runner._kanban_rewind, self.sub, self.d["cursor"], self.d.get("old_cursor", 0), self.board_slug,
-        )
+        await self._checkpoint('refused')
 
     async def advance(self) -> None:
-        await _to_thread_process_service(self.runner._kanban_advance, self.sub, self.d["cursor"], self.board_slug)
+        await self._checkpoint('accepted')
 
     async def unsub(self) -> None:
         await _to_thread_process_service(self.runner._kanban_unsub, self.sub, self.board_slug)
@@ -527,21 +546,11 @@ class _KanbanNotification:
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
 
-    async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
-        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
-        fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
-        self.sub_fail_counts[self.sub_key] = fails
-        logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
-        if fails >= MAX_SEND_FAILURES:
-            logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
-            await self.unsub()
-            self.clear_failures()
-        else:
-            await self.rewind()
-
-    async def _wake_failed(self, fmt: str, exc: Exception) -> None:
-        drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
-        await self.delivery_failed(fmt, (self.task_id,), drop_fmt, exc, True)
+    async def _retain_unknown(self, exc: Exception) -> None:
+        """Unknown effects retain the precommitted attempt, never rewind/retry/drop."""
+        logger.error('kanban notification UNKNOWN task=%s profile=%s; inspect `hermes kanban notify-list %s --json`; no resend (%s)',
+                     self.task_id, self.sub_profile or 'default', self.task_id, type(exc).__name__)
+        await self._checkpoint('inspect')
 
     # -- formatting --
 
@@ -615,7 +624,19 @@ class _KanbanNotification:
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
     async def wake(self) -> None:
-        """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
+        """A wake is a separate effect leg; already-checkpointed pings do not lend permission."""
+        from gateway.admission import GatewayDraining, native_producer_ingress
+        from gateway.wake import WakeNotAccepted
+        try:
+            with native_producer_ingress(self.runner):
+                await self._wake_reserved()
+        except GatewayDraining as exc:
+            if exc.pre_effect:
+                raise WakeNotAccepted('notification wake refused before effects') from exc
+            raise RuntimeError('notification wake outcome unknown') from exc
+
+    async def _wake_reserved(self) -> None:
+        """Wake the creator session under its independently owned reservation."""
         from gateway.wake import deliver_wake
         sub = self.sub
         if not self.is_push_adapter:
@@ -663,12 +684,15 @@ class _KanbanNotification:
         from gateway.warning_notifications import present_notification
         sub, adapter = self.sub, self.adapter
         delivery_metadata = sub.get("delivery_metadata")
-        metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
+        metadata: dict[str, Any] = ({key: value for key, value in delivery_metadata.items()
+                                     if key != 'notification_attention_v1'} if isinstance(delivery_metadata, dict) else {})
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
         _send_res = None
         async def send_ping():
+            from gateway.admission import mark_ingress_effect
             nonlocal _send_res
+            mark_ingress_effect(self.runner)
             _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
         if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
             return False
@@ -691,11 +715,11 @@ class _KanbanNotification:
                     event_payload=getattr(ev, "payload", None), task=self.task,
                 )
             except Exception as art_exc:
-                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+                raise RuntimeError("notification artifact outcome unknown") from art_exc
         return True
 
     async def _send_pings(self) -> bool:
-        """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        """Send every text ping; failures retain durable UNKNOWN attention."""
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
@@ -724,18 +748,20 @@ class _KanbanNotification:
                 ))
                 self.clear_failures()
             except Exception as exc:
-                await self.delivery_failed(
-                    "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
-                    "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,
-                )
+                await self._retain_unknown(exc)
                 return False
         return True
 
     async def deliver(self) -> None:
+        if self.sub_profile and getattr(getattr(self.runner, 'config', None), 'multiplex_profiles', False):
+            from hermes_cli.profiles import profile_exists
+            if not profile_exists(self.sub_profile):
+                await self.rewind()  # No owner scope, ping, artifact or wake entered yet.
+                return
         try:
             self.plat = self.platform_cls(self.platform_str)
         except ValueError:
-            await self.advance()
+            await self._checkpoint("inspect")
             return
         # Recheck the exact route after claiming: config/adapters can change between ticks. The
         # recheck reads the served profile's session store for a stateless destination, so it runs
@@ -754,6 +780,7 @@ class _KanbanNotification:
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
         async with self._owner_scope():
+            await self._checkpoint("inspect")
             if not await self._send_pings():
                 return
             # All text pings delivered (or skipped for non-push / wake-only).
@@ -776,7 +803,7 @@ class _KanbanNotification:
                 if self.wake_kinds:
                     wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
             self.d = {**self.d, "events": original_events}
-        wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
+        is_push = self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
         # A requested wake is required even when its passive ping already landed.
@@ -791,11 +818,7 @@ class _KanbanNotification:
                 await self.rewind()
                 return
             except Exception as _wk_err:
-                await self._wake_failed(
-                    "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
-                    else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
-                    _wk_err,
-                )
+                await self._retain_unknown(_wk_err)
                 return
 
         # Delivery complete: advance the cursor (the dedup mechanism).

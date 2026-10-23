@@ -16,18 +16,25 @@ import threading
 
 logger = logging.getLogger(__name__)
 _ingress = ContextVar('gateway_ingress', default=None)
+_native_runner = ContextVar('gateway_native_io_owner', default=None)
 
 
 class GatewayDraining(RuntimeError):
-    """No transport turn accepted. Retry the same delivery after readiness/busy state clears."""
+    """Admission unavailable. Only pre_effect=True attests a no-effect refusal."""
 
     status = 503
     headers = {'Retry-After': '1'}
+
+    def __init__(self, message, *, pre_effect=False, reason='unproven'):
+        super().__init__(message)
+        self.pre_effect = pre_effect is True
+        self.reason = reason
 
 
 class _IngressLease:
     def __init__(self, barrier, owner, startup=None):
         self.startup = startup
+        self.effect_started = False
         self.barrier = barrier
         self.owners = {owner}
 
@@ -67,7 +74,7 @@ class GatewayAdmission:
     def reserve(self, owner, *, startup=None):
         with self._lock:
             if self._closed or not self._ready(startup=startup is not None):
-                raise GatewayDraining('gateway admission closed or not ready')
+                raise GatewayDraining('gateway admission closed or not ready', pre_effect=True, reason='closed_or_unready')
             self._ingress += 1
             return _IngressLease(self, owner, startup)
 
@@ -163,12 +170,25 @@ def gateway_ingress(runner):
 
 @contextmanager
 def _reserve_ingress(runner, *, startup=None):
-    barrier = _barrier(runner)
+    try:
+        barrier = _barrier(runner)
+    except GatewayDraining as exc:
+        raise GatewayDraining(str(exc), pre_effect=_ingress.get() is None, reason='missing_capability') from exc
     owner = asyncio.current_task()
-    lease = barrier.reserve(owner, startup=startup)
+    previous = _ingress.get()
+    try:
+        lease = barrier.reserve(owner, startup=startup)
+    except GatewayDraining as exc:
+        if previous is not None and previous.effect_started:
+            exc.pre_effect = False
+        raise
     token = _ingress.set(lease)
     try:
         yield
+    except GatewayDraining as exc:
+        if lease.effect_started:
+            exc.pre_effect = False
+        raise
     finally:
         _ingress.reset(token)
         barrier.release(lease, owner)
@@ -185,15 +205,26 @@ def startup_resume_admitted(runner, event, session_key):
             and lease.startup[0] is event and lease.startup[1] == session_key)
 
 
+def startup_session_admitted(runner, session_key):
+    """Native goal producer may retain boot provenance only for its owned session."""
+    lease = _ingress.get()
+    return (ingress_admitted(runner) and lease.startup is not None and lease.startup[1] == session_key)
+
+
 async def prepare_ingress_dispatch(adapter, event, session_key):
     """Refuse backlog before Base acknowledges; route another adapter's live turn inline."""
     runner = adapter.gateway_runner
     if not ingress_admitted(runner) or startup_resume_admitted(runner, event, session_key):
         return False
-    if runner._draining and (session_key in adapter._active_sessions or runner._is_session_running(session_key)):
-        raise GatewayDraining('shutdown cannot accept a busy handoff')
+    busy = session_key in adapter._active_sessions or runner._is_session_running(session_key)
+    if busy and (event.get_command() not in (None, 'steer') or event.media_urls or event.media_types
+                 or event.message_type.value != 'text'):
+        raise GatewayDraining('retryable busy ingress requires plain text steer',
+                              pre_effect=not _ingress.get().effect_started, reason='busy_unsupported')
+    if runner._draining and busy:
+        raise GatewayDraining('shutdown cannot accept a busy handoff', pre_effect=not _ingress.get().effect_started, reason='busy_shutdown')
     if adapter._pending_messages.get(session_key) or runner._overflow_queue(session_key):
-        raise GatewayDraining('accepted session backlog must finish before retryable ingress')
+        raise GatewayDraining('accepted session backlog must finish before retryable ingress', pre_effect=not _ingress.get().effect_started, reason='busy_backlog')
     if runner._is_session_running(session_key) and session_key not in adapter._active_sessions:
         await adapter._handle_message_while_active(event, session_key)
         return True
@@ -206,6 +237,12 @@ def ingress_admitted(runner):
     barrier = getattr(runner, '_ingress_barrier', None)
     return (isinstance(barrier, GatewayAdmission) and lease is not None
             and barrier.held(lease, asyncio.current_task()))
+
+
+def mark_ingress_effect(runner):
+    """Once notice/core/steer effects begin, later 503 cannot attest no effect."""
+    if ingress_admitted(runner):
+        _ingress.get().effect_started = True
 
 
 def adopt_ingress_task(runner, task):
@@ -249,7 +286,8 @@ def native_producer_ingress(runner):
 def refuse_queued_ingress(runner):
     """Retryable ingress starts/steers directly; its caller retains work instead of a memory queue."""
     if ingress_admitted(runner):
-        raise GatewayDraining('retryable ingress cannot enter an in-memory follow-up queue')
+        raise GatewayDraining('retryable ingress cannot enter an in-memory follow-up queue',
+                              pre_effect=not _ingress.get().effect_started, reason='busy_queue_refused')
 
 
 
@@ -271,14 +309,24 @@ def admit_gateway_message(handler):
     @wraps(handler)
     async def admitted(adapter, event):
         runner = adapter.gateway_runner
-        if not event.internal or ingress_admitted(runner):
-            return await handler(adapter, event)
-        event._gateway_accepted = False
+        token = _native_runner.set(runner)
         try:
-            with gateway_ingress(runner):
+            if event.get_command() not in (None, 'queue', 'steer'):
+                mark_ingress_effect(runner)
+            if not event.internal or ingress_admitted(runner):
                 return await handler(adapter, event)
-        except GatewayDraining:
-            return  # admit_internal_event converts the false receipt to refundable WakeNotAccepted
+            event._gateway_accepted = False
+            try:
+                with gateway_ingress(runner):
+                    if event.get_command() not in (None, 'queue', 'steer'):
+                        mark_ingress_effect(runner)
+                    return await handler(adapter, event)
+            except GatewayDraining as exc:
+                if not exc.pre_effect:
+                    raise RuntimeError('native wake outcome unknown') from exc
+                return  # Only a positively pre-effect refusal is refundable WakeNotAccepted.
+        finally:
+            _native_runner.reset(token)
     return admitted
 
 
@@ -292,11 +340,19 @@ async def ingress_to_thread(function, /, *args, **kwargs):
 
 
 async def native_to_thread(function, /, *args, **kwargs):
-    """Native I/O policy: retain leased physical work; ordinary observers keep to_thread."""
+    """Native I/O retains physical work; runner identity grants no admission permission."""
     lease = _ingress.get()
     if lease is not None and lease.barrier.held(lease, asyncio.current_task()):
         return await ingress_to_thread(function, *args, **kwargs)
+    runner = _native_runner.get()
+    if runner is not None:
+        return await native_session_offload(runner, function, *args, **kwargs)
     return await asyncio.to_thread(function, *args, **kwargs)
+
+
+async def native_session_offload(runner, function, /, *args, **kwargs):
+    """Session facades retain physical workers with or without authenticated ingress."""
+    return await native_in_executor(runner, None, partial(function, *args, **kwargs))
 
 
 async def native_in_executor(runner, executor, function, /, *args):

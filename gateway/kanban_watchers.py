@@ -15,6 +15,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from gateway.admission import admit_gateway_work, native_in_executor
+from functools import partial
+
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
@@ -108,17 +111,19 @@ class GatewayKanbanWatchersMixin:
                     _gc_next_at = time.monotonic() + _GC_INTERVAL_SECONDS
                     _retention = _gc_retention_days()
 
-                deliveries = await asyncio.to_thread(
-                    _notifier_collect, self, _kb,
-                    notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
-                )
-                for d in deliveries:
-                    await _KanbanNotification(
-                        self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
-                    ).deliver()
+                await self._kanban_notifier_tick(_kb, _Platform, sub_fail_counts,
+                    notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)
+
+    @admit_gateway_work
+    async def _kanban_notifier_tick(self, kb, platform_cls, sub_fail_counts, **collect_options):
+        """Reserve before claiming; retained intent owns cancellation/crash ambiguity."""
+        deliveries = await native_in_executor(self, None, partial(_notifier_collect, self, kb, **collect_options))
+        for delivery in deliveries:
+            await _KanbanNotification(self, delivery, platform_cls=platform_cls,
+                                      sub_fail_counts=sub_fail_counts).deliver()
 
     def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""

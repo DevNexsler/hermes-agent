@@ -318,10 +318,11 @@ class GatewayGoalsMixin:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                from gateway.admission import native_producer_ingress, without_gateway_ingress
+                from gateway.admission import native_producer_ingress, startup_session_admitted, without_gateway_ingress
                 continuation = self._synthetic_prompt_event(source, prompt)
                 continuation._goal_admission_checkpoint = {'session_id': mgr.session_id,
-                                                            'final_response': final_response}
+                                                            'final_response': final_response,
+                                                            'startup_restore': startup_session_admitted(self, _quick_key)}
                 with native_producer_ingress(self), without_gateway_ingress():
                     self._enqueue_fifo(_quick_key, continuation, adapter)
         except Exception as exc:
@@ -336,20 +337,51 @@ class GatewayGoalsMixin:
         checkpoint = getattr(event, '_goal_admission_checkpoint', None)
         if checkpoint is None:
             return False
-        from hermes_cli.goals import GoalManager
-        mgr = await self._run_in_executor_with_context(lambda: GoalManager(checkpoint['session_id']))
-        if mgr.state is None:
-            self._ingress_barrier.fail_quiescence()
-            raise RuntimeError('queued goal checkpoint unavailable')
-        if not mgr.is_active():
-            return True  # User/foreign pause or completion wins; never restart its queued continuation.
-        return await self._defer_goal_for_maintenance(
-            mgr, event.source, event.text, checkpoint['final_response'], input_context={
-                'message_id': event.message_id, 'channel_prompt': event.channel_prompt,
-                'channel_context': event.channel_context, 'raw_message': event.raw_message})
+        from gateway.run import _async_profile_runtime_scope
+        home = self._resolve_profile_home_for_source(event.source)
+        async with _async_profile_runtime_scope(home, offload=self._run_in_executor_with_context):
+            from hermes_cli.goals import GoalManager
+            mgr = await self._run_in_executor_with_context(lambda: GoalManager(checkpoint['session_id']))
+            if mgr.state is None:
+                self._ingress_barrier.fail_quiescence()
+                raise RuntimeError('queued goal checkpoint unavailable')
+            if not mgr.is_active():
+                return True  # User/foreign pause or completion wins; never restart its queued continuation.
+            return await self._defer_goal_for_maintenance(
+                mgr, event.source, event.text, checkpoint['final_response'], input_context={
+                    'message_id': event.message_id, 'channel_prompt': event.channel_prompt,
+                    'channel_context': event.channel_context, 'raw_message': event.raw_message})
 
-    def _track_goal_drain_checkpoint(self, event, task):
+    async def _run_goal_fifo_drain(self, adapter, event, session_key):
+        """Fresh goal permission spans preflight through core entry; closed work becomes durable pause."""
+        from gateway.admission import GatewayDraining, native_producer_ingress, startup_resume_ingress
+        startup = (getattr(self, '_startup_restore_in_progress', False)
+                   and event._goal_admission_checkpoint.get('startup_restore') is True)
+        scope = startup_resume_ingress(self, event, session_key) if startup else native_producer_ingress(self)
+        started = False
+        guard = adapter._active_sessions.get(session_key)
+        try:
+            with scope:
+                started = True
+                await adapter._process_message_background(event, session_key)
+        except GatewayDraining:
+            if started or not await self._defer_queued_goal_for_maintenance(event):
+                self._ingress_barrier.fail_quiescence()
+                raise RuntimeError('goal continuation ownership unconfirmed')
+        finally:
+            if not started and adapter._session_tasks.get(session_key) is asyncio.current_task():
+                adapter._cleanup_finished_session_task(session_key, guard)
+
+    def _retain_goal_fifo_followup(self, adapter, event, session_key):
+        """Keep an already accepted goal in existing FIFO; its fresh Base task owns admission."""
+        if session_key not in adapter._pending_messages:
+            adapter._pending_messages[session_key] = event
+        else:
+            self._session_state(session_key).conversation.queued_events.append(event)
+
+    def _track_goal_drain_checkpoint(self, adapter, event, session_key, task):
         """A queued goal cancelled before its first step still gets a durable maintenance handoff."""
+        guard = adapter._active_sessions.get(session_key)
         def finished(done):
             barrier = self._ingress_barrier
             closed = barrier._closed or self._draining or self._external_drain_active
@@ -361,6 +393,8 @@ class GatewayGoalsMixin:
             tasks = self.__dict__.setdefault('_deferred_agent_cleanup_tasks', set())
             self._track_task_in(tasks, cleanup)
             def verified(result):
+                if adapter._session_tasks.get(session_key) is done:
+                    adapter._cleanup_finished_session_task(session_key, guard)
                 if result.cancelled() or result.exception() is not None:
                     barrier.fail_quiescence()
             cleanup.add_done_callback(verified)

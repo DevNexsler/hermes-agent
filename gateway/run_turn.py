@@ -3452,7 +3452,6 @@ class GatewayTurnMixin:
                 # `.turn.agent` on the session state is only reset to _AGENT_PENDING_SENTINEL when the
                 # *next* turn is claimed (see _session_state(...).turn.agent = ... at claim time), so a
                 # stale reference to this exact agent instance stays reachable from
-                # _interrupt_and_clear_session() until then. See #76115.
                 _finished_agent = agent_holder[0] if agent_holder else None
                 if _finished_agent is not None:
                     _finished_agent._gateway_turn_process_task_id = ""
@@ -3468,6 +3467,8 @@ class GatewayTurnMixin:
                 name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                 daemon=True,
             ).start()
+        from gateway.admission import mark_ingress_effect
+        mark_ingress_effect(self)
         worker.executor_task = adopt_ingress_task(self, asyncio.ensure_future(
             self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
         ))
@@ -3777,7 +3778,8 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        if pending_event is not None and await self._defer_queued_goal_for_maintenance(pending_event):
+        if getattr(pending_event, '_goal_admission_checkpoint', None) is not None:
+            self._retain_goal_fifo_followup(adapter, pending_event, turn_ctx.session_key)
             return response
         from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
@@ -3794,8 +3796,7 @@ class GatewayTurnMixin:
         if _active and session_key and session_key in _active:
             _active[session_key].clear()
 
-        # Cap recursion depth (user keeps sending while the agent keeps failing).
-        # (#816)
+        # Bound recursive human follow-ups (#816).
         if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
             logger.warning(
                 "Interrupt recursion depth %d reached for session %s — "

@@ -3515,8 +3515,10 @@ class BasePlatformAdapter(ABC):
         return response.text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
-        """Call the handler and send its reply inline, with retry, threading and
-        ephemeral deletion — no session lifecycle (active-session bypass paths)."""
+        """Dispatch bypass replies without a competing session lifecycle."""
+        from gateway.admission import mark_ingress_effect
+        if event.get_command() not in ('queue', 'steer', None):
+            mark_ingress_effect(self.gateway_runner)
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
@@ -3525,6 +3527,7 @@ class BasePlatformAdapter(ABC):
         if log_cmd is not None:
             logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                         len(text), event.source.chat_id)
+        mark_ingress_effect(self.gateway_runner)
         result = await self._send_with_retry(
             chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
             metadata=_mark_notify_metadata(thread_meta))
@@ -3532,8 +3535,7 @@ class BasePlatformAdapter(ABC):
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
-        """Routed home + terminal policy for post-handler text, media and error delivery;
-        a no-op without a runner or outside multiplexing."""
+        """Bind routed home and terminal policy during delivery."""
         resolve = getattr(self.gateway_runner, "_media_delivery_scope_for_source", None)
         if not callable(resolve) or source is None:
             return contextlib.nullcontext()
@@ -3993,8 +3995,7 @@ class BasePlatformAdapter(ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
-        # Bypass commands run inline: queueing deadlocks /approve and leaks /new as user text.
-        # A second background lifecycle races the owner task (#4926).
+        # Inline bypass avoids approval deadlocks and competing lifecycle ownership.
         from gateway.admission import GatewayDraining, refuse_queued_ingress
         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
         cmd = event.get_command()
@@ -4558,10 +4559,12 @@ class BasePlatformAdapter(ABC):
         from gateway.admission import without_gateway_ingress
         self._clear_session_guard(session_key)
         with without_gateway_ingress():
-            task = asyncio.create_task(self._process_message_background(pending_event, session_key))
+            task = asyncio.create_task(self.gateway_runner._run_goal_fifo_drain(self, pending_event, session_key)
+                if getattr(pending_event, '_goal_admission_checkpoint', None) is not None
+                else self._process_message_background(pending_event, session_key))
             self._track_session_task(session_key, task)
             if getattr(pending_event, '_goal_admission_checkpoint', None) is not None:
-                self.gateway_runner._track_goal_drain_checkpoint(pending_event, task)
+                self.gateway_runner._track_goal_drain_checkpoint(self, pending_event, session_key, task)
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""

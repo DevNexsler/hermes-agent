@@ -283,3 +283,80 @@ async def test_maintenance_checkpoint_real_multiplex_home_scope_a_b_a(native):
                 db.close()
     finally:
         set_multiplex_active(False)
+
+
+@pytest.mark.asyncio
+async def test_queued_goal_binds_route_before_checkpoint_lookup(native, monkeypatch):
+    from gateway.run import _profile_runtime_scope
+    from agent.secret_scope import set_multiplex_active
+    b = native.home / 'profiles' / 'b'
+    b.mkdir(parents=True)
+    (b / 'config.yaml').write_text('{}\n')
+    native.runner.config.multiplex_profiles = True
+    sid = 'synthetic-shared-id'
+    with _profile_runtime_scope(native.home):
+        GoalManager(sid).set('A goal must remain active')
+    with _profile_runtime_scope(b):
+        GoalManager(sid).set('B routed goal must pause')
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='123456', profile='b')
+    event = MessageEvent(text='exact B continuation', source=source)
+    event._goal_admission_checkpoint = {'session_id': sid, 'final_response': 'B prior result'}
+    assert native.runner._resolve_profile_home_for_source(source).resolve() == b.resolve()
+    set_multiplex_active(True)
+    try:
+        native.runner._enter_external_drain()
+        assert await native.runner._defer_queued_goal_for_maintenance(event)
+        with _profile_runtime_scope(native.home):
+            assert GoalManager(sid).state.status == 'active'
+        with _profile_runtime_scope(b):
+            assert GoalManager(sid).state.status == 'paused'
+    finally:
+        set_multiplex_active(False)
+
+
+@pytest.mark.asyncio
+async def test_fence_after_queued_goal_preflight_cannot_drop_continuation(native, monkeypatch):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='123456', user_id='u1', chat_type='dm')
+    entry = native.runner.session_store.get_or_create_session(source)
+    GoalManager(entry.session_id).set('synthetic continuation settlement')
+    monkeypatch.setattr('hermes_cli.goals.judge_goal', lambda *a, **k: ('continue', 'more', False, None, False))
+    with gateway_ingress(native.runner):
+        await native.runner._post_turn_goal_continuation(session_entry=entry, source=source, final_response='partial')
+    key = native.runner._session_key_for_source(source)
+    event = native.adapter._pending_messages.pop(key)
+    original = native.adapter._run_processing_hook
+    async def close_after_preflight(label, *args):
+        if label == 'on_processing_start':
+            native.runner._enter_external_drain()
+        return await original(label, *args)
+    monkeypatch.setattr(native.adapter, '_run_processing_hook', close_after_preflight)
+    native.finish.set()
+    native.adapter._spawn_drain_task(event, key)
+    await asyncio.wait_for(asyncio.gather(*native.adapter._background_tasks), 5)
+    assert native.effects == [event.text] or GoalManager(entry.session_id).state.status == 'paused'
+
+
+@pytest.mark.asyncio
+async def test_native_startup_goal_continuation_owns_fresh_event_while_http_unready(native, monkeypatch):
+    from gateway.admission import GatewayDraining, startup_resume_ingress
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='123456', user_id='u1', chat_type='dm')
+    entry = native.runner.session_store.get_or_create_session(source)
+    GoalManager(entry.session_id).set('synthetic startup standing goal')
+    key = native.runner._session_key_for_source(source)
+    owner = MessageEvent(text='', source=source, internal=True)
+    monkeypatch.setattr('hermes_cli.goals.judge_goal', lambda *a, **k: ('continue', 'more', False, None, False))
+    native.runner._startup_restore_in_progress = True
+    try:
+        with startup_resume_ingress(native.runner, owner, key):
+            await native.runner._post_turn_goal_continuation(session_entry=entry, source=source, final_response='partial')
+        event = native.adapter._pending_messages.pop(key)
+        with pytest.raises(GatewayDraining):
+            with gateway_ingress(native.runner):
+                raise AssertionError('HTTP borrowed native startup permission')
+        native.finish.set()
+        native.adapter._spawn_drain_task(event, key)
+        await asyncio.wait_for(asyncio.gather(*native.adapter._background_tasks), 5)
+        assert native.effects == [event.text]
+        assert not native.runner._ingress_barrier._uncertain_work
+    finally:
+        native.runner._startup_restore_in_progress = False

@@ -422,3 +422,44 @@ assets before release after a failed deployment. This feature cannot fence an ol
 qualifying the initial upgrade and rollback to source without this capability requires a separate
 old-process quiescence/bootstrap proof. Source installation or a passing test is not that proof.
 
+
+Positive refusal is narrower than HTTP503 or the exception type. `GatewayDraining` exposes
+`pre_effect` (strict bool, default False) and stable `reason`. Admission/preflight/queue refusal
+before any invocation can attest True. The lease marks effects **before** core, notice and every
+parent/child steer invocation; mark never resets, including cancellation or a returned False.
+Nested/callee typed exceptions cannot upgrade proof after this mark. Attempted steering that
+fails or declines remains UNKNOWN; no inferred no-effect or automatic retry. Ordinary human
+fanout keeps its existing behavior. Busy leased control/media/interrupt fallbacks refuse before
+invocation; direct confirmed steer or fresh start remain the acceptance paths.
+
+An extension may offer version1 refusal receipts only with explicit True and an allowlisted
+reason, synchronously authenticated request version/DD headers, and exact body/DD binding when
+body was read. Generic503/500, malformed or missing proof, timeout and wrong identity are UNKNOWN.
+The external consumer owns its wire schema and durable intent; native source supplies no resend
+policy. Missing admission capability at first ingress refuses before body work.
+
+Kanban notification claims atomically store a scalar JSON string in existing subscription
+`delivery_metadata.notification_attention_v1` with schema version1, outcome UNKNOWN, exact
+attempt id, original/claimed cursor, complete task/result/event snapshots, original subscription,
+owner principal, profile/home/board/database realpath, time/reason and required operator action.
+Record and claim commit together before any ping/artifact/wake. Any present attention, including
+malformed/foreign state, blocks collector effects and stale-subscription GC. Generic errors,
+crash and cancellation never rewind, automatically retry or drop after a failure count. Existing
+`hermes kanban notify-list [task] --json` exposes the complete record; text listing marks UNKNOWN
+and shows owner/attempt/cursors. Private attention never travels in platform send metadata.
+Owner identifies the exact profile/subscriber principal; rollout must map this to a named
+accountable operator and preserve actionable handoff, not claim a human assignment was automatic.
+
+Only an unchanged owned attention+cursor can settle successful delivery. Proven pre-effect
+refusal clears its exact attempt and rewinds only its owned cursor; independently committed ping
+receipts survive. Wake reserves a separate native leg after ping checkpoints. SQL/write/readback
+or ownership failures block strict readiness. Attention never expires or resolves automatically;
+no general manual resolution/resend command is introduced. Incapable older source can ignore
+these fields, so rollback safety still requires independent closure and retention proof.
+
+Queued goal checkpoints bind their owning profile before lookup/pause. Fresh reservation spans
+preflight through core entry; already accepted in-core goal followups return to the existing Base
+FIFO for a separately reserved task. Native boot continuation retains verified same-session boot
+provenance in a fresh event/session reservation; HTTP cannot borrow it. Session facade callbacks
+retain unleased physical futures too. Base carries runner I/O identity independently of ingress
+permission; clearing human FIFO ingress never removes physical-worker ownership.

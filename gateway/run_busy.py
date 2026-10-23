@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
-from gateway.admission import native_to_thread
+from gateway.admission import ingress_admitted, mark_ingress_effect, native_to_thread
 import contextlib
 import json
 import os
@@ -266,8 +266,7 @@ class GatewayBusySessionMixin:
         except Exception:
             return False
 
-    @staticmethod
-    def _steer_active_subagents(running_agent: Any, text: str) -> int:
+    def _steer_active_subagents(self, running_agent: Any, text: str) -> int:
         """Queue *text* into every live child of *running_agent*; returns how many accepted it.
 
         A parent blocked inside ``delegate_task`` only drains its own steer queue after the tool
@@ -289,16 +288,27 @@ class GatewayBusySessionMixin:
             if not callable(steer):
                 continue
             try:
+                mark_ingress_effect(self)
                 accepted += bool(steer(text))
             except Exception as exc:
+                if ingress_admitted(self):
+                    raise
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
     def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
+        mark_ingress_effect(self)
+        try:
+            accepted = bool(running_agent.steer(text))
+            children_accepted = self._steer_active_subagents(running_agent, text)
+        except Exception as exc:
+            if ingress_admitted(self):
+                mark_ingress_effect(self)
+                raise RuntimeError(f'steer outcome unknown: {exc}') from exc
+            raise
+        return bool(children_accepted) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """True when a compression lock is held for this session's id (callers demote interrupt →
@@ -415,6 +425,7 @@ class GatewayBusySessionMixin:
         text = (event.text or "").strip()
         if not self._pending_event_audio_paths(event):
             return text
+        mark_ingress_effect(self)
         enriched_text, successful_transcripts = await self._transcribe_and_echo_pending_voice(
             event, self._delivery_adapter_for(event.source), event.source, text, log_context="Busy-steer"
         )
@@ -476,6 +487,7 @@ class GatewayBusySessionMixin:
     async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False) -> None:
         """Send a busy-path reply anchored to the event (thread metadata included)."""
         reply_anchor = self._reply_anchor_for_event(event)
+        mark_ingress_effect(self)
         await adapter._send_with_retry(
             chat_id=event.source.chat_id, content=content,
             reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
@@ -561,6 +573,9 @@ class GatewayBusySessionMixin:
     ) -> "GatewayRunner._BusySteerOutcome":
         """Apply interrupt->queue demotions, then attempt steer (steer mode) or redirect (interrupt mode)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if ingress_admitted(self) and effective_mode != 'steer':
+            from gateway.admission import refuse_queued_ingress
+            refuse_queued_ingress(self)
         # Steer injects mid-run via running_agent.steer(), falling back to queue (nothing lost) when
         # the agent isn't running yet, lacks steer(), or the payload is empty. Interrupt is demoted
         # to queue while subagents run (interrupt() would abort them); /stop and /new still cancel all.
@@ -621,8 +636,12 @@ class GatewayBusySessionMixin:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
                 return self._steer_running_agent(running_agent, call_text)
+            mark_ingress_effect(self)
             return bool(getattr(running_agent, verb)(call_text))
         except Exception as exc:
+            if ingress_admitted(self):
+                mark_ingress_effect(self)
+                raise RuntimeError(f'{verb} outcome unknown: {exc}') from exc
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
 
@@ -898,6 +917,7 @@ class GatewayBusySessionMixin:
         try:
             adapter = self._delivery_adapter_for(source)
             if adapter:
+                mark_ingress_effect(self)
                 await adapter.send(
                     str(source.chat_id), text, metadata=self._thread_metadata_for_source(source)
                 )
