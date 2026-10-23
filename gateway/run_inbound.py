@@ -1,8 +1,6 @@
 """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner.
 
-Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
-``gateway.run`` internals are imported lazily inside method bodies (import cycle),
-so ``patch("gateway.run.X")`` keeps intercepting them at call time.
+Bound via GatewayRunner MRO; late facade imports preserve patch seams and avoid cycles.
 """
 
 from __future__ import annotations
@@ -10,6 +8,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
+from gateway.admission import native_to_thread
 import concurrent.futures
 import dataclasses
 import json
@@ -698,6 +697,8 @@ class GatewayInboundMixin:
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
             return None
         if self._draining:
+            from gateway.admission import refuse_queued_ingress
+            refuse_queued_ingress(self)
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
             if queue_during_drain:
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -846,7 +847,7 @@ class GatewayInboundMixin:
         )
 
     async def _hm_cmd_new(self, event, source, _quick_key):
-        if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+        if await native_to_thread(self._is_telegram_topic_root_lobby, source):
             return True, self._telegram_topic_root_new_message()
         return await self._hm_confirm_destructive(
             event, "new", "This starts a fresh session and discards the current conversation history.",
@@ -1028,7 +1029,8 @@ class GatewayInboundMixin:
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
-        if self._draining:
+        from gateway.admission import ingress_admitted
+        if self._draining and not ingress_admitted(self):
             return True, f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now.", command
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -1303,10 +1305,9 @@ class GatewayInboundMixin:
         if _handled:
             return _result
 
-        # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
-        # conversational "yes" would execute a dangerous command.
+        # Exec approvals require /approve or /deny; conversational yes must not execute commands.
         if not is_internal:
-            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+            if await native_to_thread(self._is_telegram_topic_root_lobby, source):
                 # Debounced so a user who forgets about topic mode doesn't get ten reminders.
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
@@ -1453,7 +1454,7 @@ class GatewayInboundMixin:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
         # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
         # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
-        _img_mode = await asyncio.to_thread(
+        _img_mode = await native_to_thread(
             self._decide_image_input_mode, source=source, session_key=session_key,
         )
         if _img_mode == "native":
@@ -2013,9 +2014,9 @@ class GatewayInboundMixin:
 
     async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
         """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
-        result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
+        result = await native_to_thread(transcribe_audio, path, None, "gateway")
         if not result.get("success"):
-            fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
+            fallback = await native_to_thread(transcribe_audio_local_fallback, path)
             if fallback.get("success"):
                 logger.info("Configured STT failed for %s; recovered with local STT", path)
                 result = fallback

@@ -10,6 +10,7 @@ except ModuleNotFoundError:
     pass  # a partial ``hermes update`` can leave the bootstrap unregistered; only Windows UTF-8 stdio suffers
 
 import asyncio
+from gateway.admission import native_to_thread
 import concurrent.futures
 import dataclasses
 import json
@@ -1845,7 +1846,7 @@ def _profile_runtime_scope(
 @_asynccontextmanager
 async def _async_profile_runtime_scope(profile_home: "Path"):
     """Enter a profile scope without loading secret files on the event loop."""
-    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
+    secrets = await native_to_thread(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
 
@@ -1895,15 +1896,14 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
     """
     from tools.mcp_oauth import suppress_interactive_oauth
     from tools.mcp_tool_discovery import discover_mcp_tools
-    loop = asyncio.get_running_loop()
     with suppress_interactive_oauth():
         if not getattr(config, "multiplex_profiles", False):
-            await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+            await native_to_thread(discover_mcp_tools)
             return
         for profile_name, profile_home in _multiplex_profile_homes(config):
             try:
                 with _profile_runtime_scope(Path(profile_home)):
-                    await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+                    await native_to_thread(discover_mcp_tools)
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
@@ -2583,7 +2583,7 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
                     frames = wf.getnframes()
                     rate = wf.getframerate() or 1
                     return frames / float(rate)
-            return _format_duration(await asyncio.to_thread(_wav_duration))
+            return _format_duration(await native_to_thread(_wav_duration))
         except Exception:
             pass
     if ext in (".ogg", ".opus", ".oga"):
@@ -2591,7 +2591,7 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
             def _ogg_duration() -> float:
                 from mutagen.oggopus import OggOpus
                 return float(OggOpus(path).info.length)
-            return _format_duration(await asyncio.to_thread(_ogg_duration))
+            return _format_duration(await native_to_thread(_ogg_duration))
         except Exception:
             pass
     try:
@@ -3559,8 +3559,7 @@ class GatewayRunner(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key))
-        # Loop-side boundary: sync helpers use ``session_store`` directly; async handlers await this facade.
-        self._async_session_store = AsyncSessionStore(self.session_store)
+        self._async_session_store = AsyncSessionStore(self.session_store, offload=native_to_thread)
         self.delivery_router = DeliveryRouter(self.config)
 
     def _init_lifecycle_state(self) -> None:
@@ -3806,16 +3805,11 @@ class GatewayRunner(
         def _open():
             # Borrow the SessionStore's handle (same path) so state.db doesn't get two writers/pools.
             # The store owns/sweeps it at shutdown; this cache holds only the async wrapper (close_all).
-            # Both caches resolve the SAME ``_default_db_path()``, so the process was holding two writer
-            # connections and two read pools against one state.db — the fd budget doubled for nothing, and
-            # doubled again per profile on a multiplexed gateway (#98573). A borrowed wrapper cannot go
-            # stale in practice: the store's cache only drops handles in close_all_db_handles() (shutdown),
-            # and while the store's own open is failing there is nothing to borrow, so nothing is cached
-            # here either.
+            # Borrowed handles stay valid until the store's shutdown sweep (#98573).
             store = getattr(self, "session_store", None)
             borrowed = getattr(store, "_db", None) if store is not None else None
             if borrowed is not None:
-                wrapper = AsyncSessionDB(borrowed)
+                wrapper = AsyncSessionDB(borrowed, offload=native_to_thread)
                 # close_all_session_db_handles() must not close what the store owns (its sweep runs first).
                 wrapper.__dict__["_hermes_borrowed_handle"] = True
                 return wrapper
@@ -3823,7 +3817,7 @@ class GatewayRunner(
                 # Store handle unavailable: opening our own would resurrect the duplicate borrowed away.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                return AsyncSessionDB(acquire())
+                return AsyncSessionDB(acquire(), offload=native_to_thread)
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise
@@ -4130,7 +4124,7 @@ class GatewayRunner(
         """Return the single async facade for this runner's SessionStore."""
         facade = getattr(self, "_async_session_store", None)
         if facade is None or facade._store is not self.session_store:
-            facade = AsyncSessionStore(self.session_store)
+            facade = AsyncSessionStore(self.session_store, offload=native_to_thread)
             self._async_session_store = facade
         return facade
 
@@ -4308,9 +4302,8 @@ class GatewayRunner(
 
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
-        loop = asyncio.get_running_loop()
-        ctx = copy_context()
-        return await loop.run_in_executor(self._get_executor(), ctx.run, func, *args)
+        from gateway.admission import native_in_executor
+        return await native_in_executor(self, self._get_executor(), func, *args)
 
     async def _run_housekeeping_in_executor(self, func, *args):
         """Run best-effort session housekeeping off the TURN pool.
@@ -4324,9 +4317,8 @@ class GatewayRunner(
         its own bounded pool; exhausting that one delays only more housekeeping, which is
         best-effort by construction.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._get_housekeeping_executor(), copy_context().run, func, *args)
+        from gateway.admission import native_in_executor
+        return await native_in_executor(self, self._get_housekeeping_executor(), func, *args)
 
     def _get_or_create_pool(self, attr: str, max_workers: int, prefix: str) -> concurrent.futures.ThreadPoolExecutor:
         """Return (creating under ``_executor_lock``) the pool at ``attr``; one lock + closing flag fences both."""

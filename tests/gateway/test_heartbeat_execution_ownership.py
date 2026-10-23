@@ -8,6 +8,7 @@ import pytest
 from evals.heartbeat_idle_wire import WireAdapter
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
+from gateway.admission import initialize_gateway_admission
 from gateway.session import SessionSource, SessionStore
 from hermes_cli.heartbeat import HeartbeatState, migrate_heartbeat_to_session, save_heartbeat
 
@@ -16,12 +17,15 @@ from hermes_cli.heartbeat import HeartbeatState, migrate_heartbeat_to_session, s
 @pytest.mark.parametrize("boundary", ["reset", "suspend", "compression", "prepare-reset", "prepare-suspend", "unchanged"])
 async def test_admitted_heartbeat_executes_only_in_own_conversation(tmp_path, boundary):
     runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner.config = GatewayConfig()
     runner._running_agents = {}
     runner._run_in_executor_with_context = asyncio.to_thread
     runner.session_store = SessionStore(tmp_path / "sessions", runner.config)
     adapter = WireAdapter(PlatformConfig(enabled=True, typing_indicator=False), Platform.TELEGRAM)
     adapter.wire = []
+    adapter.gateway_runner = runner
     runner._delivery_adapter_for = lambda source: adapter
     runner._is_telegram_topic_lane = lambda source: False
     runner._cache_session_source = lambda *args: None
@@ -61,11 +65,18 @@ async def test_admitted_heartbeat_executes_only_in_own_conversation(tmp_path, bo
     runner._run_agent = model
     runner.hooks = SimpleNamespace(emit=AsyncMock())
     adapter.set_message_handler(lambda event: runner._handle_message_with_agent(event, source, key, 1))
+    execute = asyncio.Event()
+    original_process = adapter._process_message_background
+    async def gated_process(*args):
+        await execute.wait()
+        return await original_process(*args)
+    adapter._process_message_background = gated_process
     try:
         await runner._heartbeat_poll_once({key: (source, old)})
         assert key in adapter._session_tasks  # prove admission before changing ownership
         if not boundary.startswith("prepare-"):
             change()
+        execute.set()
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
         await asyncio.sleep(0)
         expected = [old + "-child"] if boundary == "compression" else [old] if boundary == "unchanged" else []
@@ -73,6 +84,8 @@ async def test_admitted_heartbeat_executes_only_in_own_conversation(tmp_path, bo
         if boundary == "suspend":
             assert runner.session_store.peek_session_id(key) != old  # normal reset policy still runs
     finally:
+        execute.set()
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
         runner.session_store.close_all_db_handles()
 
 
@@ -88,6 +101,8 @@ async def test_restart_does_not_restore_suspended_heartbeat(tmp_path):
     store.suspend_session(entry.session_key)
     store.close_all_db_handles()
     runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner.config = config
     runner.session_store = SessionStore(tmp_path / "sessions", config)
     runner._heartbeat_watch = {}

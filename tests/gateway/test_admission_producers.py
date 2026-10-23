@@ -16,7 +16,8 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('runner_busy_handler', [False, True])
-async def test_native_internal_refund_and_leased_busy_refusal_never_queue(tmp_path, runner_busy_handler):
+@pytest.mark.parametrize('shutdown', [False, True])
+async def test_native_internal_refund_and_leased_busy_refusal_never_queue(tmp_path, runner_busy_handler, shutdown):
     runner, adapter = make_restart_runner(admission_home=tmp_path)
     adapter.gateway_runner = runner
     adapter.set_message_handler(runner._handle_message)
@@ -37,6 +38,8 @@ async def test_native_internal_refund_and_leased_busy_refusal_never_queue(tmp_pa
         await admit_internal_event(adapter, first)
         await asyncio.wait_for(started.wait(), 5)
         with gateway_ingress(runner):
+            if shutdown:
+                runner._running, runner._draining = False, True
             with pytest.raises(GatewayDraining):
                 await adapter.handle_message(MessageEvent(text='busy', source=make_restart_source()))
         assert not adapter._pending_messages and not runner._queued_events
@@ -72,6 +75,8 @@ def test_present_api_adapter_with_unreadable_or_missing_counter_is_unknown(tmp_p
     assert gateway_admission_status(runner)['quiescent'] is None
     api._active_run_tasks = {}
     api._session_tasks = {}
+    api._pending_messages = {}
+    api._text_debounce = {}
     status = gateway_admission_status(runner)
     assert status['known'] and status['active_work'] >= 1 and not status['quiescent']
     api._pending_agent_requests = 0

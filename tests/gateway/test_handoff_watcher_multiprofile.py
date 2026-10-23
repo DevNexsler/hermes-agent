@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from gateway import run
+from tests.gateway.restart_test_helpers import install_watcher_admission
 
 
 class _FakeConfig:
@@ -141,18 +142,9 @@ async def test_watcher_gates_profile_scope_on_pending_handoffs(monkeypatch):
             {str(h): _ProbeDB(pending_by_home[h]) for h in homes})
         entered.clear()
         db = _RecordingDB()
-        states = iter([True, False])
-
-        class _Running:
-            def __bool__(_self):
-                try:
-                    return next(states)
-                except StopIteration:
-                    return False
-
         fake = types.SimpleNamespace()
         fake._session_db = db
-        fake._running = _Running()
+        install_watcher_admission(fake, monkeypatch)
         fake._run_in_executor_with_context = asyncio.to_thread
 
         async def _process_handoff(row, profile_name=None):
@@ -215,18 +207,9 @@ async def test_watcher_enters_profile_scope_for_each_home(monkeypatch):
     monkeypatch.setattr(run.asyncio, "sleep", _no_sleep)
 
     db = _RecordingDB()
-    states = iter([True, False])
-
-    class _Running:
-        def __bool__(_self):
-            try:
-                return next(states)
-            except StopIteration:
-                return False
-
     fake = types.SimpleNamespace()
     fake._session_db = db
-    fake._running = _Running()
+    install_watcher_admission(fake, monkeypatch)
 
     async def _process_handoff(row, profile_name=None):
         return None
@@ -374,15 +357,8 @@ async def test_each_scope_resolves_its_own_store_and_profile(monkeypatch):
     }
 
     processed = []
-    states = iter([True, False])
-
     class _Fake:
-        @property
-        def _running(self):
-            try:
-                return next(states)
-            except StopIteration:
-                return False
+        _running = True
 
         @property
         def _session_db(self):
@@ -392,7 +368,9 @@ async def test_each_scope_resolves_its_own_store_and_profile(monkeypatch):
         async def _process_handoff(self, row, profile_name=None):
             processed.append((row["id"], profile_name))
 
-    coro = run.GatewayRunner._handoff_watcher(_Fake(), interval=0.0)
+    fake = _Fake()
+    install_watcher_admission(fake, monkeypatch)
+    coro = run.GatewayRunner._handoff_watcher(fake, interval=0.0)
     await asyncio.wait_for(coro, timeout=5)
 
     assert processed == [

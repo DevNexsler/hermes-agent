@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform
+from gateway.admission import initialize_gateway_admission
 from gateway.run import GatewayRunner, _profile_runtime_scope
 from gateway.session import SessionSource
 from hermes_cli.heartbeat import HeartbeatManager, HeartbeatState, save_heartbeat, migrate_heartbeat_to_session
@@ -16,6 +17,8 @@ async def test_watches_read_and_admit_in_each_owner_profile(tmp_path, monkeypatc
     monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
     monkeypatch.setenv('HERMES_HOME', str(tmp_path / '.hermes'))
     runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner.config = SimpleNamespace(multiplex_profiles=True)
     runner._run_in_executor_with_context = asyncio.to_thread
     runner._is_session_running = lambda key: False
@@ -50,6 +53,8 @@ async def test_watches_read_and_admit_in_each_owner_profile(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_watch_tracks_rotated_route_owner_without_reviving_parent():
     runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner._run_in_executor_with_context = asyncio.to_thread
     runner._is_session_running = lambda key: False
     runner._queue_depth = lambda key, adapter: 0

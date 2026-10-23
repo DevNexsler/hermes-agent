@@ -8,6 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+from gateway.admission import native_to_thread
 import dataclasses
 import faulthandler
 import logging
@@ -19,6 +20,7 @@ from contextvars import copy_context
 from datetime import datetime
 from pathlib import Path
 from gateway.config import Platform
+from gateway.admission import admit_gateway_work
 from gateway.delivery import looks_like_telegram_private_chat_id
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
@@ -208,7 +210,7 @@ class GatewayStartupMixin:
         done, pending = await asyncio.wait(tasks, timeout=timeout)
         if pending:
             args = (timeout, len(pending)) if warn_fmt.count("%") > 1 else (timeout,)
-            await asyncio.to_thread(logger.warning, warn_fmt, *args)
+            await native_to_thread(logger.warning, warn_fmt, *args)
             late = self._late_failure_callback(late_msg, level=level)
             for task in pending:
                 task.add_done_callback(late)
@@ -329,7 +331,7 @@ class GatewayStartupMixin:
         """
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_recoverable
-            if not await asyncio.to_thread(ledger_enabled):
+            if not await native_to_thread(ledger_enabled):
                 return []
             # Claim only rows whose exact transport owner is connected: platform-only filtering would spend
             # a disconnected bot's retry budget because another bot on that platform is online.
@@ -341,7 +343,7 @@ class GatewayStartupMixin:
                 _deliverable_targets.update((_pval(p), None) for p in self.adapters)
             for _profile, _adapters in _profile_adapters.items():
                 _deliverable_targets.update((_pval(p), _profile) for p in _adapters)
-            claimed = await asyncio.to_thread(
+            claimed = await native_to_thread(
                 sweep_recoverable, None,
                 deliverable_platforms={platform for platform, _ in _deliverable_targets},
                 deliverable_targets=_deliverable_targets,
@@ -366,7 +368,7 @@ class GatewayStartupMixin:
         ``send_path_degraded``."""
         from gateway.delivery_ledger import release_runtime_claim
         try:
-            await asyncio.to_thread(release_runtime_claim, obligation_id, error)
+            await native_to_thread(release_runtime_claim, obligation_id, error)
         except Exception:
             logger.debug(log_fmt, obligation_id, exc_info=True)
 
@@ -391,7 +393,7 @@ class GatewayStartupMixin:
             try:
                 while getattr(self, "_running", False):
                     wake.clear()
-                    waiting = await asyncio.to_thread(pending_retries)
+                    waiting = await native_to_thread(pending_retries)
                     deadlines = [r["not_before"] for r in waiting
                                  if (r["platform"], r["profile"]) == key]
                     if not deadlines:
@@ -420,7 +422,7 @@ class GatewayStartupMixin:
     async def _arm_flood_timers_for_waiting_rows(self) -> None:
         """Recover adopted, newly refused/rejected and unsent released rows without blocking the loop."""
         from gateway.delivery_ledger import pending_retries
-        for row in await asyncio.to_thread(pending_retries):
+        for row in await native_to_thread(pending_retries):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
@@ -454,14 +456,14 @@ class GatewayStartupMixin:
                 result = None
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    await native_to_thread(mark_delivered, row["obligation_id"])
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
+                    await native_to_thread(
                         mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
@@ -511,9 +513,9 @@ class GatewayStartupMixin:
         the next restart. Best-effort; reuses the startup redelivery contract."""
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
-            if not await asyncio.to_thread(ledger_enabled):
+            if not await native_to_thread(ledger_enabled):
                 return 0
-            claimed = await asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
+            claimed = await native_to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
         except Exception:
             logger.debug(
                 "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
@@ -731,7 +733,7 @@ class GatewayStartupMixin:
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
-        ledger_on = await asyncio.to_thread(ledger_enabled)
+        ledger_on = await native_to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
             self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -751,7 +753,7 @@ class GatewayStartupMixin:
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
-                await asyncio.to_thread(
+                await native_to_thread(
                     record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
@@ -807,7 +809,7 @@ class GatewayStartupMixin:
         return service
 
     async def _ensure_hosted_room_worker(self):
-        return await asyncio.to_thread(self._start_hosted_room_worker_sync)
+        return await native_to_thread(self._start_hosted_room_worker_sync)
 
     async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
         """Keep the room worker alive for the messaging gateway lifetime."""
@@ -818,7 +820,7 @@ class GatewayStartupMixin:
     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
         """Pause room execution durably without interrupting accepted turns."""
         from tui_gateway import methods_groups
-        return await asyncio.to_thread(methods_groups.stop_hosted_room_service, timeout=timeout)
+        return await native_to_thread(methods_groups.stop_hosted_room_service, timeout=timeout)
 
     def _start_loop_heartbeat_task(self) -> None:
         """Start the loop-liveness heartbeat task (idempotent, best-effort). An asyncio task so a
@@ -909,7 +911,7 @@ class GatewayStartupMixin:
                 logger.info("Active profile: %s", _profile)
         try:
             from gateway.status import write_runtime_status
-            persisted = await asyncio.to_thread(
+            persisted = await native_to_thread(
                 write_runtime_status,
                 gateway_state="starting",
                 exit_reason=None,
@@ -1753,6 +1755,7 @@ class GatewayStartupMixin:
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
 
+    @admit_gateway_work
     async def _process_handoff(self, row: Dict[str, Any], profile_name: Optional[str] = None) -> None:
         """Execute one handoff row; raises on failure (caller marks failed). ``profile_name`` (None =
         root) is the profile whose store queued it — load-bearing under multiplex: secondaries live in

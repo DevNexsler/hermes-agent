@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.admission import initialize_gateway_admission
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 from hermes_cli.heartbeat import HeartbeatManager, HeartbeatState, save_heartbeat
@@ -15,10 +16,13 @@ from evals.heartbeat_idle_wire import WireAdapter
 @pytest.mark.asyncio
 async def test_cancelled_admission_is_refunded_but_started_execution_is_not():
     runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner._running_agents = {}
     runner._run_in_executor_with_context = asyncio.to_thread
     adapter = WireAdapter(PlatformConfig(enabled=True, typing_indicator=False), Platform.TELEGRAM)
     adapter.wire = []
+    adapter.gateway_runner = runner
     runner._delivery_adapter_for = lambda source: adapter
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='42', user_id='42')
     key = build_session_key(source)
@@ -41,7 +45,15 @@ async def test_cancelled_admission_is_refunded_but_started_execution_is_not():
 
     adapter.set_message_handler(handler)
     await runner._warm_goals_session_db('test')
+    execute = asyncio.Event()
+    original_process = adapter._process_message_background
+    async def gated_process(*args):
+        await execute.wait()
+        return await original_process(*args)
+    adapter._process_message_background = gated_process
     for cancel_before_start in (True, False):
+        if not cancel_before_start:
+            execute.set()
         save_heartbeat('cancel-test', HeartbeatState(prompt='check', interval_seconds=60, created_at=1))
         await runner._heartbeat_poll_once(watch)
         task = adapter._session_tasks[key]
@@ -56,10 +68,13 @@ async def test_cancelled_admission_is_refunded_but_started_execution_is_not():
 @pytest.mark.asyncio
 async def test_runner_rejection_does_not_consume_tick_or_overwrite_replacement():
     runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner._running_agents = {}
     runner._run_in_executor_with_context = asyncio.to_thread
     adapter = WireAdapter(PlatformConfig(enabled=True, typing_indicator=False), Platform.TELEGRAM)
     adapter.wire = []
+    adapter.gateway_runner = runner
     runner._delivery_adapter_for = lambda source: adapter
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='42', user_id='42')
     key = build_session_key(source)

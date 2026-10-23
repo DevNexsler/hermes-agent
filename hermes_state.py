@@ -1647,15 +1647,16 @@ class AsyncSessionDB:
     """Async door onto SessionDB: every call runs via asyncio.to_thread so a blocking SQLite call
     never freezes the event loop (no method returns a live cursor)."""
 
-    def __init__(self, db: "SessionDB") -> None:
+    def __init__(self, db: "SessionDB", *, offload=None) -> None:
         self._db = db
+        self._offload = offload
 
     def __getattr__(self, name: str):
         attr = getattr(self._db, name)
         if not callable(attr):
             return attr
         async def _offloaded(*args, **kwargs):
-            return await asyncio.to_thread(attr, *args, **kwargs)
+            return await (self._offload or asyncio.to_thread)(attr, *args, **kwargs)
         return _offloaded
 
 

@@ -482,6 +482,8 @@ class GatewayBusySessionMixin:
         )
 
     async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
+        from gateway.admission import refuse_queued_ingress
+        refuse_queued_ingress(self)
         """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:

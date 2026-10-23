@@ -15,6 +15,7 @@ from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.admission import admit_gateway_work
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -129,6 +130,7 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
 
+    @admit_gateway_work
     async def _heartbeat_poll_watch(self, watch, quick_key, source, session_id):
         await self._warm_goals_session_db("heartbeat poll")
         store = getattr(self, "session_store", None)
@@ -374,12 +376,14 @@ class GatewayGoalsMixin:
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
+    @admit_gateway_work
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
         """Inject one due /loop wakeup into its session, applying every deferral rule. ``profile`` is
         the store being scanned (None = default); a ``profile`` persisted in the route wins."""
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
+        from gateway.wake import WakeNotAccepted, admit_internal_event
 
         if state.awaiting_response or now < state.next_due_at:
             return
@@ -440,15 +444,15 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
+            await admit_internal_event(adapter, self._synthetic_prompt_event(source, wakeup, internal=True))
             # Slash-command loops dispatch through the command path and never hit the post-turn
             # completion hook — complete the tick immediately (caps + scheduling).
             if wakeup.lstrip().startswith("/"):
                 await self._run_in_executor_with_context(mgr.complete_tick, "")
+        except WakeNotAccepted:
+            await self._run_in_executor_with_context(mgr.abandon_tick)
         except Exception as exc:
-            logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
-            with suppress(Exception):
-                mgr.abandon_tick()
+            logger.warning("loop wakeup outcome unknown for %s: %s", sid, exc)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops

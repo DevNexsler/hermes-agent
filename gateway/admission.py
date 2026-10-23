@@ -6,7 +6,7 @@ This process-local capability requires a running gateway built with this module.
 """
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar, copy_context
 from functools import partial
 from functools import wraps
@@ -184,6 +184,8 @@ async def prepare_ingress_dispatch(adapter, event, session_key):
     runner = adapter.gateway_runner
     if not ingress_admitted(runner) or startup_resume_admitted(runner, event, session_key):
         return False
+    if runner._draining and (session_key in adapter._active_sessions or runner._is_session_running(session_key)):
+        raise GatewayDraining('shutdown cannot accept a busy handoff')
     if adapter._pending_messages.get(session_key) or runner._overflow_queue(session_key):
         raise GatewayDraining('accepted session backlog must finish before retryable ingress')
     if runner._is_session_running(session_key) and session_key not in adapter._active_sessions:
@@ -214,6 +216,20 @@ def refuse_queued_ingress(runner):
         raise GatewayDraining('retryable ingress cannot enter an in-memory follow-up queue')
 
 
+
+def admit_gateway_work(handler):
+    """Native lifecycle producer: reserve before mutations; cancellation retains actual work."""
+    @wraps(handler)
+    async def admitted(runner, *args, **kwargs):
+        scope = nullcontext() if ingress_admitted(runner) else gateway_ingress(runner)
+        with scope:
+            task = adopt_ingress_task(runner, asyncio.create_task(handler(runner, *args, **kwargs)))
+            # A cancelled waiter no longer observes the producer's eventual exception.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            return await asyncio.shield(task)
+    return admitted
+
+
 def admit_gateway_message(handler):
     """Native internal producers acquire the same fence and refund on refusal, before dispatch."""
     @wraps(handler)
@@ -236,11 +252,30 @@ async def ingress_to_thread(function, /, *args, **kwargs):
     Use for pre-registration SQLite/journal work. Shield the executor future: cancelling an
     asyncio wrapper otherwise marks it done while the underlying thread is still writing.
     """
+    return await _ingress_in_executor(None, function, *args, **kwargs)
+
+
+async def native_to_thread(function, /, *args, **kwargs):
+    """Native I/O policy: retain leased physical work; ordinary observers keep to_thread."""
+    lease = _ingress.get()
+    if lease is not None and lease.barrier.held(lease, asyncio.current_task()):
+        return await ingress_to_thread(function, *args, **kwargs)
+    return await asyncio.to_thread(function, *args, **kwargs)
+
+
+async def native_in_executor(runner, executor, function, /, *args):
+    """Preserve the native pool choice and profile context across admission-aware offloads."""
+    if ingress_admitted(runner):
+        return await _ingress_in_executor(executor, function, *args)
+    return await asyncio.get_running_loop().run_in_executor(executor, copy_context().run, function, *args)
+
+
+async def _ingress_in_executor(executor, function, /, *args, **kwargs):
     lease = _ingress.get()
     if lease is None or not lease.barrier.held(lease, asyncio.current_task()):
         raise GatewayDraining('off-thread work requires a live ingress reservation')
     future = asyncio.get_running_loop().run_in_executor(
-        None, copy_context().run, partial(function, *args, **kwargs))
+        executor, copy_context().run, partial(function, *args, **kwargs))
     lease.barrier.adopt(lease, asyncio.current_task(), future)
     # A cancelled handler no longer awaits a worker's exception, but must not cancel its work.
     future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
@@ -305,6 +340,10 @@ def gateway_admission_status(runner):
         observers = _observer_work_count(adapters)
         work += sum(not task.done() for adapter in adapters
                     for task in adapter._session_tasks.values())
+        # Accepted memory-only backlog must not disappear behind an idle/orphaned guard.
+        work += sum(len(adapter._pending_messages) + len(adapter._text_debounce) for adapter in adapters)
+        work += sum(len(state.conversation.queued_events) + bool(state.persistent.pending_command_text)
+                    for state in runner.__dict__.get('_sessions', {}).values())
         status.update(known=True, observers=observers, active_work=work + observers,
                       quiescent=status['closed'] and not (work + observers + status['ingress'] + status['adopted']))
         return status

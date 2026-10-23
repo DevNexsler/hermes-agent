@@ -1,6 +1,5 @@
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
-background tasks, MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
-are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
+background tasks, MCP reload. Late facade imports preserve patch seams and avoid cycles.
 """
 
 from __future__ import annotations
@@ -8,6 +7,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
+from gateway.admission import adopt_ingress_task, native_to_thread
 import dataclasses
 import inspect
 import json
@@ -406,7 +406,7 @@ class GatewayTurnMixin:
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
-        recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+        recovered = (await native_to_thread(self._recover_telegram_topic_thread_id, source)
                      if not expected_session_key else None)
         if recovered is not None:
             logger.info(
@@ -449,7 +449,7 @@ class GatewayTurnMixin:
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        if await native_to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
@@ -470,7 +470,7 @@ class GatewayTurnMixin:
             logger.debug("Failed to read Telegram topic binding", exc_info=True)
         if not binding:
             try:
-                await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
+                await native_to_thread(self._record_telegram_topic_binding, source, session_entry)
             except Exception:
                 logger.debug("Failed to record Telegram topic binding", exc_info=True)
             return session_entry
@@ -500,7 +500,7 @@ class GatewayTurnMixin:
                 session_entry = switched
         if bound_session_id and bound_session_id != stored_session_id:
             # The stored binding pointed at a parent: rewrite it to the canonical descendant.
-            await asyncio.to_thread(
+            await native_to_thread(
                 self._sync_telegram_topic_binding, source, session_entry, reason="compression-tip-walk",
             )
         return session_entry
@@ -564,7 +564,7 @@ class GatewayTurnMixin:
                     f"Use /resume to browse and restore a previous session.\n"
                 )
                 with suppress(Exception):
-                    session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
+                    session_info = await native_to_thread(self._reset_notice_session_info, source)
                     if session_info:
                         notice = f"{notice}\n\n{session_info}"
                 await adapter.send(source.chat_id, notice, metadata=self._thread_metadata_for_source(source))
@@ -885,7 +885,7 @@ class GatewayTurnMixin:
                 return None
             else:
                 break
-        _compressed, _ = await attempt.future
+        _compressed, _ = await asyncio.shield(attempt.future)
         return _compressed
 
     def _hmwa_hygiene_defer_cleanup(self, attempt, context):
@@ -914,7 +914,7 @@ class GatewayTurnMixin:
         from gateway.run import _hygiene_cooldown_for_failure, _record_hygiene_cooldown
         if hs.failure_cooldown_seconds < 0:
             return
-        _hyg_cooldown = await asyncio.to_thread(
+        _hyg_cooldown = await native_to_thread(
             _hygiene_cooldown_for_failure, self, session_key, hs.failure_cooldown_seconds,
         )
         _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
@@ -1135,7 +1135,7 @@ class GatewayTurnMixin:
                 # The held turn lease follows the rotation (alias keys still serialize on this turn).
                 self._rebind_turn_lease(_quick_key, run_generation, _hyg_new_sid)
                 await self.async_session_store._save()
-                await asyncio.to_thread(
+                await native_to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="hygiene-compression",
                 )
 
@@ -1191,7 +1191,7 @@ class GatewayTurnMixin:
             msg_count=plan.msg_count, new_count=_new_count, approx_tokens=plan.approx_tokens,
             new_tokens=_new_tokens,
         ):
-            await asyncio.to_thread(_reset_hygiene_failure_streak, self, session_key)
+            await native_to_thread(_reset_hygiene_failure_streak, self, session_key)
         if _hyg_aborted:
             await self._hmwa_hygiene_record_failure_cooldown(
                 hs, session_key, session_entry.session_id,
@@ -1309,11 +1309,7 @@ class GatewayTurnMixin:
             attempt.commit_fence = _hyg_commit_fence
             attempt.future = loop.run_in_executor(
                 None,
-                # But it MUST run inside the caller's contextvars: under multiplex_profiles the profile
-                # secret scope / HERMES_HOME override live in ContextVars, and a bare run_in_executor worker
-                # starts with an empty Context — the summary model's get_secret(<PROVIDER>_API_KEY) then
-                # fails closed (UnscopedSecretError) and every hygiene compaction silently degrades to a
-                # lossy truncation (#100849 bundle).
+                # Multiplex secret/home context must reach the summary worker (#100849).
                 copy_context().run,
                 # task_id = the live turn's dedup bucket (session row id), never "" (= reset every task).
                 lambda: _hyg_agent._compress_context(
@@ -1321,6 +1317,7 @@ class GatewayTurnMixin:
                     task_id=session_entry.session_id or "default",
                 ),
             )
+            adopt_ingress_task(self, attempt.future)
             attempt.wait_started = time.monotonic()
             try:
                 _compressed = await self._hmwa_hygiene_wait_for_summary(attempt, hs, session_entry)
@@ -1583,7 +1580,7 @@ class GatewayTurnMixin:
                 await self.async_session_store._record_gateway_session_peer(
                     session_entry.session_id, session_key, source,
                 )
-                await asyncio.to_thread(
+                await native_to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="agent-result-compression",
                 )
             else:
@@ -1795,7 +1792,7 @@ class GatewayTurnMixin:
                 # oversized transcript, and re-triggers compression exhaustion forever (#35809 — regression
                 # of the #9893/#10063 auto-reset).
                 session_entry = new_entry
-                await asyncio.to_thread(
+                await native_to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
                 )
             response = (response or "") + (
@@ -3471,9 +3468,9 @@ class GatewayTurnMixin:
                 name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                 daemon=True,
             ).start()
-        worker.executor_task = asyncio.ensure_future(
+        worker.executor_task = adopt_ingress_task(self, asyncio.ensure_future(
             self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
-        )
+        ))
         return worker
 
     @staticmethod

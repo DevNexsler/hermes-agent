@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
-from gateway.admission import admit_gateway_message
+from gateway.admission import admit_gateway_message, native_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -627,7 +627,7 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
 
 async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
     """Cache image bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_image_from_bytes, data, ext)
+    return await native_to_thread(cache_image_from_bytes, data, ext)
 
 
 async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type: str, accept: str,
@@ -647,7 +647,7 @@ async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type:
                 async with client.stream("GET", url, headers=headers) as response:
                     response.raise_for_status()
                     content = await _read_httpx_body_with_limit(response, media_type=media_type)
-                return await asyncio.to_thread(cache_fn, content, ext)
+                return await native_to_thread(cache_fn, content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
                     raise
@@ -695,7 +695,7 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
 
 async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg") -> str:
     """Cache audio bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_audio_from_bytes, data, ext)
+    return await native_to_thread(cache_audio_from_bytes, data, ext)
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:
@@ -723,7 +723,7 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
 
 async def cache_video_from_bytes_async(data: bytes, ext: str = ".mp4") -> str:
     """Cache video bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_video_from_bytes, data, ext)
+    return await native_to_thread(cache_video_from_bytes, data, ext)
 
 
 # Document / screenshot cache utilities (same pattern; referenced by local path).
@@ -1483,7 +1483,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
 
 async def cache_document_from_bytes_async(data: bytes, filename: str) -> str:
     """Cache document bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_document_from_bytes, data, filename)
+    return await native_to_thread(cache_document_from_bytes, data, filename)
 
 
 # Unified media caching: classify attachment bytes by ext/MIME, route to cache_*_from_bytes.
@@ -1555,7 +1555,7 @@ async def cache_media_bytes_async(
     default_kind: Optional[str] = None,
 ) -> Optional[CachedMedia]:
     """Classify and cache attachment bytes without blocking the event loop."""
-    return await asyncio.to_thread(
+    return await native_to_thread(
         cache_media_bytes,
         data,
         filename=filename,
@@ -3973,7 +3973,7 @@ class BasePlatformAdapter(ABC):
         # Routed events already name their destination; topic recovery would redirect it.
         if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
-            await asyncio.to_thread(self._apply_topic_recovery, event)
+            await native_to_thread(self._apply_topic_recovery, event)
         session_key = self._event_session_key(event)
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
@@ -4086,7 +4086,7 @@ class BasePlatformAdapter(ABC):
                 if not speech_text:
                     raise ValueError("Empty text after markdown cleanup")
                 requested_path = build_auto_tts_output_path(self.platform)
-                tts_data = _json.loads(await asyncio.to_thread(
+                tts_data = _json.loads(await native_to_thread(
                     text_to_speech_tool, text=speech_text, output_path=requested_path))
                 if tts_data.get("success", True):
                     raw_tts_paths = tts_data.get("file_paths") or [tts_data.get("file_path")]
@@ -4130,7 +4130,7 @@ class BasePlatformAdapter(ABC):
         try:
             from gateway.delivery_ledger import (
                 compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
-            if not await asyncio.to_thread(ledger_enabled):
+            if not await native_to_thread(ledger_enabled):
                 return None
             source = event.source
             # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
@@ -4140,13 +4140,13 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
-            await asyncio.to_thread(
+            await native_to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
+            await native_to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
@@ -4164,10 +4164,10 @@ class BasePlatformAdapter(ABC):
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
+                await native_to_thread(mark_delivered, obligation_id)
                 return
             error = str(getattr(result, "error", "") or "")
-            await asyncio.to_thread(mark_failed, obligation_id, error)
+            await native_to_thread(mark_failed, obligation_id, error)
             if is_reconnect_only(error):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)

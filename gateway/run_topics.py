@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from gateway.admission import native_to_thread
 import logging
 import re
 import time
@@ -379,7 +380,7 @@ class GatewayTopicThreadsMixin:
         """Best-effort semantic rename of a newly auto-created Discord thread. ``relay_info`` is the
         connector's (thread_id, initial_name) feedback, supplied on the title turn where the source
         is the parent-channel event without auto-thread markers (see _relay_auto_thread_info)."""
-        if relay_info is None and not await asyncio.to_thread(self._is_discord_auto_thread_lane, source):
+        if relay_info is None and not await native_to_thread(self._is_discord_auto_thread_lane, source):
             # Relay title turn with no feedback captured at schedule time: the title comes off the
             # user's opening message, so it beats the delivery that produces the connector's
             # send-result feedback by the whole length of the turn. None here = a true miss.
@@ -491,7 +492,7 @@ class GatewayTopicThreadsMixin:
 
     async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+        if not await native_to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
             return
         # Operator kill-switch, e.g. user-managed topics (ad-hoc Threaded Mode) that auto-rename
         # would keep overwriting.

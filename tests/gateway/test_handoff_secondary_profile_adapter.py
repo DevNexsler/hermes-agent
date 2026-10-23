@@ -22,6 +22,7 @@ import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.run import GatewayRunner
+from gateway.admission import initialize_gateway_admission
 from gateway.session import SessionEntry
 
 
@@ -58,6 +59,8 @@ def _make_multiplex_runner():
         emit=AsyncMock(), emit_collect=AsyncMock(return_value=[]), loaded_hooks=False,
     )
 
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     captured = {}
 
     store = MagicMock()

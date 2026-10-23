@@ -33,7 +33,8 @@ async def _server(handler):
 
 
 @pytest.mark.asyncio
-async def test_http_prefence_work_survives_drain_and_handoff_without_false_ack(tmp_path):
+@pytest.mark.parametrize('shutdown', [False, True])
+async def test_http_prefence_work_survives_drain_and_handoff_without_false_ack(tmp_path, shutdown):
     runner, adapter = make_restart_runner(admission_home=tmp_path)
     adapter.gateway_runner = runner
     entered, release, background, finish = (asyncio.Event() for _ in range(4))
@@ -74,7 +75,10 @@ async def test_http_prefence_work_survives_drain_and_handoff_without_false_ack(t
         await asyncio.wait_for(entered.wait(), 5)
         assert not adapter._active_sessions
         assert runner._active_work_count() > 0
-        runner._enter_external_drain()
+        if shutdown:
+            runner._running, runner._draining = False, True
+        else:
+            runner._enter_external_drain()
         status = gateway_admission_status(runner)
         assert status['closed'] and status['ingress'] == 1 and not status['quiescent']
         async with client.post(url, json={'delivery_id': 'same-id'}) as response:
@@ -91,6 +95,8 @@ async def test_http_prefence_work_survives_drain_and_handoff_without_false_ack(t
         await asyncio.gather(*adapter._background_tasks)
         await asyncio.sleep(0)  # run task completion callbacks
         assert gateway_admission_status(runner)['quiescent'] is True
+        if shutdown:
+            runner._running, runner._draining = True, False  # Disposable fixture reopens.
         runner._exit_external_drain()
         async with client.post(url, json={'delivery_id': 'same-id'}) as response:
             assert response.status == 202

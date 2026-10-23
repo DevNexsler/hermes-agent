@@ -755,8 +755,9 @@ class _RouteDecision:
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
-    def __init__(self, store: "SessionStore") -> None:
+    def __init__(self, store: "SessionStore", *, offload=None) -> None:
         self._store = store
+        self._offload = offload
 
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
@@ -764,7 +765,7 @@ class AsyncSessionStore:
             return attr
 
         async def _offloaded(*args, **kwargs) -> Any:
-            return await asyncio.to_thread(attr, *args, **kwargs)
+            return await (self._offload or asyncio.to_thread)(attr, *args, **kwargs)
 
         return _offloaded
 

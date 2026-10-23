@@ -345,12 +345,26 @@ maintenance hold or external drain. Leased arrivals with existing backlog refuse
 acknowledges or mutates that backlog. A consumer must never record delivery after a refused steer
 or queue fallback.
 
+Native loop ticks, heartbeat decisions and CLI handoff claims reserve before their first durable
+mutation. Their lifecycle coroutine stays adopted if its watcher is cancelled; only a proven
+unaccepted tick may refund. Unknown outcomes retain durable ownership. During shutdown, an idle
+pre-fence reservation still enters and settles its core turn; a busy shutdown handoff refuses
+before acknowledgment or queue mutation.
+
 Use `await ingress_to_thread(fn, *args, **kwargs)` for work under this reservation. Cancellation
 raises `asyncio.CancelledError` promptly while the shielded executor future remains counted until
 the actual worker exits. This helper requires a live authenticated reservation and otherwise raises
 `GatewayDraining`. Background observers/startup housekeeping outside ingress keep their own tracked
 execution path; do not fabricate ingress or silently fall back from this helper. Admission is a
 transport receipt, not authorization, model completion or proof of an outbound business effect.
+
+Native thread boundaries use `native_to_thread`; session database/routing facades accept its
+offload policy without depending on the gateway package. Turn and housekeeping pools keep their
+existing separation. With a live lease, actual executor futures remain adopted across caller
+cancellation; outside ingress, native observers retain their existing execution policy. This
+internal policy does not weaken the strict `ingress_to_thread` extension contract.
+Accepted Base pending/debounce buffers and runner FIFO/command backlog also prevent strict
+quiescence, even when their original guard is orphaned. Inspection never consumes or refunds them.
 
 `gateway_admission_status(runner)` returns `known`, `closed`, `ingress`, `adopted`, `active_work`,
 `quiescent`, `observers`, plus public `hold` identity when known. `adopted` includes background tasks and executor

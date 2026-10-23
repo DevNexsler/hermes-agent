@@ -172,3 +172,24 @@ def make_restart_runner(
     initialize_gateway_admission(runner, home=admission_home)
     platform_adapter.gateway_runner = runner
     return runner, platform_adapter
+
+
+def install_watcher_admission(runner, monkeypatch, *, ticks=1):
+    """Explicit native capability; terminate legacy watcher fixtures by poll cycles, not flag reads."""
+    from gateway.admission import initialize_gateway_admission
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
+    original_sleep = asyncio.sleep
+    owner, remaining = None, ticks
+
+    async def bounded_sleep(delay):
+        nonlocal owner, remaining
+        if delay == 5 and owner is None:
+            owner = asyncio.current_task()
+        if delay == 0 and asyncio.current_task() is owner:
+            remaining -= 1
+            if remaining <= 0:
+                runner._running = False
+        return await original_sleep(delay)
+
+    monkeypatch.setattr('gateway.run_adapters.asyncio.sleep', bounded_sleep)
