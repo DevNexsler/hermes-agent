@@ -1319,7 +1319,8 @@ class GatewayInboundMixin:
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.
-            if self._external_drain_active:
+            from gateway.admission import ingress_admitted
+            if self._external_drain_active and not ingress_admitted(self):
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return (
                     "⏳ This agent is draining for a maintenance action and isn't "

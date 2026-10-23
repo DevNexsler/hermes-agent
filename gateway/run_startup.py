@@ -1545,6 +1545,9 @@ class GatewayStartupMixin:
             await self._start_flush_runtime_status()
 
     async def _start_impl(self) -> bool:
+        from gateway.admission import wait_for_admission_hold
+        if not await wait_for_admission_hold(self):
+            return True
         logger.info("Starting Hermes Gateway...")
         self._start_install_faulthandler()
         await self._start_log_startup_environment()

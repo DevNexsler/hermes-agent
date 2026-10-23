@@ -175,11 +175,13 @@ class GatewayShutdownMixin:
     # Active-work accounting
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
+        from gateway.admission import ingress_work_count
         return (
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + ingress_work_count(self)
         )
 
     @staticmethod
@@ -687,6 +689,8 @@ class GatewayShutdownMixin:
     # the watcher flips between accepting and refusing NEW turns WITHOUT exiting (reversible).
     def _enter_external_drain(self) -> None:
         """Begin external drain: refuse NEW turns (in-flight ones are NOT interrupted). Idempotent."""
+        if (barrier := getattr(self, '_ingress_barrier', None)) is not None:
+            barrier.close()
         if self._external_drain_active:
             return
         self._external_drain_active = True
@@ -699,9 +703,13 @@ class GatewayShutdownMixin:
 
     def _exit_external_drain(self) -> None:
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
+        if (barrier := getattr(self, '_ingress_barrier', None)) is not None and barrier.hold['active']:
+            return
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        if (barrier := getattr(self, '_ingress_barrier', None)) is not None:
+            barrier.reopen()
         if self._draining or not self._running:
             logger.info(
                 "External drain marker cleared during shutdown — not reverting "
@@ -716,18 +724,18 @@ class GatewayShutdownMixin:
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Poll ``.drain_request.json`` at 1s: present -> enter drain, absent -> exit; a stale epoch = absent."""
-        from gateway.drain_control import drain_requested
+        from gateway.admission import read_admission_controls, reconcile_admission_controls
         while self._running:
             try:
                 # Off-thread: a synchronous marker read at 1s cadence can stall 30s+ under host I/O
                 # pressure and take every platform heartbeat down.
-                if await asyncio.to_thread(drain_requested):
-                    self._enter_external_drain()
+                barrier = getattr(self, '_ingress_barrier', None)
+                controls = await asyncio.to_thread(read_admission_controls, barrier.home)
+                reconcile_admission_controls(self, controls)
+                if controls['drain']:
                     # API and cron work live outside messaging's _running_agents map; refresh the
                     # aggregate while an external caller polls this reversible drain state.
                     self._persist_active_agents()
-                else:
-                    self._exit_external_drain()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -785,8 +793,9 @@ class GatewayShutdownMixin:
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
         """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        from gateway.admission import ingress_work_count
         return (
-            self._running_agent_count(), self._active_cron_job_count(),
+            self._running_agent_count() + ingress_work_count(self), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
         )
 
@@ -809,7 +818,7 @@ class GatewayShutdownMixin:
         # Cron/API/deferred work lives outside ``_running_agents``; fold it in or it is killed unwarned.
         _cron0, _api0, _deferred0 = last_counts[1:]
         _maybe_update_status(force=True)
-        if not self._running_agents and not (_cron0 or _api0 or _deferred0):
+        if not any(last_counts):
             return snapshot, False
         # Cron has its own deadline: a chat turn is announced+resumable; a killed cron run is a permanent failure.
         # ``timeout`` (``restart_drain_timeout``) defaults to 0 because interrupting a chat turn is

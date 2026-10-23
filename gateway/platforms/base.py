@@ -3866,7 +3866,8 @@ class BasePlatformAdapter(ABC):
         (False)."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        from gateway.admission import adopt_ingress_task
+        task = adopt_ingress_task(self.gateway_runner, asyncio.create_task(self._process_message_background(event, session_key)))
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)

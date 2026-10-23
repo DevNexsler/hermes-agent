@@ -316,3 +316,54 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 - [ACP Internals](./acp-internals.md)
 - [Agent Loop Internals](./agent-loop.md)
 - [Messaging Gateway (User Guide)](../user-guide/messaging/index.md)
+# Retryable extension admission and maintenance holds
+
+`gateway.admission` supplies a gateway-owned reservation for HTTP extensions which acknowledge
+work before a core session exists. After synchronous authentication, enter
+`with gateway_ingress(adapter.gateway_runner):` **before the first await or mutation**, including
+body parsing, deduplication, SQLite and journal setup. Keep the scope through response creation.
+`GatewayDraining` means no reservation was acquired: answer JSON HTTP 503 with `exc.headers`
+(`Retry-After: 1`), without journals, dedup claims, delivery receipts or core dispatch. A missing
+or unready native capability also raises this exception. Test doubles must install an explicit
+admission fixture; a missing runner never means acceptance.
+
+Reservations acquired before fence closure finish naturally. The base adapter adopts the task it
+spawns before that task can run; its completion callback releases the reservation even if cancelled
+before its first step. Only the reserving handler and explicitly adopted task identities can pass
+the core external-drain gate. An unrelated task inheriting context cannot borrow admission.
+Extension-created tasks use `adopt_ingress_task(runner, task)` before the handler exits.
+
+Use `await ingress_to_thread(fn, *args, **kwargs)` for work under this reservation. Cancellation
+raises `asyncio.CancelledError` promptly while the shielded executor future remains counted until
+the actual worker exits. This helper requires a live authenticated reservation and otherwise raises
+`GatewayDraining`. Background observers/startup housekeeping outside ingress keep their own tracked
+execution path; do not fabricate ingress or silently fall back from this helper. Admission is a
+transport receipt, not authorization, model completion or proof of an outbound business effect.
+
+`gateway_admission_status(runner)` returns `known`, `closed`, `ingress`, `adopted`, `active_work`,
+`quiescent`, plus public `hold` identity when known. `adopted` includes background tasks and executor
+futures. Counters overlap intentionally: only zero matters. Unknown capability, hold or work counters
+return `known=False` and `quiescent=None`; never convert that to zero. Read this synchronously on the
+gateway loop. Before treating quiescence as an activation fence, hold the existing cron tick lock
+for **every** home returned by `_cron_tick_profile_homes`, verify no home was added, and separately
+exclude manual/external producers. Tick locks cover scan/advance/register/submit, not job lifetime:
+hold them before checking running-job counters. Snapshot zero or producer shutdown alone is insufficient.
+
+`gateway.admission_hold` supplies separate persistent maintenance control:
+
+- `acquire_admission_hold(owner=..., home=..., token=...)` returns `hold_id` and `token`. Persist a
+  random `secrets.token_urlsafe(32)` token privately **before** acquisition; retries with that token
+  and owner recover a lost response. A different acquisition raises `AdmissionHoldConflict`.
+- `inspect_admission_hold(home=...)` returns `known`, `active`, `hold_id`, `owner`; it exposes no token
+  or digest. Malformed/unreadable state means active with unknown identity.
+- `release_admission_hold(token=..., home=...)` compares under a shared cross-process lock, returns
+  false if already absent, and raises `AdmissionHoldConflict` for foreign/unknown state. Keep the
+  serialization lock inode; never unlink it or log tokens.
+
+Holds never expire because of age, owner death or machine epoch. NAS `.drain_request.json` remains a
+separate expiring control. New-source startup loads the owner hold before listeners, cron or restore
+and waits until explicit release; abort/cancellation leaves it intact. The owner must restore matched
+assets before release after a failed deployment. This feature cannot fence an older running binary:
+qualifying the initial upgrade and rollback to source without this capability requires a separate
+old-process quiescence/bootstrap proof. Source installation or a passing test is not that proof.
+
