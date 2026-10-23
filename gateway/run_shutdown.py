@@ -197,16 +197,8 @@ class GatewayShutdownMixin:
         return len(get_running_job_ids())
 
     def _active_cron_job_count(self) -> int:
-        """Cron jobs currently executing — they run outside ``_running_agents``; 0 if cron can't import.
-
-        Cron jobs run through a standalone ``AIAgent`` on the scheduler's own thread pool
-        (``cron/scheduler.py::run_job``), entirely outside ``self._running_agents`` — the dict every OTHER
-        active-work check on this class (``_running_agent_count``, ``_drain_active_agents``) reads. Without
-        this, the shutdown drain is structurally blind to in-flight cron work: it can report
-        ``active_at_start=0`` and proceed straight to killing tool subprocesses while a cron job's terminal
-        command is still running (#60432). Best-effort: returns 0 if the cron module can't be imported (e.g.
-        a minimal test double for this class).
-        """
+        """Cron runs outside ``_running_agents`` (#60432). Best-effort shutdown count;
+        activation readiness calls the strict registry accessor instead."""
         try:
             return self._running_cron_job_count()
         except Exception:
@@ -698,7 +690,6 @@ class GatewayShutdownMixin:
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.", self._active_work_count(),
         )
-        # Persist "draining" so /api/status tracks it; active_agents is read-merged, only state changes.
         self._update_runtime_status("draining")
 
     def _exit_external_drain(self) -> None:

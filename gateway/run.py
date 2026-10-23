@@ -3572,13 +3572,11 @@ class GatewayRunner(
         self._exit_code: Optional[int] = None
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
-        # External (NAS-driven) drain, distinct from one-way ``_draining``: set while ``.drain_request.json``
-        # exists — NEW turns refused, process stays up, removing the marker reverts to ``running``.
+        # Reversible admission drain is separate from one-way shutdown.
         self._external_drain_active = False
         from gateway.admission import initialize_gateway_admission
         initialize_gateway_admission(self)
-        # ``_signal_initiated_shutdown``: SIGTERM/SIGINT with no planned-stop/takeover marker (container,
-        # OOM, bare kill); _stop_impl must NOT persist gateway_state=stopped or container_boot won't restart.
+        # Unplanned signals must not persist stopped or container_boot won't restart.
         self._restart_requested = self._signal_initiated_shutdown = self._restart_task_started = False
         self._restart_detached = self._restart_via_service = self._detached_restart_helper_started = False
         self._restart_command_source: Optional[SessionSource] = None

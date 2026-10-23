@@ -3861,9 +3861,7 @@ class BasePlatformAdapter(ABC):
 
     def _start_session_processing(self, event: MessageEvent, session_key: str, *,
                                   interrupt_event: Optional[asyncio.Event] = None) -> bool:
-        """Spawn a background processing task under the session guard; True on success. If
-        ``create_task`` is stubbed with a non-Task sentinel (tests), the guard is rolled back
-        (False)."""
+        """Spawn under the session guard; roll back non-Task test sentinels."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
         from gateway.admission import adopt_ingress_task

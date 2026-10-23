@@ -316,7 +316,8 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 - [ACP Internals](./acp-internals.md)
 - [Agent Loop Internals](./agent-loop.md)
 - [Messaging Gateway (User Guide)](../user-guide/messaging/index.md)
-# Retryable extension admission and maintenance holds
+
+## Retryable extension admission and maintenance holds
 
 `gateway.admission` supplies a gateway-owned reservation for HTTP extensions which acknowledge
 work before a core session exists. After synchronous authentication, enter

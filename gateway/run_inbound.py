@@ -1316,9 +1316,7 @@ class GatewayInboundMixin:
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
-            # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
-            # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
-            # only fall to zero. Reversible.
+            # Pre-fence transport reservations remain counted until their handoff finishes.
             from gateway.admission import ingress_admitted
             if self._external_drain_active and not ingress_admitted(self):
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)

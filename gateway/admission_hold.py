@@ -32,9 +32,11 @@ def _read(home):
         body = json.loads((home / HOLD_FILENAME).read_text(encoding='utf-8'))
     except FileNotFoundError:
         return None
-    if (not isinstance(body, dict) or body.get('version') != 1
+    if (not isinstance(body, dict) or type(body.get('version')) is not int or body['version'] != 1
             or not all(isinstance(body.get(key), str) and body[key]
-                       for key in ('hold_id', 'owner', 'token_digest'))):
+                       for key in ('hold_id', 'owner', 'token_digest'))
+            or len(body['token_digest']) != 64
+            or any(c not in '0123456789abcdef' for c in body['token_digest'])):
         raise ValueError('invalid gateway admission hold')
     return body
 

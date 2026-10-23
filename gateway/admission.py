@@ -190,6 +190,8 @@ async def ingress_to_thread(function, /, *args, **kwargs):
     future = asyncio.get_running_loop().run_in_executor(
         None, copy_context().run, partial(function, *args, **kwargs))
     lease.barrier.adopt(lease, asyncio.current_task(), future)
+    # A cancelled handler no longer awaits a worker's exception, but must not cancel its work.
+    future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
     return await asyncio.shield(future)
 
 

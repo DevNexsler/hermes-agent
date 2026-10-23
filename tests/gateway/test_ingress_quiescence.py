@@ -1,7 +1,9 @@
 """HTTP admission stays visible before a session exists and through background handoff."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+import threading
 
 import aiohttp
 from aiohttp import web
@@ -9,6 +11,7 @@ import pytest
 
 from gateway.admission import (
     GatewayDraining, gateway_admission_status, gateway_ingress, initialize_gateway_admission,
+    adopt_ingress_task, ingress_admitted, ingress_to_thread,
 )
 from gateway.platforms.event import MessageEvent
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -123,3 +126,49 @@ async def test_cancelled_handler_and_unready_capability_fail_closed(tmp_path):
     with pytest.raises(GatewayDraining):
         with gateway_ingress(runner):
             pytest.fail('stopping runtime accepted work')
+
+
+@pytest.mark.asyncio
+async def test_cancelled_thread_or_unstarted_task_retains_exact_work_until_exit(tmp_path):
+    runner, _adapter = make_restart_runner()
+    initialize_gateway_admission(runner, home=tmp_path)
+    started, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+
+    def worker():
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5)
+
+    async def handler():
+        with gateway_ingress(runner):
+            await ingress_to_thread(worker)
+
+    task = asyncio.create_task(handler())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        runner._enter_external_drain()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        status = gateway_admission_status(runner)
+        assert status['ingress'] == 0 and status['adopted'] == 1 and not status['quiescent']
+        # Even a zero-time shutdown budget must report timeout instead of treating this as idle.
+        _snapshot, timed_out = await runner._drain_active_agents(0)
+        assert timed_out
+    finally:
+        release.set()
+    # Executor callback (not a timer or handler cancellation) releases the final reservation.
+    # FIFO behind the actual worker, so its completion callback runs before this returns.
+    await loop.run_in_executor(None, lambda: None)
+    assert gateway_admission_status(runner)['quiescent'] is True
+    runner._exit_external_drain()
+    with gateway_ingress(runner):
+        async def unrelated():
+            assert not ingress_admitted(runner)
+        await asyncio.create_task(unrelated())
+        child = adopt_ingress_task(runner, asyncio.create_task(asyncio.Event().wait()))
+        child.cancel()  # before the coroutine's first step
+        with pytest.raises(asyncio.CancelledError):
+            await child
+    assert runner._ingress_barrier.snapshot()['adopted'] == 0
