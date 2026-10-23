@@ -147,6 +147,8 @@ class _FakeAdapter:
 
 def _make_runner() -> tuple[GatewayRunner, _FakeAdapter]:
     runner = object.__new__(GatewayRunner)
+    from tests.gateway.restart_test_helpers import install_native_admission
+    install_native_admission(runner)
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )

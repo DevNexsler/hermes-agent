@@ -283,6 +283,8 @@ class GatewayGoalsMixin:
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None or not mgr.is_active():
             return
+        if await self._defer_goal_for_maintenance(mgr, source, mgr.next_continuation_prompt(), final_response):
+            return
 
         _bg_procs, _active_deleg = None, 0
         with suppress(Exception):
@@ -301,6 +303,9 @@ class GatewayGoalsMixin:
                 active_delegations=_active_deleg,
             ),
         )
+        if await self._defer_goal_for_maintenance(
+                mgr, source, decision.get('continuation_prompt'), final_response):
+            return
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
@@ -313,9 +318,78 @@ class GatewayGoalsMixin:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                from gateway.admission import native_producer_ingress, without_gateway_ingress
+                continuation = self._synthetic_prompt_event(source, prompt)
+                continuation._goal_admission_checkpoint = {'session_id': mgr.session_id,
+                                                            'final_response': final_response}
+                with native_producer_ingress(self), without_gateway_ingress():
+                    self._enqueue_fifo(_quick_key, continuation, adapter)
         except Exception as exc:
+            from gateway.admission import GatewayDraining
+            if isinstance(exc, GatewayDraining):
+                if await self._defer_goal_for_maintenance(mgr, source, prompt, final_response):
+                    return
+                raise
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    async def _defer_queued_goal_for_maintenance(self, event):
+        checkpoint = getattr(event, '_goal_admission_checkpoint', None)
+        if checkpoint is None:
+            return False
+        from hermes_cli.goals import GoalManager
+        mgr = await self._run_in_executor_with_context(lambda: GoalManager(checkpoint['session_id']))
+        if mgr.state is None:
+            self._ingress_barrier.fail_quiescence()
+            raise RuntimeError('queued goal checkpoint unavailable')
+        if not mgr.is_active():
+            return True  # User/foreign pause or completion wins; never restart its queued continuation.
+        return await self._defer_goal_for_maintenance(
+            mgr, event.source, event.text, checkpoint['final_response'], input_context={
+                'message_id': event.message_id, 'channel_prompt': event.channel_prompt,
+                'channel_context': event.channel_context, 'raw_message': event.raw_message})
+
+    def _track_goal_drain_checkpoint(self, event, task):
+        """A queued goal cancelled before its first step still gets a durable maintenance handoff."""
+        def finished(done):
+            barrier = self._ingress_barrier
+            closed = barrier._closed or self._draining or self._external_drain_active
+            if not done.cancelled() or getattr(event, '_heartbeat_execution_started', False) or not closed:
+                return
+            from gateway.admission import without_gateway_ingress
+            with without_gateway_ingress():
+                cleanup = asyncio.create_task(self._defer_queued_goal_for_maintenance(event))
+            tasks = self.__dict__.setdefault('_deferred_agent_cleanup_tasks', set())
+            self._track_task_in(tasks, cleanup)
+            def verified(result):
+                if result.cancelled() or result.exception() is not None:
+                    barrier.fail_quiescence()
+            cleanup.add_done_callback(verified)
+        task.add_done_callback(finished)
+
+    async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None):
+        """Retain a not-yet-started continuation as an owned, actionable maintenance checkpoint."""
+        barrier = getattr(self, '_ingress_barrier', None)
+        closed = (getattr(self, '_draining', False) or getattr(self, '_external_drain_active', False)
+                  or (barrier is not None and barrier._closed))
+        if not closed or not prompt or source is None or not mgr.is_active():
+            return False
+        hold = barrier.hold if barrier is not None else {}
+        owner = hold.get('owner') or 'gateway-maintenance-operator'
+        def pause():
+            try:
+                return mgr.pause_for_maintenance(
+                    owner=owner, hold_id=hold.get('hold_id'), continuation_prompt=prompt,
+                    final_response=final_response, source=dataclasses.asdict(source), input_context=input_context)
+            except Exception:
+                if barrier is not None:
+                    barrier.fail_quiescence()
+                logger.error('Goal maintenance checkpoint unconfirmed for %s; quiescence blocked',
+                             mgr.session_id, exc_info=True)
+                raise
+        await self._run_in_executor_with_context(pause)
+        await self._defer_goal_status_notice_after_delivery(
+            source, f'Goal paused for gateway maintenance; owner={owner}. Use /goal resume after handoff.')
+        return True
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,

@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1167,6 +1169,51 @@ class GoalManager:
         self._state.paused_reason = reason
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
+
+    def pause_for_maintenance(self, *, owner, hold_id, continuation_prompt, final_response, source, input_context=None):
+        """Atomically pause unchanged active state and retain exact continuation inputs for its owner.
+
+        Unlike best-effort user commands, maintenance needs verified durable readback before a
+        process can quiesce. An intervening user/foreign mutation is never overwritten.
+        """
+        if not self.is_active():
+            return None
+        if not owner or not continuation_prompt:
+            raise ValueError('maintenance pause requires owner and continuation inputs')
+        from hermes_constants import get_hermes_home
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError('maintenance goal checkpoint store unavailable')
+        expected = self._state.to_json()
+        paused = GoalState.from_json(expected)
+        pause_id = uuid.uuid4().hex
+        paused.status = 'paused'
+        paused.paused_reason = f'maintenance-deferred; owner={owner}; pause={pause_id}; /goal resume'
+        raw = paused.to_json()
+        receipt = {'version': 1, 'pause_id': pause_id, 'owner': owner, 'hold_id': hold_id,
+                   'session_id': self.session_id, 'profile_home': str(get_hermes_home().resolve()),
+                   'checkpoint': json.loads(expected), 'paused_goal_sha256': hashlib.sha256(raw.encode()).hexdigest(),
+                   'continuation_prompt': continuation_prompt, 'final_response': final_response,
+                   'source': source, 'input_context': input_context, 'created_at': time.time()}
+        key = f'goal_maintenance_pause:{self.session_id}:{pause_id}'
+        def commit(conn):
+            row = conn.execute('SELECT value FROM state_meta WHERE key = ?', (_meta_key(self.session_id),)).fetchone()
+            if row is None or GoalState.from_json(row[0]).to_json() != expected:
+                raise RuntimeError('goal changed before maintenance pause; existing owner preserved')
+            history = [dict(row) for row in conn.execute(
+                'SELECT * FROM messages WHERE session_id = ? ORDER BY id', (self.session_id,))]
+            receipt['history_checkpoint'] = {'session_id': self.session_id,
+                'message_ids': [row['id'] for row in history],
+                'sha256': hashlib.sha256(json.dumps(history, sort_keys=True, default=str).encode()).hexdigest()}
+            payload = json.dumps(receipt, sort_keys=True, default=str)
+            db.set_meta(key, payload, cursor=conn)
+            db.set_meta(_meta_key(self.session_id), raw, cursor=conn)
+            return payload
+        payload = db._execute_write(commit)
+        if db.get_meta(key) != payload or db.get_meta(_meta_key(self.session_id)) != raw:
+            raise RuntimeError('maintenance goal checkpoint readback changed or unavailable')
+        self._state = paused
+        return json.loads(payload)
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:

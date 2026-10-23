@@ -193,3 +193,10 @@ def install_watcher_admission(runner, monkeypatch, *, ticks=1):
         return await original_sleep(delay)
 
     monkeypatch.setattr('gateway.run_adapters.asyncio.sleep', bounded_sleep)
+
+
+def install_native_admission(runner, *, home=None):
+    """Explicit capability for standalone native-producer fixtures built without __init__."""
+    from gateway.admission import initialize_gateway_admission
+    runner._running, runner._draining, runner._external_drain_active = True, False, False
+    initialize_gateway_admission(runner, home=home)

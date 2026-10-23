@@ -3,6 +3,7 @@ import asyncio
 import threading
 
 import pytest
+import pytest_asyncio
 
 from gateway.admission import gateway_admission_status, gateway_ingress
 from gateway.config import Platform
@@ -12,9 +13,26 @@ from gateway.turn_context import TurnContext
 from tests.gateway.test_admission_native_work import native  # noqa: F401 — explicit real-runner fixture
 
 
+@pytest_asyncio.fixture
+async def executor_futures(monkeypatch):
+    futures = []
+    loop = asyncio.get_running_loop()
+    original = loop.run_in_executor
+    def capture(*args, **kwargs):
+        future = original(*args, **kwargs)
+        futures.append(future)
+        return future
+    monkeypatch.setattr(loop, 'run_in_executor', capture)
+    return futures
+
+
+async def settled(futures):
+    await asyncio.wait_for(asyncio.gather(*(asyncio.shield(f) for f in futures), return_exceptions=True), 5)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('method', ['_hm_skill_slash_rewrite', '_is_telegram_topic_root_lobby'])
-async def test_real_core_executor_stays_counted_after_base_task_cancel(native, monkeypatch, method):
+async def test_real_core_executor_stays_counted_after_base_task_cancel(native, monkeypatch, method, executor_futures):
     entered, exited, release = asyncio.Event(), asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
     original = getattr(native.runner, method)
@@ -41,14 +59,13 @@ async def test_real_core_executor_stays_counted_after_base_task_cancel(native, m
     finally:
         release.set()
         await asyncio.wait_for(exited.wait(), 5)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await settled(executor_futures)
     assert not native.effects and gateway_admission_status(native.runner)['quiescent']
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('boundary', ['store', 'db'])
-async def test_real_sqlite_facade_worker_survives_cancel(native, monkeypatch, boundary):
+async def test_real_sqlite_facade_worker_survives_cancel(native, monkeypatch, boundary, executor_futures):
     entered, exited, release = asyncio.Event(), asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
     if boundary == 'store':
@@ -83,10 +100,7 @@ async def test_real_sqlite_facade_worker_survives_cancel(native, monkeypatch, bo
     finally:
         release.set()
         await asyncio.wait_for(exited.wait(), 5)
-        for _ in range(100):
-            if gateway_admission_status(native.runner)['quiescent']:
-                break
-            await asyncio.sleep(.001)
+        await settled(executor_futures)
     assert gateway_admission_status(native.runner)['quiescent']
     if boundary == 'db':
         assert native.db.get_session('synthetic-physical-write')
@@ -115,7 +129,7 @@ async def test_orphan_accepted_backlog_prevents_quiescence_without_consuming(nat
 
 
 @pytest.mark.asyncio
-async def test_native_turn_worker_handoff_keeps_physical_owner_after_cancel(native, monkeypatch):
+async def test_native_turn_worker_handoff_keeps_physical_owner_after_cancel(native, monkeypatch, executor_futures):
     monkeypatch.setenv('HERMES_AGENT_TIMEOUT', '0')
     entered, exited, release = asyncio.Event(), asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
@@ -139,8 +153,5 @@ async def test_native_turn_worker_handoff_keeps_physical_owner_after_cancel(nati
     finally:
         release.set()
         await asyncio.wait_for(exited.wait(), 5)
-        for _ in range(100):
-            if gateway_admission_status(native.runner)['quiescent']:
-                break
-            await asyncio.sleep(.001)
+        await settled(executor_futures)
     assert gateway_admission_status(native.runner)['quiescent']

@@ -23,11 +23,14 @@ async def native(tmp_path, monkeypatch):
     (home / 'config.yaml').write_text('security: {tirith_enabled: false}\napprovals: {mode: auto}\n')
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     monkeypatch.setenv('HERMES_HOME', str(home))
+    import hermes_state
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
     pin_process_hermes_home(home)
     monkeypatch.setattr(GatewayRunner, '_init_startup_checks', lambda self: None)
     cfg = PlatformConfig(enabled=True, home_channel=HomeChannel(platform=Platform.TELEGRAM, chat_id='123456', name='synthetic'))
     runner = GatewayRunner(GatewayConfig(multiplex_profiles=False, sessions_dir=home / 'sessions',
                                         platforms={Platform.TELEGRAM: cfg}))
+    assert runner._session_db._db.db_path.resolve() == home.resolve() / 'state.db'
     adapter = RestartTestAdapter()
     adapter.gateway_runner = runner
     runner.adapters[Platform.TELEGRAM] = adapter

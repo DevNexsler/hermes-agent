@@ -164,6 +164,8 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     adapter_key = build_session_key(src)
 
     runner = object.__new__(GatewayRunner)
+    from tests.gateway.restart_test_helpers import install_native_admission
+    install_native_admission(runner)
     from gateway.config import GatewayConfig
 
     runner.config = GatewayConfig(

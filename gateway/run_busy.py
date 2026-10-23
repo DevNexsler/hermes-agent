@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
+from gateway.admission import native_to_thread
 import contextlib
 import json
 import os
@@ -319,7 +320,7 @@ class GatewayBusySessionMixin:
             return True
 
         try:
-            session_id = await asyncio.to_thread(
+            session_id = await native_to_thread(
                 self._lookup_session_id_under_store_lock, session_store, session_key
             )
         except (AttributeError, TypeError):
@@ -331,7 +332,7 @@ class GatewayBusySessionMixin:
             return False
         raw_db = getattr(session_db, "_db", session_db)
         try:
-            holder = await asyncio.to_thread(raw_db.get_compression_lock_holder, str(session_id))
+            holder = await native_to_thread(raw_db.get_compression_lock_holder, str(session_id))
             # Production returns Optional[str]. Reject non-strings so a MagicMock auto-attr (or any
             # unexpected truthy) cannot look like a held lock and skip hygiene.
             # See #96953.
@@ -1053,9 +1054,14 @@ class GatewayBusySessionMixin:
         try:
             accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
         except Exception as exc:
+            from gateway.admission import ingress_admitted
+            if ingress_admitted(self):
+                raise
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return f"⚠️ Steer failed: {exc}"
         if not accepted:
+            from gateway.admission import refuse_queued_ingress
+            refuse_queued_ingress(self)
             return "Steer rejected (empty payload)."
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = "run and its active subagent(s)" if self._agent_has_active_subagents(running_agent) else "run"

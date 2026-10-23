@@ -366,6 +366,27 @@ internal policy does not weaken the strict `ingress_to_thread` extension contrac
 Accepted Base pending/debounce buffers and runner FIFO/command backlog also prevent strict
 quiescence, even when their original guard is orphaned. Inspection never consumes or refunds them.
 
+Independent human FIFO handoffs clear ambient ingress context. Failed Task adoption cancels and
+tracks the scheduled child before its first step. Ordinary native executor work also stays in the
+existing deferred-worker registry through physical completion after caller cancellation. Busy slash
+queue/rejected-steer refusal propagates to HTTP 503; an unexpected steering exception propagates as
+an error, with no accepted receipt. Such an error has an unknown effect outcome, never retry authority.
+
+Standing-goal continuation and kickoff/resume are separate native producers. Their enqueue
+reservation linearizes with closure and clears parent permission; transport fallback remains
+refused. If maintenance closes before continuation entry, including after FIFO enqueue or cancellation
+before its first step, `GoalManager.pause_for_maintenance` atomically compares unchanged active state
+and stores a maintenance pause plus a private `state_meta` receipt under
+`goal_maintenance_pause:<session_id>:<pause_id>`. Receipt retains owner/hold identity, exact goal
+checkpoint, continuation prompt and inputs, prior result, profile path and durable history identity.
+Existing user/foreign changes are preserved. Failed durable write/readback latches strict quiescence
+unknown; marker removal cannot clear that process-local uncertainty.
+
+These pauses never resume automatically. Before fence release, the maintenance owner must inventory
+every profile's receipts and leave a named, actionable `/goal resume` handoff. A rollout must not
+resume user/foreign/changed pauses. No automatic maintenance-resume API is supplied here; source
+publication does not authorize goal commands. Existing history stays in the same profile database.
+
 `gateway_admission_status(runner)` returns `known`, `closed`, `ingress`, `adopted`, `active_work`,
 `quiescent`, `observers`, plus public `hold` identity when known. `adopted` includes background tasks and executor
 futures. Counters overlap intentionally: only zero matters. Unknown capability, hold or work counters

@@ -3777,6 +3777,8 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
+        if pending_event is not None and await self._defer_queued_goal_for_maintenance(pending_event):
+            return response
         from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (

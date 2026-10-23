@@ -42,6 +42,7 @@ class GatewayAdmission:
         self._closed = False
         self._ingress = 0
         self._adopted = 0
+        self._uncertain_work = False
         self.hold = {'known': True, 'active': False, 'hold_id': None, 'owner': None}
 
     def close(self):
@@ -50,8 +51,13 @@ class GatewayAdmission:
 
     def reopen(self):
         with self._lock:
-            if not self.runner._draining and not self.hold['active']:
+            if not self.runner._draining and not self.hold['active'] and not self._uncertain_work:
                 self._closed = False
+
+    def fail_quiescence(self):
+        """Unconfirmed durable ownership blocks closure until an operator resolves it."""
+        with self._lock:
+            self._closed = self._uncertain_work = True
 
     def _ready(self, *, startup=False):
         return (self.runner._running and not self.runner._draining
@@ -206,8 +212,38 @@ def adopt_ingress_task(runner, task):
     """Carry a live handler reservation across background dispatch; otherwise leave legacy tasks."""
     lease = _ingress.get()
     if lease is not None:
-        _barrier(runner).adopt(lease, asyncio.current_task(), task)
+        try:
+            _barrier(runner).adopt(lease, asyncio.current_task(), task)
+        except GatewayDraining:
+            if isinstance(task, asyncio.Task):
+                task.cancel()
+                pending = lease.barrier.runner.__dict__.setdefault('_deferred_agent_cleanup_tasks', set())
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            else:
+                lease.barrier.runner._track_deferred_agent_worker(task, None)
+            raise
     return task
+
+
+@contextmanager
+def without_gateway_ingress():
+    """Independent queued arrivals/producers never inherit another handler's permission."""
+    token = _ingress.set(None)
+    try:
+        yield
+    finally:
+        _ingress.reset(token)
+
+
+@contextmanager
+def native_producer_ingress(runner):
+    """Independent native continuation admission; only its startup owner may skip restore readiness."""
+    previous = _ingress.get()
+    startup = previous.startup if ingress_admitted(runner) else None
+    with without_gateway_ingress(), _reserve_ingress(runner, startup=startup):
+        yield
 
 
 def refuse_queued_ingress(runner):
@@ -267,7 +303,9 @@ async def native_in_executor(runner, executor, function, /, *args):
     """Preserve the native pool choice and profile context across admission-aware offloads."""
     if ingress_admitted(runner):
         return await _ingress_in_executor(executor, function, *args)
-    return await asyncio.get_running_loop().run_in_executor(executor, copy_context().run, function, *args)
+    future = asyncio.get_running_loop().run_in_executor(executor, copy_context().run, function, *args)
+    runner._track_deferred_agent_worker(future, None)
+    return await asyncio.shield(future)
 
 
 async def _ingress_in_executor(executor, function, /, *args, **kwargs):
@@ -317,6 +355,8 @@ def gateway_admission_status(runner):
     """
     try:
         barrier = _barrier(runner)
+        if barrier._uncertain_work:
+            raise GatewayDraining('durable work ownership unconfirmed')
         status = barrier.snapshot()
         if not status['hold']['known']:
             raise GatewayDraining('persistent admission hold unreadable')
@@ -332,6 +372,7 @@ def gateway_admission_status(runner):
         work = (runner._running_agent_count() + runner._running_cron_job_count()
                 + api_count + api_worker_live_count()
                 + sum(not future.done() for future in list(deferred))
+                + sum(not task.done() for task in getattr(runner, '_deferred_agent_cleanup_tasks', ()))
                 + bool(getattr(runner, '_startup_restore_in_progress', False)))
         # A base task can be waiting on routing/auth before the runner has claimed a session.
         adapters = list(runner.adapters.values())

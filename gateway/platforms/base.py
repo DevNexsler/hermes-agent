@@ -4010,14 +4010,12 @@ class BasePlatformAdapter(ABC):
                                  self.name, cmd, session_key)
                     await self._dispatch_inline_reply(event)
             except Exception as e:
+                from gateway.admission import GatewayDraining, ingress_admitted
+                if isinstance(e, GatewayDraining) or ingress_admitted(self.gateway_runner):
+                    raise
                 logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
             return
-        # Clarify bypass: while blocked on clarify_tool the next message must reach the
-        # text-intercept so numeric/exact/"Other" answers resolve it and unblock the agent.
-        # Otherwise it lands in _pending_messages as a follow-up turn and the answer is
-        # discarded.  Same shape as the /approve deadlock fix (PR #4926): agent thread
-        # blocked on Event.wait, message must reach the resolver before being a new turn.
-        # See #4926.
+        # Clarify answers must reach their resolver before queueing, or the waiting agent deadlocks (#4926).
         if not cmd and event.allow_gateway_control:
             try:
                 from tools import clarify_gateway as _clarify_mod
@@ -4039,6 +4037,9 @@ class BasePlatformAdapter(ABC):
             except GatewayDraining:
                 raise
             except Exception as e:
+                from gateway.admission import ingress_admitted
+                if ingress_admitted(self.gateway_runner):
+                    raise
                 logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
         refuse_queued_ingress(self.gateway_runner)
         # Without a runner FIFO, do not merge a wake into an occupied human slot
@@ -4450,6 +4451,9 @@ class BasePlatformAdapter(ABC):
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
+            if (getattr(event, '_goal_admission_checkpoint', None) is not None
+                    and await self.gateway_runner._defer_queued_goal_for_maintenance(event)):
+                return
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
@@ -4491,15 +4495,8 @@ class BasePlatformAdapter(ABC):
                 if not _tts_paths and _tts_requested_path is not None:
                     with contextlib.suppress(OSError):
                         os.remove(_tts_requested_path)
-                # Suspend the typing refresh before the first delivery attempt, not just in
-                # the turn's finally (#117300): if the final send stalls (platform accepted it
-                # but the HTTP ack never returns), control never reaches the finally, and
-                # _keep_typing keeps refreshing sendChatAction forever while the agent is
-                # already idle and the user can read the answer. Reuse the existing
-                # _typing_paused mechanism: _keep_typing skips paused chats each tick and
-                # _stop_typing_refresh's finally discards it, so it cannot leak into the next
-                # turn. No new await on the delivery path (a fire-and-forget stop task was
-                # measured to have no effect).
+                # Stop typing before delivery: a lost send ack must not refresh it forever (#117300).
+                # Reuse _typing_paused so turn cleanup releases suppression.
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
@@ -4520,8 +4517,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
-            # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
-            # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
+            # Flush debounce before the handoff; keep the guard live across stop-typing.
             await self._flush_text_debounce_now(session_key)
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
@@ -4558,13 +4554,14 @@ class BasePlatformAdapter(ABC):
             self._finish_session_task(session_key, interrupt_event)
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
-        """Hand the session to a fresh task for a queued follow-up — never recurse (chained
-        follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
-        live for concurrent inbound; ownership moves so stale-lock detection works."""
+        """Fresh independent queued turn; never recurse (C-stack overflow) or borrow ingress."""
+        from gateway.admission import without_gateway_ingress
         self._clear_session_guard(session_key)
-        self._track_session_task(
-            session_key,
-            asyncio.create_task(self._process_message_background(pending_event, session_key)))
+        with without_gateway_ingress():
+            task = asyncio.create_task(self._process_message_background(pending_event, session_key))
+            self._track_session_task(session_key, task)
+            if getattr(pending_event, '_goal_admission_checkpoint', None) is not None:
+                self.gateway_runner._track_goal_drain_checkpoint(pending_event, task)
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""
