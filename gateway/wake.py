@@ -89,7 +89,8 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
+                       notification_category: str = "result", profile: Optional[str] = None,
+                       single_attempt: bool = False) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
@@ -112,6 +113,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
+    if single_attempt:
+        extra['single_attempt'] = True
     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
@@ -184,7 +187,7 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
+                                      profile: Optional[str] = None, single_attempt: bool = False) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -225,7 +228,7 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     if notification_category == "diagnostic":
         payload["hermes_notification_category"] = "diagnostic"
     last_err: Optional[BaseException] = None
-    attempts = 1 + len(_RETRY_DELAYS_SECONDS)
+    attempts = 1 if single_attempt else 1 + len(_RETRY_DELAYS_SECONDS)
     for attempt in range(attempts):
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])

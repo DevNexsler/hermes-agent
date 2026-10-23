@@ -53,16 +53,8 @@ class ApiServerLikeAdapter:
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(delay):
-        if delay == 5:
-            return None
-        runner._running = False
-        await real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    from tests.gateway.restart_test_helpers import run_one_notifier_tick
+    await run_one_notifier_tick(runner, monkeypatch)
 
 
 def _make_runner(adapters):
@@ -113,7 +105,8 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, single_attempt=False):
+        assert single_attempt is True
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -170,7 +163,8 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, single_attempt=False):
+        assert single_attempt is True
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -185,7 +179,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
     assert _unseen_terminal_events(tid, "api_server", "origin-b") == []
 
 
-def test_apiserver_wake_failure_rewinds_then_retries_destination(
+def test_apiserver_unknown_wake_retains_attention_without_reposting(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-retry.db"))
@@ -195,7 +189,8 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     )
     attempted_sessions = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id):
+    async def fail_once_then_succeed(adapter, *, text, session_id, single_attempt=False):
+        assert single_attempt is True
         attempted_sessions.append(session_id)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")
@@ -210,12 +205,16 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    assert _unseen_terminal_events(tid, "api_server", "origin-session")
+    with kbc.connect() as conn:
+        attention = kbn.list_notify_subs(conn, tid)[0]['delivery_metadata']['notification_attention_v1']
+    assert attention
 
     runner._running = True
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert attempted_sessions == ["origin-session", "origin-session"]
+    assert attempted_sessions == ["origin-session"]
     assert "worker-session" not in attempted_sessions
+    with kbc.connect() as conn:
+        assert kbn.list_notify_subs(conn, tid)[0]['delivery_metadata']['notification_attention_v1'] == attention
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
 

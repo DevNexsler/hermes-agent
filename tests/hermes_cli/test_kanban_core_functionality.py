@@ -984,10 +984,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    calls = {"connect": 0, "to_thread": 0}
-
     def _connect(*args, **kwargs):
-        calls["connect"] += 1
         if corrupt_exc == "guard":
             raise _kbc.KanbanDbCorruptError(
                 corrupt_db,
@@ -996,26 +993,24 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             )
         raise sqlite3.DatabaseError("file is not a database")
 
-    async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kbd.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 6:
-            runner._running = False
-        return result
+    from tests.gateway.restart_test_helpers import install_native_admission
+    install_native_admission(runner)
+    real_sleep = asyncio.sleep
+    cycles = 0
 
     async def _sleep(_delay):
-        return None
+        await real_sleep(0)
+
+    async def _after_tick(_interval):
+        nonlocal cycles
+        cycles += 1
+        if cycles == 2:
+            runner._running = False
+        await real_sleep(0)
 
     monkeypatch.setattr(_kbc, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+    monkeypatch.setattr(runner, '_sleep_between_ticks', _after_tick)
 
     with caplog.at_level(logging.ERROR, logger="gateway.run"):
         asyncio.run(

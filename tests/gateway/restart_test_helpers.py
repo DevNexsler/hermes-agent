@@ -200,3 +200,24 @@ def install_native_admission(runner, *, home=None):
     from gateway.admission import initialize_gateway_admission
     runner._running, runner._draining, runner._external_drain_active = True, False, False
     initialize_gateway_admission(runner, home=home)
+
+
+async def run_one_notifier_tick(runner, monkeypatch):
+    """Explicit capability; stop AFTER full notifier tick, never during a worker yield."""
+    if getattr(runner, '_ingress_barrier', None) is None:
+        install_native_admission(runner)
+    runner._running = True
+    owner = asyncio.current_task()
+    original_sleep = asyncio.sleep
+
+    async def initial_delay(delay):
+        if delay == 5 and asyncio.current_task() is owner:
+            return
+        await original_sleep(delay)
+
+    async def stop_after_tick(interval):
+        runner._running = False
+
+    monkeypatch.setattr(asyncio, 'sleep', initial_delay)
+    monkeypatch.setattr(runner, '_sleep_between_ticks', stop_after_tick)
+    await runner._kanban_notifier_watcher(interval=1)

@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.admission import admit_gateway_work, native_in_executor
+from gateway.admission import GatewayDraining, admit_gateway_work, native_in_executor
 from functools import partial
 
 from gateway.kanban_watchers_common import (
@@ -154,7 +154,7 @@ class GatewayKanbanWatchersMixin:
         Sources, in priority order: ``event_payload['artifacts']``,
         ``event_payload['summary']``, then ``task.result`` (legacy). Paths are
         deduplicated, missing files are skipped (may be mentioned for
-        reference only), and upload errors are logged, never raised.
+        reference only). Failed/uncertain uploads retain notification attention.
         """
         raw_paths: list[str] = []
         prose_paths: list[str] = []
@@ -187,23 +187,40 @@ class GatewayKanbanWatchersMixin:
 
         from urllib.parse import quote as _quote
 
-        # Images ride one send_multiple_images call (batch uploads on Signal/Slack).
+        # Native image batches attest at-least-one success. A notification must know
+        # EACH artifact landed before clearing its aggregate durable attention.
         image_paths = [p for p in candidates if Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if Path(p).suffix.lower() not in _IMAGE_EXTS]
-        if image_paths:
-            try:
-                batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
-            except Exception as exc:
-                logger.warning("kanban notifier: image batch upload failed: %s", exc)
+        for path in image_paths:
+            image = [(f"file://{_quote(path)}", "")]
+            result = await adapter.send_multiple_images(chat_id=chat_id, images=image, metadata=metadata)
+            self._require_kanban_artifact_delivery(result)
         for path in other_paths:
-            try:
-                if Path(path).suffix.lower() in _VIDEO_EXTS:
-                    await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
-                else:
-                    await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
-            except Exception as exc:
-                logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
+            if Path(path).suffix.lower() in _VIDEO_EXTS:
+                result = await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+            else:
+                result = await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+            self._require_kanban_artifact_delivery(result)
+
+    @staticmethod
+    def _require_kanban_artifact_delivery(result) -> None:
+        if getattr(result, 'success', True) is False:
+            raise RuntimeError('kanban artifact delivery outcome unknown')
+
+    @admit_gateway_work
+    async def _kanban_dispatcher_tick(self, dispatcher, load_config):
+        """Fence before decomposition/claims/spawn; physical offloads retain reservation."""
+        from hermes_cli import kanban_db_dispatch as kbd
+        pids = await _to_thread_process_service(kbd.reap_worker_zombies)
+        if pids:
+            logger.info('kanban dispatcher: reaped %d zombie worker(s), pids=%s', len(pids), pids)
+        if not _kanban_dispatch_allowed():
+            return [], False
+        enabled, per_tick = _resolve_auto_decompose_settings(load_config)
+        if enabled:
+            await _to_thread_process_service(dispatcher.auto_decompose_tick, per_tick)
+        results = await _to_thread_process_service(dispatcher.tick_once)
+        return results, await _to_thread_process_service(dispatcher.ready_nonempty)
 
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
@@ -283,31 +300,16 @@ class GatewayKanbanWatchersMixin:
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
             try:
-                # Reap zombies before per-board work so a board DB failure
-                # cannot block cleanup of unrelated workers.
                 from hermes_cli import kanban_db_dispatch as _kbd
-                pids = await _to_thread_process_service(_kbd.reap_worker_zombies)
-                if pids:
-                    logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
-            except Exception:
-                logger.exception("kanban dispatcher: zombie reaper failed")
-
-            try:
-                # Emergency stop (`hermes pause`): no auto-decompose or
-                # dispatch while paused; running workers finish naturally.
-                if not _kanban_dispatch_allowed():
-                    bad_ticks = 0
-                else:
-                    # Re-read the auto-decompose toggle live so disabling it
-                    # takes effect on the next tick, not on restart.
-                    _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
-                    # See #49638.
-                    if _ad_enabled:
-                        await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(dispatcher.tick_once)
-                    any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                tick = asyncio.create_task(self._kanban_dispatcher_tick(dispatcher, _load_config))
+                try:
+                    results, ready_pending = await asyncio.shield(tick)
+                except asyncio.CancelledError:
+                    # Keep the singleton lock until admitted physical spawn/DB work settles.
+                    await asyncio.shield(asyncio.gather(tick, return_exceptions=True))
+                    raise
+                any_spawned = _log_spawn_results(results)
+                bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
@@ -323,6 +325,8 @@ class GatewayKanbanWatchersMixin:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()
                 raise
+            except GatewayDraining:
+                bad_ticks = 0
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 

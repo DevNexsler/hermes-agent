@@ -216,6 +216,12 @@ async def prepare_ingress_dispatch(adapter, event, session_key):
     runner = adapter.gateway_runner
     if not ingress_admitted(runner) or startup_resume_admitted(runner, event, session_key):
         return False
+    from tools import clarify_gateway, slash_confirm
+    state = runner._peek_session_state(session_key)
+    if (clarify_gateway.get_pending_for_session(session_key, include_choice_prompts=True) is not None
+            or slash_confirm.get_pending(session_key)
+            or (state is not None and state.persistent.update_prompt_pending)):
+        refuse_control_ingress(runner)
     busy = session_key in adapter._active_sessions or runner._is_session_running(session_key)
     if busy and (event.get_command() not in (None, 'steer') or event.media_urls or event.media_types
                  or event.message_type.value != 'text'):
@@ -288,6 +294,13 @@ def refuse_queued_ingress(runner):
     if ingress_admitted(runner):
         raise GatewayDraining('retryable ingress cannot enter an in-memory follow-up queue',
                               pre_effect=not _ingress.get().effect_started, reason='busy_queue_refused')
+
+
+def refuse_control_ingress(runner):
+    """Retryable wakes cannot resolve or cancel somebody else's interactive prompt."""
+    if ingress_admitted(runner):
+        raise GatewayDraining('retryable wake cannot answer a human control prompt',
+                              pre_effect=not _ingress.get().effect_started, reason='busy_unsupported')
 
 
 
@@ -417,6 +430,7 @@ def gateway_admission_status(runner):
         if not status['hold']['known']:
             raise GatewayDraining('persistent admission hold unreadable')
         from gateway.platforms.api_server_runs import api_worker_live_count
+        from gateway.kanban_quiescence import kanban_worker_work_count
         from gateway.config import Platform
         api = runner.adapters.get(Platform.API_SERVER)
         api_count = 0 if api is None else api.active_agent_work_count(strict=True)
@@ -426,7 +440,7 @@ def gateway_admission_status(runner):
         if not isinstance(deferred, dict):
             raise GatewayDraining('deferred worker registry unreadable')
         work = (runner._running_agent_count() + runner._running_cron_job_count()
-                + api_count + api_worker_live_count()
+                + api_count + api_worker_live_count() + kanban_worker_work_count()
                 + sum(not future.done() for future in list(deferred))
                 + sum(not task.done() for task in getattr(runner, '_deferred_agent_cleanup_tasks', ()))
                 + bool(getattr(runner, '_startup_restore_in_progress', False)))

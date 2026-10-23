@@ -355,6 +355,21 @@ def unseen_events_for_sub(
 
 
 def claim_unseen_events_for_sub(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, kinds: Optional[Iterable[str]] = None,
+    attention_context: Optional[dict] = None,
+) -> tuple[int, int, list[Event]]:
+    """Legacy cursor claim; owned notifier consumes the atomic snapshot API below."""
+    return _claim_notify_events(conn, task_id=task_id, platform=platform, chat_id=chat_id,
+                               thread_id=thread_id, kinds=kinds, attention_context=attention_context)[:3]
+
+
+def claim_notify_delivery(conn: sqlite3.Connection, *, attention_context: dict, **identity) -> tuple:
+    """Claim with exact subscription/attention captured inside the same write transaction."""
+    return _claim_notify_events(conn, attention_context=attention_context, **identity)
+
+
+def _claim_notify_events(
     conn: sqlite3.Connection,
     *,
     task_id: str,
@@ -363,7 +378,7 @@ def claim_unseen_events_for_sub(
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
     attention_context: Optional[dict] = None,
-) -> tuple[int, int, list[Event]]:
+) -> tuple[int, int, list[Event], Optional[dict]]:
     """Atomically claim unseen events for one subscription.
 
     Returns ``(old_cursor, new_cursor, events)``; when events are returned the
@@ -381,15 +396,15 @@ def claim_unseen_events_for_sub(
             raise ValueError('notification metadata unreadable')
         old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
         if 'notification_attention_v1' in metadata:
-            return old_cursor or 0, old_cursor or 0, []
+            return old_cursor or 0, old_cursor or 0, [], None
         if old_cursor is None:
-            return 0, 0, []
+            return 0, 0, [], None
         new_cursor, events = unseen_events_for_sub(
             conn, task_id=task_id, platform=platform, chat_id=chat_id,
             thread_id=thread_id, kinds=kinds,
         )
         if not events:
-            return old_cursor, old_cursor, []
+            return old_cursor, old_cursor, [], None
         if attention_context is not None:
             record = dict(attention_context, version=1, outcome='UNKNOWN', attempt_id=uuid.uuid4().hex,
                 reason='notification claimed; effect outcome unconfirmed', created_at=time.time(),
@@ -405,7 +420,8 @@ def claim_unseen_events_for_sub(
             saved = conn.execute('SELECT delivery_metadata, last_event_id FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
             if saved['last_event_id'] != new_cursor or json.loads(saved['delivery_metadata']) != metadata:
                 raise RuntimeError('notification intent readback unconfirmed')
-        return old_cursor, new_cursor, events
+        snapshot = dict(row, last_event_id=new_cursor, delivery_metadata=metadata)
+        return old_cursor, new_cursor, events, snapshot
 
 
 def checkpoint_notify_delivery(

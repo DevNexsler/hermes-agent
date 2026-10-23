@@ -431,6 +431,9 @@ Nested/callee typed exceptions cannot upgrade proof after this mark. Attempted s
 fails or declines remains UNKNOWN; no inferred no-effect or automatic retry. Ordinary human
 fanout keeps its existing behavior. Busy leased control/media/interrupt fallbacks refuse before
 invocation; direct confirmed steer or fresh start remain the acceptance paths.
+Preflight refuses pending clarify/update/slash-confirm prompts before Base can acknowledge
+background dispatch; core resolver guards cover direct callers too. Unleased human replies retain
+their existing control behavior.
 
 An extension may offer version1 refusal receipts only with explicit True and an allowlisted
 reason, synchronously authenticated request version/DD headers, and exact body/DD binding when
@@ -456,6 +459,25 @@ receipts survive. Wake reserves a separate native leg after ping checkpoints. SQ
 or ownership failures block strict readiness. Attention never expires or resolves automatically;
 no general manual resolution/resend command is introduced. Incapable older source can ignore
 these fields, so rollback safety still requires independent closure and retention proof.
+
+Owned notifier HTTP wake uses one POST attempt, including lost-response/timeout failures; generic
+errors and HTTP status alone never authorize replay. If an earlier diagnostic/result wake group
+was accepted, a later pre-effect refusal retains aggregate UNKNOWN rather than rewinding the
+whole cursor. Artifact exceptions and negative delivery results retain attention too. Native image
+batch success means at least one image landed, so owned notifications submit individual image
+uploads to verify every artifact before aggregate settlement.
+
+`claim_notify_delivery` returns subscription and attention captured inside its SQLite claim
+transaction. A later foreign replacement cannot become the caller's ownership token. Existing
+cursor-only consumers keep `claim_unseen_events_for_sub` and its three-value result.
+
+Embedded dispatcher reserves its complete decomposition/claim/spawn tick before mutations.
+Cancellation waits for admitted physical tick completion before releasing its singleton lock.
+Strict status also reads machine-shared board claims and task/run worker records without schema
+initialization, reconciliation or signals: running/orphan claims, live terminal workers and
+unverifiable foreign-host workers prevent zero; unreadable stores mean unknown. This inventory
+does not fence independent dispatcher processes. Coordinator must verify their exclusion and
+actual machine-shared dispatcher-lock ownership alongside every served home's cron tick lock.
 
 Queued goal checkpoints bind their owning profile before lookup/pause. Fresh reservation spans
 preflight through core entry; already accepted in-core goal followups return to the existing Base

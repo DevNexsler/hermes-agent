@@ -28,22 +28,10 @@ def test_notifier_watcher_skips_when_notifications_disabled():
     list_boards.assert_not_called()
 
 
-def test_notifier_watcher_polls_without_dispatch_ownership():
+def test_notifier_watcher_polls_without_dispatch_ownership(monkeypatch):
     """A profile gateway still polls its profile-owned subscriptions."""
     runner = _make_runner(with_adapter=True)
     past_gate = []
-    sleep_calls = []
-
-    async def fake_sleep(delay):
-        sleep_calls.append(delay)
-        # Stop after the initial delay + first per-interval sleep so the loop
-        # body runs exactly once.
-        if len(sleep_calls) >= 2:
-            runner._running = False
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
     import hermes_cli.kanban_db as _kb
 
     with patch(
@@ -59,9 +47,8 @@ def test_notifier_watcher_polls_without_dispatch_ownership():
             _kb, "list_boards",
             side_effect=lambda *a, **kw: past_gate.append(True) or [],
         ):
-            with patch("asyncio.sleep", side_effect=fake_sleep):
-                with patch("asyncio.to_thread", side_effect=fake_to_thread):
-                    asyncio.run(runner._kanban_notifier_watcher())
+            from tests.gateway.restart_test_helpers import run_one_notifier_tick
+            asyncio.run(run_one_notifier_tick(runner, monkeypatch))
 
     assert past_gate, (
         "gateways without the dispatch lock must still poll owned subscriptions"

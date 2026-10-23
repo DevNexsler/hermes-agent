@@ -292,7 +292,7 @@ class _Collector:
         profile = owner_profile or self.notifier_profile or 'default'
         source = SessionSource(platform=Platform(platform), chat_id=sub['chat_id'], profile=owner_profile)
         profile_home = self.runner._resolve_profile_home_for_source(source).resolve()
-        old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
+        old_cursor, cursor, events, claimed_sub = _kbn().claim_notify_delivery(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
             attention_context={'owner': f"profile:{profile}/{platform}:subscriber:{sub.get('user_id') or sub['chat_id']}",
@@ -300,8 +300,7 @@ class _Collector:
         )
         if not events:
             return None
-        sub = next(item for item in _kbn().list_notify_subs(conn, sub['task_id'])
-                   if all(item.get(field) == sub.get(field) for field in ('platform', 'chat_id', 'thread_id')))
+        sub = claimed_sub
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
@@ -645,8 +644,11 @@ class _KanbanNotification:
             # API_SERVER_KEY, which a route-only profile legitimately does not have, and an
             # unprefixed self-post would resume the session in the DEFAULT profile's store.
             async with self._owner_scope():
+                from gateway.admission import mark_ingress_effect
+                mark_ingress_effect(self.runner)
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
                                    profile=self._served_wake_profile(),
+                                   single_attempt=True,
                                    notification_category="diagnostic" if self.wake_diagnostic else "result")
             self._log_woke()
             return
@@ -808,14 +810,19 @@ class _KanbanNotification:
 
         # A requested wake is required even when its passive ping already landed.
         if wake_payloads:
+            accepted_wakes = 0
             try:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
                     await self.wake()
+                    accepted_wakes += 1
                 self.clear_failures()
-            except WakeNotAccepted:
+            except WakeNotAccepted as exc:
                 # Startup / full queue is not a dead destination. Keep the durable
                 # subscription alive regardless of how long admission takes.
-                await self.rewind()
+                if accepted_wakes:
+                    await self._retain_unknown(exc)
+                else:
+                    await self.rewind()
                 return
             except Exception as _wk_err:
                 await self._retain_unknown(_wk_err)

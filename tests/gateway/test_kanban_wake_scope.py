@@ -27,6 +27,9 @@ USER = "U0BCE4NRVKN"
 
 
 class UnscopedAdapter:
+    from gateway.platforms.base import BasePlatformAdapter
+    extract_local_files = staticmethod(BasePlatformAdapter.extract_local_files)
+
     """Push-capable adapter for a platform without tenant scoping."""
 
     def __init__(self):
@@ -65,16 +68,8 @@ def _runner(adapter, platform=Platform.SLACK):
 
 
 async def _one_notifier_tick(monkeypatch, runner):
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(delay):
-        if delay == 5:
-            return None
-        runner._running = False
-        await real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    from tests.gateway.restart_test_helpers import run_one_notifier_tick
+    await run_one_notifier_tick(runner, monkeypatch)
 
 
 def _completed_subscription(**sub_kwargs):

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
-from gateway.admission import native_to_thread, startup_resume_admitted
+from gateway.admission import native_to_thread, refuse_control_ingress, startup_resume_admitted
 import concurrent.futures
 import dataclasses
 import json
@@ -322,7 +322,7 @@ class GatewayInboundMixin:
         _up_state = self._peek_session_state(_quick_key)
         if _up_state is None or not _up_state.persistent.update_prompt_pending:
             return None
-        # Accept /approve and /deny as shorthand for yes/no
+        refuse_control_ingress(self)
         cmd = event.get_command()
         _recognized_cmd = None
         if cmd in {"approve", "yes"}:
@@ -364,8 +364,7 @@ class GatewayInboundMixin:
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Intercept a reply to a pending clarify prompt; None when the message falls through.
-        Free text answers open-ended/"Other" prompts; "2" answers a multi-choice one. Resolved/retained
-        replies return "" so adapters don't double-post — the agent produces the next user-facing message."""
+        Resolved/retained replies return "" so adapters don't double-post."""
         try:
             from tools import clarify_gateway as _clarify_mod
             _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key, include_choice_prompts=True)
@@ -373,6 +372,7 @@ class GatewayInboundMixin:
             return None
         if _pending_clarify is None:
             return None
+        refuse_control_ingress(self)
         _clarify_has_audio = bool(self._pending_event_audio_paths(event))
         _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
 
@@ -458,13 +458,13 @@ class GatewayInboundMixin:
         _pending_confirm = _slash_confirm_mod.get_pending(_quick_key)
         if not _pending_confirm:
             return None
+        refuse_control_ingress(self)
         with suppress(Exception):
             from tools.approval import has_blocking_approval
             if has_blocking_approval(_quick_key):
                 return None
         # Accept bang-prefixed replies (`!always`, `!cancel`) verbatim: Slack/Matrix show the `!`
-        # prefix (typed `/` is blocked in Slack threads) and adapters only rewrite
-        # `!<known-command>` — confirm keywords aren't commands, so the `!` survives to here.
+        # prefix; confirm keywords survive adapter command rewriting.
         _norm_reply = (event.text or "").strip().lstrip("!/").lower()
         _confirm_choice = (
             self._SLASH_CONFIRM_CMD_CHOICES.get(event.get_command())
