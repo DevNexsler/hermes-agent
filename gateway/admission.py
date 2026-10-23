@@ -168,7 +168,6 @@ def _reserve_ingress(runner, *, startup=None):
         barrier.release(lease, owner)
 
 
-
 def startup_resume_ingress(runner, event, session_key):
     """Native lifecycle owner only: resume its preclaimed slot while HTTP readiness stays closed."""
     return _reserve_ingress(runner, startup=(event, session_key))
@@ -297,7 +296,8 @@ def gateway_admission_status(runner):
             raise GatewayDraining('deferred worker registry unreadable')
         work = (runner._running_agent_count() + runner._running_cron_job_count()
                 + api_count + api_worker_live_count()
-                + sum(not future.done() for future in list(deferred)))
+                + sum(not future.done() for future in list(deferred))
+                + bool(getattr(runner, '_startup_restore_in_progress', False)))
         # A base task can be waiting on routing/auth before the runner has claimed a session.
         adapters = list(runner.adapters.values())
         for profile_adapters in getattr(runner, '_profile_adapters', {}).values():

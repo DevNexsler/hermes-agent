@@ -17,8 +17,7 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 @pytest.mark.asyncio
 @pytest.mark.parametrize('runner_busy_handler', [False, True])
 async def test_native_internal_refund_and_leased_busy_refusal_never_queue(tmp_path, runner_busy_handler):
-    runner, adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, adapter = make_restart_runner(admission_home=tmp_path)
     adapter.gateway_runner = runner
     adapter.set_message_handler(runner._handle_message)
     if not runner_busy_handler:
@@ -55,8 +54,7 @@ async def test_native_internal_refund_and_leased_busy_refusal_never_queue(tmp_pa
 
 
 def test_present_api_adapter_with_unreadable_or_missing_counter_is_unknown(tmp_path):
-    runner, _adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, _adapter = make_restart_runner(admission_home=tmp_path)
     runner._enter_external_drain()
     api = object.__new__(APIServerAdapter)
     api._pending_agent_requests = 1
@@ -87,8 +85,7 @@ def test_present_api_adapter_with_unreadable_or_missing_counter_is_unknown(tmp_p
     {'known': True, 'active_tasks': False, 'active_threads': 0},
 ])
 def test_declared_observer_contract_never_converts_unknown_to_idle(tmp_path, reported):
-    runner, adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, adapter = make_restart_runner(admission_home=tmp_path)
     runner._enter_external_drain()
     assert gateway_admission_status(runner)['quiescent'] is True
     adapter.admission_observer_status = lambda: reported
@@ -101,8 +98,7 @@ def test_declared_observer_contract_never_converts_unknown_to_idle(tmp_path, rep
 
 
 def test_corrupt_lazy_deferred_registry_is_unknown(tmp_path):
-    runner, _adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, _adapter = make_restart_runner(admission_home=tmp_path)
     runner._enter_external_drain()
     assert gateway_admission_status(runner)['quiescent'] is True
     runner._deferred_agent_workers = None

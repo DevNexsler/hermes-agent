@@ -118,6 +118,8 @@ def make_startup_runner(tmp_path):
         runner, gateway_run.GatewayRunner
     )
     runner.stop = gateway_run.GatewayRunner.stop.__get__(runner, gateway_run.GatewayRunner)
+    from gateway.admission import initialize_gateway_admission
+    initialize_gateway_admission(runner, home=tmp_path)
     return runner
 
 

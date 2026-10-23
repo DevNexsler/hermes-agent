@@ -53,7 +53,7 @@ def make_restart_source(
 
 
 def make_restart_runner(
-    adapter: BasePlatformAdapter | None = None,
+    adapter: BasePlatformAdapter | None = None, *, admission_home=None,
 ) -> tuple[GatewayRunner, BasePlatformAdapter]:
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -168,4 +168,7 @@ def make_restart_runner(
     platform_adapter.set_message_handler(AsyncMock(return_value=None))
     platform_adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
     runner.adapters = {Platform.TELEGRAM: platform_adapter}
+    from gateway.admission import initialize_gateway_admission
+    initialize_gateway_admission(runner, home=admission_home)
+    platform_adapter.gateway_runner = runner
     return runner, platform_adapter

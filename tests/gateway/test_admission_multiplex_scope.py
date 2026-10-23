@@ -27,7 +27,6 @@ async def test_real_multiplex_thread_scope_survives_handoff_and_cancel(tmp_path,
     pin_process_hermes_home(homes[0])
     set_multiplex_active(True)
     runner, _adapter = make_restart_runner()
-    initialize_gateway_admission(runner)  # captures launch A once, never the current profile
     expected = []
 
     def observe():

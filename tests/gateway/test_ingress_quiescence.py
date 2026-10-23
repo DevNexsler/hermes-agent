@@ -34,8 +34,7 @@ async def _server(handler):
 
 @pytest.mark.asyncio
 async def test_http_prefence_work_survives_drain_and_handoff_without_false_ack(tmp_path):
-    runner, adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, adapter = make_restart_runner(admission_home=tmp_path)
     adapter.gateway_runner = runner
     entered, release, background, finish = (asyncio.Event() for _ in range(4))
     effects = []
@@ -102,6 +101,7 @@ async def test_http_prefence_work_survives_drain_and_handoff_without_false_ack(t
 @pytest.mark.asyncio
 async def test_cancelled_handler_and_unready_capability_fail_closed(tmp_path):
     runner, _adapter = make_restart_runner()
+    del runner._ingress_barrier  # Explicit missing-capability fixture.
     with pytest.raises(GatewayDraining):
         with gateway_ingress(runner):
             pytest.fail('missing native capability accepted work')
@@ -130,8 +130,7 @@ async def test_cancelled_handler_and_unready_capability_fail_closed(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cancelled_thread_or_unstarted_task_retains_exact_work_until_exit(tmp_path):
-    runner, _adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, _adapter = make_restart_runner(admission_home=tmp_path)
     started, release = asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=1))

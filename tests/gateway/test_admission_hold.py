@@ -40,8 +40,7 @@ async def test_hold_survives_restart_stale_nas_and_abort_across_two_homes(tmp_pa
     monkeypatch.setattr(drain_control, 'DRAIN_REQUEST_MAX_AGE_SECONDS', -1)
     assert not drain_control.drain_requested(home=homes[0])
     for home in (homes[0], homes[1], homes[0]):
-        runner, _adapter = make_restart_runner()
-        initialize_gateway_admission(runner, home=home)
+        runner, _adapter = make_restart_runner(admission_home=home)
         with _profile_runtime_scope(homes[1], hydrate_secrets=False):
             controls = read_admission_controls(runner._ingress_barrier.home)
         assert controls['drain'] is (home == homes[0])
@@ -65,9 +64,8 @@ async def test_hold_survives_restart_stale_nas_and_abort_across_two_homes(tmp_pa
         pass
     # The real boot entry cannot reach even its first setup hook while an owned hold exists.
     boot_hold = acquire_admission_hold(owner='boot-fixture', home=homes[0])
-    boot, _adapter = make_restart_runner()
+    boot, _adapter = make_restart_runner(admission_home=homes[0])
     boot._running = False
-    initialize_gateway_admission(boot, home=homes[0])
     read, reached = asyncio.Event(), []
     loop = asyncio.get_running_loop()
     original_read = admission.read_admission_controls
@@ -118,6 +116,5 @@ def test_corrupt_hold_never_looks_absent_or_gets_replaced(tmp_path, contents):
         with pytest.raises(AdmissionHoldConflict):
             operation()
     assert path.is_dir() if contents == 'directory' else path.read_text(encoding='utf-8') == contents
-    runner, _adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, _adapter = make_restart_runner(admission_home=tmp_path)
     assert gateway_admission_status(runner)['quiescent'] is None

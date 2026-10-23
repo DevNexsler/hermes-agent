@@ -339,7 +339,11 @@ fallback raises `GatewayDraining` before storage, so callers retain the original
 and retry; refund provisional dedup claims on every unaccepted exit, including cancellation.
 Native internal producers use the same reservation; their refused receipt becomes
 `WakeNotAccepted`, preserving refund/retry semantics. Ordinary unleased human queues keep their
-existing behavior. A consumer must never record delivery after a refused steer or queue fallback.
+existing behavior. Startup resume reserves its own event and preclaimed session through the native
+lifecycle path; it can finish restoration while HTTP readiness stays closed, but cannot bypass a
+maintenance hold or external drain. Leased arrivals with existing backlog refuse before Base
+acknowledges or mutates that backlog. A consumer must never record delivery after a refused steer
+or queue fallback.
 
 Use `await ingress_to_thread(fn, *args, **kwargs)` for work under this reservation. Cancellation
 raises `asyncio.CancelledError` promptly while the shielded executor future remains counted until

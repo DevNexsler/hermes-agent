@@ -13,8 +13,7 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 @pytest.mark.asyncio
 async def test_real_startup_schedule_dispatch_finish_allowed_but_external_ingress_stays_closed(tmp_path):
-    runner, adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, adapter = make_restart_runner(admission_home=tmp_path)
     adapter.gateway_runner = runner
     adapter.set_message_handler(runner._handle_message)
     runner._startup_restore_in_progress = True
@@ -35,7 +34,12 @@ async def test_real_startup_schedule_dispatch_finish_allowed_but_external_ingres
     await asyncio.gather(*runner._startup_restore_tasks)
     assert effects == [True]
     assert not runner._is_session_running(key)
+    await runner._finish_startup_restore()
+    assert not runner._startup_restore_in_progress
+    with gateway_ingress(runner):
+        pass
     # Same lifecycle path remains refused once external closure is engaged.
+    runner._startup_restore_in_progress = True
     runner._enter_external_drain()
     assert runner._schedule_resume_pending_sessions() == 1
     await asyncio.gather(*runner._startup_restore_tasks)
@@ -46,8 +50,7 @@ async def test_real_startup_schedule_dispatch_finish_allowed_but_external_ingres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ['sentinel', 'photo', 'orphan'])
 async def test_leased_base_refuses_priority_or_orphan_backlog_before_ack_and_preserves_it(tmp_path, kind):
-    runner, adapter = make_restart_runner()
-    initialize_gateway_admission(runner, home=tmp_path)
+    runner, adapter = make_restart_runner(admission_home=tmp_path)
     adapter.gateway_runner = runner
     adapter.set_message_handler(runner._handle_message)
     source = make_restart_source()
@@ -68,3 +71,19 @@ async def test_leased_base_refuses_priority_or_orphan_backlog_before_ack_and_pre
         assert runner._overflow_queue(key) == [old]
     else:
         assert runner._peek_session_state(key).turn.agent is _AGENT_PENDING_SENTINEL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('photo', [False, True])
+async def test_real_core_priority_merge_propagates_typed_refusal(tmp_path, photo):
+    runner, adapter = make_restart_runner(admission_home=tmp_path)
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    runner._session_state(key).turn.agent = _AGENT_PENDING_SENTINEL
+    event = MessageEvent(text='retry', source=source,
+                         message_type=MessageType.PHOTO if photo else MessageType.TEXT)
+    with gateway_ingress(runner):
+        with pytest.raises(GatewayDraining):
+            await runner._handle_message(event)
+    assert not adapter._pending_messages
+    assert runner._peek_session_state(key).turn.agent is _AGENT_PENDING_SENTINEL

@@ -237,8 +237,6 @@ class TestMarkerMaxAge:
 
 def _drain_runner():
     runner, adapter = make_restart_runner()
-    from gateway.admission import initialize_gateway_admission
-    initialize_gateway_admission(runner)
     runner._external_drain_active = False
     # Bind the real methods under test.
     runner._enter_external_drain = GatewayRunner._enter_external_drain.__get__(
