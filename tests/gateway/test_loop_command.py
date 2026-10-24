@@ -49,6 +49,8 @@ def loop_env(tmp_path, monkeypatch):
 
 
 def _make_runner():
+    from gateway.admission import GatewayAdmission
+    from hermes_constants import get_hermes_home
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
@@ -56,7 +58,18 @@ def _make_runner():
     runner.session_store = _FakeSessionStore()
     runner.adapters = {}
     runner._queued_events = {}
+    runner._running = True
+    runner._draining = runner._external_drain_active = False
+    runner._ingress_barrier = GatewayAdmission(runner, get_hermes_home())
     return runner
+
+
+def _watcher_clock(monkeypatch, sleep):
+    """Advance watcher ticks only; adopted-task/executor scheduling stays real."""
+    class Clock:
+        def __getattr__(self, name):
+            return sleep if name == 'sleep' else getattr(asyncio, name)
+    monkeypatch.setattr('gateway.run_goals.asyncio', Clock())
 
 
 def _make_event(text: str) -> MessageEvent:
@@ -253,6 +266,7 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
 
         async def handle_message(self, event):
             self.handled.append(event.text)
+            event._gateway_accepted = True  # Explicit inert adapter admission fixture.
 
     runner.adapters = {Platform.DISCORD: _Adapter()}
     runner._build_process_event_source = lambda evt: SimpleNamespace(
@@ -307,7 +321,7 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
         mp.setattr(loops, "list_active_loops", _list_active_loops)
         mp.setattr(loops.LoopManager, "fire_tick", _fire_tick)
         mp.setattr(loops.LoopManager, "complete_tick", _complete_tick)
-        mp.setattr(asyncio, "sleep", _one_pass_sleep)
+        _watcher_clock(mp, _one_pass_sleep)
         await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
 
     assert _Adapter.handled == ["/status"], _Adapter.handled
@@ -364,7 +378,7 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
             return await orig_sleep(0)
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(asyncio, "sleep", _one_pass_sleep)
+            _watcher_clock(mp, _one_pass_sleep)
             await asyncio.wait_for(
                 GatewayRunner._loop_wakeup_watcher(runner, interval=0), timeout=5)
 

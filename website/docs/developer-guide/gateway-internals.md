@@ -542,6 +542,15 @@ stored goal and conversation history; an unreadable store cannot attest a comple
 handoff. The operator must inspect that session before proceeding. No automatic retry or resume
 resolves this uncertainty. Ordinary interactive goal reads retain their existing best-effort behavior.
 
+Strict decoding validates original nested gate/contract/subgoal containers and fields before the
+permissive legacy parser. Every supplied value must survive decoding; missing known legacy fields
+may default and equivalent JSON numbers compare by value, while booleans remain distinct. Discarded
+constraints, unknown nested fields or changed scalar values block readiness and preserve the raw row.
+Duplicate JSON keys at any depth are ambiguous and rejected before decoding.
+The gateway also adopts the whole post-turn task before its earlier routing lookup. Failure of both
+SQLite routing persistence and its JSON fallback latches UNKNOWN before that task settles; cancellation
+cannot abandon later goal/loop accounting. A surviving authoritative routing path keeps normal behavior.
+
 Queued goals also bind the originating conversation to the resolved/current route before preparation
 and again before actual entry. Only a verified compression tip with the identical migrated goal may
 continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation

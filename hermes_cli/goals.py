@@ -615,13 +615,59 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
+def _validate_goal_nested_state(data: dict) -> None:
+    """Automatic ownership must not rely on legacy coercions that discard constraints."""
+    subgoals = data.get('subgoals', [])
+    contract = data.get('contract', {})
+    gates = data.get('gates', [])
+    if not isinstance(subgoals, list) or any(not isinstance(s, str) or not s.strip() for s in subgoals):
+        raise ValueError('goal subgoal structure unconfirmed')
+    if (not isinstance(contract, dict) or contract.keys() - GoalContract.__dataclass_fields__.keys()
+            or any(not isinstance(v, str) for v in contract.values())):
+        raise ValueError('goal contract structure unconfirmed')
+    if not isinstance(gates, list):
+        raise ValueError('goal gate structure unconfirmed')
+    for gate in gates:
+        if (not isinstance(gate, dict) or gate.keys() - GoalGate.__dataclass_fields__.keys()
+                or not isinstance(gate.get('command'), str) or not gate['command'].strip()):
+            raise ValueError('goal gate identity or fields unconfirmed')
+    for key in ('last_verdict', 'last_reason', 'paused_reason', 'waiting_reason', 'waiting_on_session', 'generation_id'):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            raise ValueError('goal optional text identity unconfirmed')
+
+
+def _goal_values_preserved(original, decoded) -> bool:
+    """Legacy fields may default; present values survive, including equivalent JSON numbers."""
+    if isinstance(original, dict):
+        return (isinstance(decoded, dict) and not (original.keys() - decoded.keys())
+                and all(_goal_values_preserved(v, decoded[k]) for k, v in original.items()))
+    if isinstance(original, list):
+        return (isinstance(decoded, list) and len(original) == len(decoded)
+                and all(_goal_values_preserved(a, b) for a, b in zip(original, decoded)))
+    if type(original) in (int, float) and type(decoded) in (int, float):
+        return original == decoded
+    return type(original) is type(decoded) and original == decoded
+
+
+def _goal_json_object(pairs) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate goal checkpoint field')
+        result[key] = value
+    return result
+
+
 def _confirmed_goal_state(raw: str) -> GoalState:
     """Decode an automatic ownership witness without discarding unknown state."""
-    data = json.loads(raw)
+    data = json.loads(raw, object_pairs_hook=_goal_json_object)
     if not isinstance(data, dict) or data.keys() - GoalState.__dataclass_fields__.keys():
         raise ValueError('goal checkpoint contains unknown fields or structure')
+    _validate_goal_nested_state(data)
     state = GoalState.from_json(raw)
     json.dumps(asdict(state), allow_nan=False)
+    if not _goal_values_preserved(data, asdict(state)):
+        raise ValueError('goal checkpoint normalization would discard or change stored inputs')
     if (state.status not in ('active', 'paused', 'done', 'cleared') or not isinstance(state.goal, str)
             or (state.status in ('active', 'paused') and not state.goal.strip())):
         raise ValueError('goal checkpoint identity or status unconfirmed')

@@ -582,16 +582,28 @@ class GatewayGoalsMixin:
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
-        """Run goal and loop bookkeeping after an agent turn returns."""
+        """Retain routing through bookkeeping when the delivered-turn waiter is cancelled."""
         if getattr(event, '_goal_ownership_refused', False):
             return  # No turn ran; post-turn bookkeeping must not reset a suspended route.
+        from gateway.admission import adopt_ingress_task
+        task = adopt_ingress_task(self, asyncio.create_task(self._post_turn_bookkeeping(
+            agent_result=agent_result, source=source, is_internal=is_internal, event=event)))
+        self._track_deferred_agent_worker(task, None)
+        await asyncio.shield(task)
+
+    async def _post_turn_bookkeeping(
+        self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
+    ) -> None:
+        """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(
                 source, touch_activity=not is_internal,
             )
-        except Exception as exc:
-            logger.debug("post-turn session resolution failed: %s", exc)
+        except Exception:
+            self._ingress_barrier.fail_quiescence()
+            logger.error('Post-turn route unresolved for %s/%s; inspect retained goal/loop obligations before release',
+                         source.platform, source.chat_id, exc_info=True)
             return
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
