@@ -588,6 +588,9 @@ closure before yielding, leaving their caller's outer transaction owned by that 
 Attachment identity, input containment and retained workspace overlap share the existing NFC
 comparison policy after realpath resolution. Destructive I/O keeps the original stored path spelling;
 on normalization-sensitive filesystems equivalent comparison keys conservatively retain inputs.
+Resolved original paths stay separate from comparison keys; keys never become lookup paths.
+Actual filesystem identity and ancestor checks also retain case aliases. Unreadable identity
+refuses destructive cleanup; absent names alone do not imply business completion or retry authority.
 Native log rotation runs before claim under that same board's writer boundary. Prior physical,
 launch, notification or ancestor ownership preserves every generation, including zero-backup
 configuration. An injected database cannot authorize canonical log rotation; append-only spawn

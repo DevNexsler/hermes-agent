@@ -28,9 +28,10 @@ _REMOVABLE_KINDS = ("scratch", "worktree")
 
 def _unlink_unreferenced_attachment_blob(conn, path):
     path = Path(path)
-    realpath = _input_path_identity(path)
-    if (_has_retained_workspace(conn, realpath)
-            or any(_input_path_identity(row[0]) == realpath for row in conn.execute('SELECT stored_path FROM task_attachments'))):
+    realpath = _resolved_input_path(path)
+    if (_has_retained_workspace(conn, path)
+            or any(_same_input_path(_resolved_input_path(row[0]), realpath)
+                   for row in conn.execute('SELECT stored_path FROM task_attachments'))):
         return
     with contextlib.suppress(OSError):
         if path.is_file():
@@ -48,23 +49,23 @@ def cleanup_failed_attachment_blob(conn, path):
 
 
 def _has_attachment_files(conn, directory):
-    root = _input_path_identity(directory)
-    return any(_input_path_identity(row[0]).is_relative_to(root)
+    root = _resolved_input_path(directory)
+    return any(_input_path_contains(root, _resolved_input_path(row[0]))
                for row in conn.execute('SELECT stored_path FROM task_attachments'))
 
 
 def _has_retained_workspace(conn, directory):
     """Shared native workspace ownership protects both enclosing and nested inputs."""
     from hermes_cli.kanban_db_spawn import retained_task_ids
-    root = _input_path_identity(directory)
+    root = _resolved_input_path(directory)
     protected = retained_task_ids(conn)
     for task_id, path in conn.execute('SELECT id, workspace_path FROM tasks'):
         if task_id not in protected:
             continue
         if not path:
             return True  # An unbound retained workspace cannot authorize removal.
-        owner = _input_path_identity(path)
-        if owner.is_relative_to(root) or root.is_relative_to(owner):
+        owner = _resolved_input_path(path)
+        if _input_path_contains(owner, root) or _input_path_contains(root, owner):
             return True
     return False
 
@@ -96,9 +97,25 @@ def _path_key(path: Path | str | None) -> str:
     return unicodedata.normalize("NFC", str(path)) if path is not None else ""
 
 
-def _input_path_identity(path) -> Path:
-    """Comparison only: preserve original spelling for I/O, normalize resolved input keys."""
-    return Path(_path_key(Path(path).expanduser().resolve()))
+def _resolved_input_path(path) -> Path:
+    """Resolve original spelling; comparison keys never become filesystem lookup paths."""
+    return Path(path).expanduser().resolve()
+
+
+def _same_input_path(left: Path, right: Path) -> bool:
+    if _path_key(left) == _path_key(right):
+        return True
+    try:
+        return left.samefile(right)
+    except FileNotFoundError:
+        return False
+
+
+def _input_path_contains(parent: Path, child: Path) -> bool:
+    """Keep conservative Unicode keys and actual case-insensitive ancestor identities."""
+    if Path(_path_key(child)).is_relative_to(Path(_path_key(parent))):
+        return True
+    return any(_same_input_path(parent, ancestor) for ancestor in (child, *child.parents))
 
 # Statuses after which a child no longer needs its parent's workspace artifacts.
 _ACTIVE_CHILDREN_SQL = (
