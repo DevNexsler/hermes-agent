@@ -1,7 +1,9 @@
 """Existing task-event ownership spans physical launch and durable PID handoff."""
+from contextlib import contextmanager
 from dataclasses import asdict
 import json
 import logging
+import re
 from pathlib import Path
 import uuid
 
@@ -159,10 +161,67 @@ def gc_settled_worker_logs(log_dir, cutoff, board):
     with kbc.connect_closing(board=board) as conn, kb.write_txn(conn):
         protected = unresolved_worker_task_ids(conn)
         for path in log_dir.iterdir():
-            if path.stem in protected:
+            owner = re.fullmatch(r'(.+)\.log(?:\.\d+)?', path.name)
+            if owner is not None and owner.group(1) in protected:
                 continue
             with contextlib.suppress(OSError):
                 if path.is_file() and path.stat().st_mtime < cutoff:
                     path.unlink()
                     removed += 1
     return removed
+
+
+def worker_ownership_count(conn):
+    """Shared strict inventory; unreadable/unknown launch ownership raises."""
+    from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
+    require_writable_board(conn)
+    if pending_worker_launch(conn) is not None:
+        raise RuntimeError('physical worker launch ownership UNKNOWN; inspect task events')
+    total = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' OR NULLIF(claim_lock, '') IS NOT NULL").fetchone()[0]
+    workers = conn.execute('SELECT worker_pid, claim_lock FROM tasks WHERE worker_pid IS NOT NULL '
+                           'UNION SELECT worker_pid, claim_lock FROM task_runs WHERE worker_pid IS NOT NULL')
+    local = kb._host_prefix()
+    for pid, owner in workers:
+        if local == 'unknown:' or not str(owner or '').startswith(local) or dispatch._pid_alive(pid):
+            total += 1
+    return total
+
+
+def require_writable_board(conn):
+    """A removed WAL file can remain writable through an old connection; intent closes it first."""
+    if conn.execute("SELECT 1 FROM task_events WHERE kind='board_removal_pending' LIMIT 1").fetchone():
+        raise RuntimeError('board removal ownership UNKNOWN; preserve remaining store and inspect removal intent')
+
+
+@contextmanager
+def board_removal_guard(board):
+    """Keep destructive removal serialized with native claim/launch writers; never migrate."""
+    import sqlite3
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    # Removal targets this directory, regardless of a caller's DB override.
+    path = (kb.board_dir(board) / 'kanban.db').resolve()
+    conn = connect_tracked(path.as_uri() + '?mode=rw', uri=True, timeout=0, isolation_level=None)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute('BEGIN IMMEDIATE')
+        if worker_ownership_count(conn):
+            raise RuntimeError('board still owns active or unverifiable physical work')
+        for (raw,) in conn.execute('SELECT delivery_metadata FROM kanban_notify_subs'):
+            metadata = json.loads(raw or '{}')
+            if not isinstance(metadata, dict) or 'notification_attention_v1' in metadata:
+                raise RuntimeError('board notification outcome UNKNOWN; preserve attention and inputs')
+        record = {'version': 1, 'operation_id': uuid.uuid4().hex, 'board': board,
+                  'database_realpath': str(path), 'owner': 'native-board-removal',
+                  'outcome': 'UNKNOWN', 'required_action': 'Inspect exact removal and remaining files; no automatic reopen.'}
+        _append_checked_event(conn, '', 'board_removal_pending', record, None)
+        conn.commit()
+        # Old/preopened connections now see the durable stop even after unlink/recreation.
+        saved = conn.execute("SELECT payload FROM task_events WHERE kind='board_removal_pending'").fetchall()
+        if len(saved) != 1 or json.loads(saved[0][0]) != record:
+            raise RuntimeError('board removal intent readback unconfirmed')
+        conn.execute('BEGIN IMMEDIATE')
+        yield
+    finally:
+        conn.rollback()
+        conn.close()

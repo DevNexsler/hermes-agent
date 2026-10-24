@@ -660,28 +660,29 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
+    from hermes_cli.kanban_db_spawn import board_removal_guard
+    with (contextlib.nullcontext() if archive else board_removal_guard(normed)):
+        # If the user removed the currently-active board, revert to default.
+        if get_current_board() == normed:
+            clear_current_board()
 
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        # Recreated stores must initialize again after rename/removal.
+        _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        suffix = 1
-        while target.exists():  # rapid double-archive
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            suffix = 1
+            while target.exists():  # rapid double-archive
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {"slug": normed, "action": "archived", "new_path": str(target)}
+        import shutil
+        shutil.rmtree(d)
+        return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # --- Data classes ---
@@ -1703,6 +1704,8 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        require_settled_worker_launch(conn, parent_id)
+        require_settled_worker_launch(conn, child_id)
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )

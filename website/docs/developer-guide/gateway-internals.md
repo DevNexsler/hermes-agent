@@ -540,6 +540,25 @@ refuse unresolved task/ancestor ownership; completion may settle its result whil
 Verified matching launch settlement restores ordinary cleanup eligibility. No absence-of-PID or
 elapsed-time inference clears the launch, and no new settlement/resend interface is added.
 
+The final queued-goal check runs after the last await: a nonwaiting route lock and SQLite writer
+snapshot verify the prepared session, original goal generation and verified compression tip together,
+then mark execution entry before releasing either lock. Preparation-time compression can advance the
+prepared identity only along that verified lineage with identical goal state. Contention or unreadable
+ownership retains the exact original obligation as UNKNOWN; no lock spans an await.
+
+Unlink cannot remove an unresolved launch's ancestor protection. Log retention covers both the current
+`<task>.log` and supported numbered rotations. Whole-board hard deletion checks the database inside
+the directory being removed, independently of a database override, and refuses active/unverifiable
+workers, unresolved launches or any notification attention. Before unlinking files, it commits and
+reads back a version1 `board_removal_pending` event in the existing task-events store, with empty
+task ID, operation identity, owner principal, database path and required operator action. Native writer
+transactions reject any present removal event. This also closes preopened WAL connections, which
+otherwise can keep claiming work after filesystem deletion. Failed/interrupted deletion leaves the
+surviving store closed and strict inventory UNKNOWN across restart; no automatic clearing/reopen.
+Explicit recreation creates an independent database, while old connections remain closed. Existing
+archive behavior retains its database for inventory. These guards require the new source; old writers
+and incapable rollback still need separate exclusion. Owner principal does not assign a human.
+
 Supported pre-dispatch text rewrites clone the event while retaining private native checkpoints.
 Only the current live reservation's exact event may transfer its reserved capacity/startup ownership
 to that clone; matching session keys or inherited context alone grant no permission. Original

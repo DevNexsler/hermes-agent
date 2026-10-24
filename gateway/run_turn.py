@@ -1085,10 +1085,8 @@ class GatewayTurnMixin:
         """Adopt a finished compression (rotation / in-place / refused); publishes the transcript to
         continue with on ``attempt.history``. Returns ``(rotated, in_place, new_count, new_tokens)``.
 
-        Rewrite only on rotation (NEW session id): in-place compaction already soft-archived the
-        old rows and rewrite_transcript() would DELETE them; neither rotation nor in-place signals
-        FAILURE and an unconditional rewrite would leave only the summary. Write-before-repoint:
-        a repoint-then-failed-rewrite would point the live entry at an empty session."""
+        Rewrite only on rotation, before repointing. In-place/failed compaction must retain old rows;
+        a failed rewrite must never leave the live entry pointing at an empty session."""
         from agent.model_metadata import estimate_messages_tokens_rough
         _hyg_agent = attempt.agent
         # _compress_context rotates to a NEW session_id so the old transcript stays intact/searchable.
@@ -2162,6 +2160,7 @@ class GatewayTurnMixin:
         if not isinstance(prepared, self._PreparedTurn):
             return prepared
         history, message_text = prepared.history, prepared.message_text
+        prepared_session_id = prepared.persistence_session_id or session_entry.session_id
 
         try:
             hook_ctx = {
@@ -2175,13 +2174,15 @@ class GatewayTurnMixin:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
-            # Compression publication keeps the launch session identity.
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
-            if await self._defer_queued_goal_for_maintenance(event):
+            if await self._defer_queued_goal_for_maintenance(event, resolved_session_id=prepared_session_id):
                 return
-            _run_start_session_id = session_entry.session_id
+            if not self._claim_goal_entry(event, prepared_session_id):
+                await self._defer_queued_goal_for_maintenance(event)
+                return
+            _run_start_session_id = getattr(event, '_goal_resolved_session_id', None) or session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             from gateway.admission_capacity import mark_event_execution_started
             mark_event_execution_started(event)
@@ -2201,8 +2202,7 @@ class GatewayTurnMixin:
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # A queued (/queue) chain answered the LAST message of the chain, so the outer final
-            # send (bracketed by the adapter against this event) must be ledgered under that
+            # A queued chain's outer final must be ledgered under its LAST
             # message's id or it collides with an earlier turn's row carrying the same text. Reply
             # routing is untouched: the anchor still comes from this event.
             if isinstance(agent_result, dict):

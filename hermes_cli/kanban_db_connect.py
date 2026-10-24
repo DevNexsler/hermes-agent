@@ -1222,6 +1222,8 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
+        from hermes_cli.kanban_db_spawn import require_writable_board
+        require_writable_board(conn)
         yield conn
     except Exception:
         # SQLite may already have auto-rolled-back (EIO, contention, corruption);

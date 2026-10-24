@@ -361,6 +361,55 @@ class GatewayGoalsMixin:
             return GoalManager(origin), conflict
         return GoalManager(current_id), None
 
+    def _claim_goal_entry(self, event, prepared_session_id):
+        """No await/retry: serialize the final identity check and entry with route/goal writers."""
+        checkpoint = getattr(event, '_goal_admission_checkpoint', None)
+        if checkpoint is None:
+            return True
+        import sqlite3
+        from contextlib import closing
+        from pathlib import Path
+        from gateway.run import _profile_runtime_scope
+        from gateway.admission_capacity import mark_event_execution_started
+        from hermes_cli.goals import GoalState
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        store = self.session_store
+        key = self._session_key_for_source(event.source)
+        conflict = {'origin_session_id': checkpoint['session_id'], 'prepared_session_id': prepared_session_id,
+                    'session_key': key, 'reason': 'final goal/route ownership unavailable or changed'}
+        acquired = store._lock.acquire(blocking=False)
+        try:
+            if acquired:
+                home = self._resolve_profile_home_for_source(event.source)
+                with _profile_runtime_scope(home, {}):
+                    db = store._db_for_key(key)
+                    uri = Path(db.db_path).resolve().as_uri() + '?mode=rw'
+                    with closing(connect_tracked(uri, uri=True, timeout=0, isolation_level=None)) as conn:
+                        conn.row_factory = sqlite3.Row
+                        conn.execute('BEGIN IMMEDIATE')
+                        try:
+                            current = store._entry_locked(key)
+                            row = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                                               ('goal:' + prepared_session_id,)).fetchone()
+                            tip = db.get_compression_tip(checkpoint['session_id'], conn=conn)
+                            if (current is not None and not current.suspended
+                                    and current.session_id == prepared_session_id == tip and row is not None
+                                    and GoalState.from_json(row[0]).to_json() == checkpoint['goal_state']):
+                                mark_event_execution_started(event)
+                                return True
+                            conflict.update(current_session_id=current.session_id if current else None)
+                        finally:
+                            conn.rollback()
+        except Exception as exc:
+            conflict['reason'] = f'final ownership unreadable/contended: {type(exc).__name__}'
+        finally:
+            if acquired:
+                store._lock.release()
+        event._goal_entry_conflict = conflict
+        event._goal_ownership_refused = True
+        self._ingress_barrier.fail_quiescence()
+        return False
+
     async def _defer_queued_goal_for_maintenance(self, event, *, resolved_session_id=None):
         checkpoint = getattr(event, '_goal_admission_checkpoint', None)
         if checkpoint is None:
@@ -371,6 +420,7 @@ class GatewayGoalsMixin:
             resolved = resolved_session_id or getattr(event, '_goal_resolved_session_id', None)
             mgr, conflict = await self._run_in_executor_with_context(
                 lambda: self._queued_goal_owner(event, checkpoint, resolved))
+            conflict = getattr(event, '_goal_entry_conflict', None) or conflict
             expected = checkpoint.get('goal_state')
             if not isinstance(expected, str):
                 self._ingress_barrier.fail_quiescence()

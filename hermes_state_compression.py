@@ -5,6 +5,7 @@ Mixin bound onto ``SessionDB`` via the MRO, built on its ``_read_ctx`` /
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import logging
 import sqlite3
@@ -650,20 +651,21 @@ class SessionCompressionMixin:
                 (time.time(), cutoff),
         ) or 0
 
-    def get_compression_chain(self, session_id: str) -> List[str]:
+    def get_compression_chain(self, session_id: str, *, conn=None) -> List[str]:
         """Walk the compression-continuation chain forward: root-first through the tip (``[session_id]``
         when no continuation); ``get_compression_tip`` is the last element. A continuation is a child of
         a session with ``end_reason='compression'``. The old ``child.started_at >= parent.ended_at`` test
         was too brittle (gateway + compression races insert the real continuation before ``ended_at`` is
         written, while a stale websocket later creates a sibling that passes it). Instead exclude
         branch/delegate/tool children and prefer children that continue the chain or are still live over
-        stale closed siblings such as ``ws_orphan_reap``."""
+        stale closed siblings such as ``ws_orphan_reap``. Optional ``conn`` shares the caller's
+        transaction snapshot for an atomic lineage/goal ownership check."""
         current = session_id
         chain = [current] if current else []
         seen = set(chain)
         for _ in range(100):  # defensive bound; chains this deep are pathological
-            with self._read_ctx() as conn:
-                row = conn.execute(_CHAIN_STEP_SQL, (current,)).fetchone()
+            with (nullcontext(conn) if conn is not None else self._read_ctx()) as snapshot:
+                row = snapshot.execute(_CHAIN_STEP_SQL, (current,)).fetchone()
             child_id = row["id"] if row is not None else None
             if not child_id or child_id in seen:
                 return chain
@@ -672,10 +674,11 @@ class SessionCompressionMixin:
             chain.append(child_id)
         return chain
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(self, session_id: str, *, conn=None) -> Optional[str]:
         """Live tip of a compression chain (``get_compression_chain`` semantics); the input
-        id when no continuation exists."""
-        chain = self.get_compression_chain(session_id)
+        id when no continuation exists; optional ``conn`` preserves the caller's snapshot."""
+        chain = (self.get_compression_chain(session_id, conn=conn) if conn is not None
+                 else self.get_compression_chain(session_id))
         return chain[-1] if chain else session_id
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
