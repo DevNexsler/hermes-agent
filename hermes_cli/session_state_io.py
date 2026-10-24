@@ -88,9 +88,12 @@ def migrate_confirmed_state(prefix, old, new, decode, *, db=None, strict=False):
                 return False
             cleared = parse_confirmed_json(parent[0])
             cleared['status'] = 'cleared'
-            for key, raw in ((prefix + new, parent[0]), (prefix + old, json.dumps(cleared))):
+            values = ((prefix + new, parent[0]), (prefix + old, json.dumps(cleared)))
+            for key, raw in values:
                 db.set_meta(key, raw, cursor=conn)
-                if conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()[0] != raw:
+            for key, raw in values:
+                row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+                if row is None or row[0] != raw:
                     raise RuntimeError('session transfer readback unconfirmed')
             return True
         result = db._execute_write(commit)

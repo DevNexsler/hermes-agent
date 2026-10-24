@@ -1304,6 +1304,9 @@ class GatewayInboundMixin:
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
+            attempt = getattr(event, '_loop_admission_checkpoint', None)
+            if attempt is not None:
+                attempt['command_completed'] = True
             return _result
 
         # Exec approvals require /approve or /deny; conversational yes must not execute commands.

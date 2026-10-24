@@ -18,7 +18,8 @@ native = test_admission_native_work.native
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ['goal', 'loop', 'heartbeat'])
-@pytest.mark.parametrize('fault', ['none', 'malformed', 'write', 'parent_write', 'readback', 'duplicate'])
+@pytest.mark.parametrize('fault', ['none', 'malformed', 'write', 'parent_write', 'readback', 'duplicate',
+                                  'parent_deletes_child', 'parent_corrupts_child'])
 async def test_real_rotating_compression_retains_state_and_reports_unknown(native, kind, fault):
     runner, db = native.runner, native.db
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='123456', user_id='u1', chat_type='dm')
@@ -52,6 +53,12 @@ async def test_real_rotating_compression_retains_state_and_reports_unknown(nativ
             action = "UPDATE state_meta SET value='EXACT unconfirmed readback' WHERE key=NEW.key"
         db._conn.execute('CREATE TRIGGER transfer_fault ' + timing + ' ON state_meta WHEN ' + condition
                          + ' BEGIN ' + action + '; END')
+    if fault in ('parent_deletes_child', 'parent_corrupts_child'):
+        action = ("DELETE FROM state_meta" if fault == 'parent_deletes_child'
+                  else "UPDATE state_meta SET value='EXACT child corrupted after first readback'")
+        db._conn.execute("CREATE TRIGGER transfer_fault AFTER UPDATE ON state_meta "
+                         "WHEN NEW.key='" + kind + ':' + parent + "' BEGIN " + action
+                         + " WHERE key LIKE '" + kind + ":%' AND key!=NEW.key; END")
     agent = _build_agent_with_db(db, parent)
     try:
         with gateway_ingress(runner):
@@ -71,7 +78,7 @@ async def test_real_rotating_compression_retains_state_and_reports_unknown(nativ
                 break
             await asyncio.sleep(.01)
     finally:
-        if fault in ('write', 'parent_write', 'readback'):
+        if fault in ('write', 'parent_write', 'readback', 'parent_deletes_child', 'parent_corrupts_child'):
             db._conn.execute('DROP TRIGGER transfer_fault')
     status = gateway_admission_status(runner)
     assert status['known'] is (fault == 'none')

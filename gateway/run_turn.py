@@ -8,6 +8,7 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 from gateway.admission import adopt_ingress_task, native_to_thread
+from gateway.run_loop_acceptance import mark_loop_failure
 import dataclasses
 import inspect
 import json
@@ -1971,7 +1972,7 @@ class GatewayTurnMixin:
     async def _hmwa_agent_error_reply(self, e, event, source, session_entry, session_key, prepared):
         """``except Exception`` body of the agent turn: stop typing, log, persist the inbound user
         turn once and close it, and build the sanitized user-facing error reply."""
-        # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
+        mark_loop_failure(event)
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
         status_code = getattr(e, "status_code", None)
@@ -2200,11 +2201,10 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
+            mark_loop_failure(event, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # A queued chain's outer final must be ledgered under its LAST
-            # message's id or it collides with an earlier turn's row carrying the same text. Reply
-            # routing is untouched: the anchor still comes from this event.
+            # Ledger the queued chain's LAST message id; reply anchors stay with this event.
             if isinstance(agent_result, dict):
                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
                 if _terminal_inbound:

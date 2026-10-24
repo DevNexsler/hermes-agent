@@ -12,6 +12,7 @@ import dataclasses
 import logging
 import time
 from contextlib import suppress
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
@@ -610,7 +611,10 @@ class GatewayGoalsMixin:
             return
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
-        hooks = [("loop completion", self._post_turn_loop_completion)]
+        attempt = getattr(event, '_loop_admission_checkpoint', None)
+        loop_hook = (partial(self._post_turn_loop_completion, attempt=attempt, event=event)
+                     if attempt is not None else self._post_turn_loop_completion)
+        hooks = [("loop completion", loop_hook)]
         if final_text.strip():
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
@@ -634,7 +638,7 @@ class GatewayGoalsMixin:
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
     async def _post_turn_loop_completion(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, attempt=None, event=None,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
@@ -653,12 +657,24 @@ class GatewayGoalsMixin:
                          getattr(session_entry, 'session_id', None), exc_info=True)
             raise
         state = mgr.state
+        if attempt is not None:
+            from gateway.run_loop_acceptance import confirm_loop_attempt
+            if not getattr(event, '_heartbeat_execution_started', False) or attempt.get('failed'):
+                self._ingress_barrier.fail_quiescence()
+                raise RuntimeError('loop ended before confirmed core entry')
+            try:
+                await self._run_in_executor_with_context(confirm_loop_attempt, mgr, attempt)
+            except BaseException:
+                self._ingress_barrier.fail_quiescence()
+                raise
         if state is None or not state.awaiting_response:
             return
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
         decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        if attempt is not None:
+            attempt['accounted'] = True
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
@@ -670,7 +686,7 @@ class GatewayGoalsMixin:
         """Inject one due /loop wakeup into its session, applying every deferral rule. ``profile`` is
         the store being scanned (None = default); a ``profile`` persisted in the route wins."""
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
-        from gateway.wake import WakeNotAccepted, admit_internal_event
+        from gateway.run_loop_acceptance import dispatch_loop_attempt
 
         if state.awaiting_response or now < state.next_due_at:
             return
@@ -717,29 +733,16 @@ class GatewayGoalsMixin:
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        try:
+            wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        except asyncio.CancelledError:
+            self._ingress_barrier.fail_quiescence()
+            raise
         if not wakeup:
             return
-        # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
-        # surface. Persist the completion as a durable delivery row — never self-post it as a new role=user
-        # prompt.
-        # #85957: same client-owns-the-turn rule as the raw-key branch above — persist the completion as a
-        # delivery row, never self-post it as a new role=user prompt.
-        try:
-            logger.info(
-                "loop wakeup #%s — injecting for %s chat=%s thread=%s",
-                mgr.state.ticks_fired if mgr.state else "?",
-                platform_name, source.chat_id, source.thread_id,
-            )
-            await admit_internal_event(adapter, self._synthetic_prompt_event(source, wakeup, internal=True))
-            # Slash-command loops dispatch through the command path and never hit the post-turn
-            # completion hook — complete the tick immediately (caps + scheduling).
-            if wakeup.lstrip().startswith("/"):
-                await self._run_in_executor_with_context(mgr.complete_tick, "")
-        except WakeNotAccepted:
-            await self._run_in_executor_with_context(mgr.abandon_tick)
-        except Exception as exc:
-            logger.warning("loop wakeup outcome unknown for %s: %s", sid, exc)
+        event = self._synthetic_prompt_event(source, wakeup, internal=True)
+        event.metadata['gateway_session_key'] = session_key
+        await dispatch_loop_attempt(self, mgr, adapter, event, session_key)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops

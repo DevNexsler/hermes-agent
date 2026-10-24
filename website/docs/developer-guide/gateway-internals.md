@@ -569,6 +569,23 @@ compression catches the transfer error. The child session may already exist; thi
 attest rollback of the whole compression. Raw state and ancestor history remain inspectable.
 This uncertainty latch is process-local and supplies no restart or OLD-source bootstrap proof.
 
+Loop admission retains the exact raw claim and owning database through the actual Base task's
+termination. An adopted native monitor preserves its existing lease and executor accounting;
+it does not block scans of other loops. Normal post-turn completion must match that claim (or
+its verified compression child), enter core, and finish confirmed loop accounting. Preflight
+refusal, caught turn failure, generic error, or cancellation cannot silently reschedule the
+charged attempt. Original checkpoint/history remain actionable with readiness UNKNOWN; physical
+workers remain counted until actual settlement. A cancelled-before-start monitor also closes
+UNKNOWN before removal. Slash-command loops complete after actual command dispatch and Base
+termination, rather than merely receiving an admission boolean.
+
+Only a positively typed pre-effect admission refusal, with unchanged no-effect history and no
+accepted/spawned task, may rewind the exact owned claim. Missing admission receipt or an exception
+after effects is ambiguous; neither refunds the tick nor authorizes automatic replay. A misleading
+typed refusal after effects propagates generic uncertainty. This deliberately tightens the former
+untyped `WakeNotAccepted` refund. Compression transfer reads back both final rows after both writes,
+so a parent-clear trigger cannot invalidate an earlier child readback unnoticed.
+
 Queued goals also bind the originating conversation to the resolved/current route before preparation
 and again before actual entry. Only a verified compression tip with the identical migrated goal may
 continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation

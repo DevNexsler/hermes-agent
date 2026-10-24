@@ -53,6 +53,13 @@ async def native(tmp_path, monkeypatch):
     finally:
         finish.set()
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+        for _ in range(500):
+            if (not runner._ingress_barrier.snapshot()['adopted']
+                    and not getattr(runner, '_deferred_agent_workers', {})):
+                break
+            await asyncio.sleep(.01)
+        else:
+            raise AssertionError('native owned physical work did not settle before fixture cleanup')
         from hermes_state_registry import close_all_under
         close_all_under(home)
         pin_process_hermes_home(None)

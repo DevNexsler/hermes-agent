@@ -267,6 +267,7 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
         async def handle_message(self, event):
             self.handled.append(event.text)
             event._gateway_accepted = True  # Explicit inert adapter admission fixture.
+            event._loop_admission_checkpoint['command_completed'] = True  # Explicit inert command settlement.
 
     runner.adapters = {Platform.DISCORD: _Adapter()}
     runner._build_process_event_source = lambda evt: SimpleNamespace(
@@ -327,7 +328,7 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
     assert _Adapter.handled == ["/status"], _Adapter.handled
     assert seen_calls == ["list_active_loops", "fire_tick", "complete_tick"], seen_calls
     assert on_loop_calls == [], f"SessionDB calls ran on the event-loop thread: {on_loop_calls}"
-    # complete_tick ran (slash-command loops complete immediately).
+    # Completion follows the explicit inert command settlement, not admission alone.
     assert loops.load_loop("sid-gateway-loop").ticks_fired == 1
 
 
