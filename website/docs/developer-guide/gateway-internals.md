@@ -524,6 +524,17 @@ the successor stays untouched and strict readiness latches unknown. A successful
 explicit operator accounting, never automatic resume/refund/resend. The history remains in the same
 profile's existing database; no additional queue is created.
 
+Post-turn judge and quality-gate evaluation also pin the pre-evaluation goal generation and exact
+stored JSON. Automatic evaluation uses an isolated snapshot, then compares and reads back every
+save inside the existing SQLite writer transaction. A user pause, clear, replacement or resume
+committed while the judge waits wins; evaluation cannot resurrect its cached goal. A conflict
+retains the original goal, continuation prompt, delivered response and attempted evaluation in the
+same UNKNOWN receipt even with admission open. No continuation or misleading pause notice runs.
+Persistence/readback failure blocks readiness. The gateway adopts and tracks the complete
+evaluation-to-handoff task, so cancellation of its delivered-turn waiter cannot discard the
+physical executor result or durable handoff. Explicit user controls keep their existing contract;
+no writer lock spans a judge, gate or other await.
+
 Queued goals also bind the originating conversation to the resolved/current route before preparation
 and again before actual entry. Only a verified compression tip with the identical migrated goal may
 continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation

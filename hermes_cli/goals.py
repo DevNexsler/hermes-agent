@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -1067,6 +1068,10 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+class _GoalEvaluationConflict(RuntimeError):
+    """A user or another producer changed the goal while automatic work was running."""
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1124,8 +1129,23 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
+        if hasattr(self, '_evaluation_expected_raw'):
+            self._save_evaluation_state()
+        else:
+            save_goal(self.session_id, self._state)
         return self._state
+
+    def _save_evaluation_state(self) -> None:
+        db, key, raw = self._evaluation_db, _meta_key(self.session_id), self._state.to_json()
+        def commit(conn):
+            row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+            if row is None or row[0] != self._evaluation_expected_raw:
+                raise _GoalEvaluationConflict('goal changed during automatic evaluation')
+            db.set_meta(key, raw, cursor=conn)
+            if conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()[0] != raw:
+                raise RuntimeError('automatic goal persistence readback unconfirmed')
+        db._execute_write(commit)
+        self._evaluation_expected_raw = raw
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1517,6 +1537,44 @@ class GoalManager:
         )
 
     def evaluate_after_turn(
+        self, last_response: str, *, user_initiated: bool = True,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
+        active_delegations: int = 0,
+    ) -> Dict[str, Any]:
+        """Evaluate an isolated snapshot; automatic saves cannot erase intervening user state."""
+        if not self.is_active():
+            return _decision(self._state.status if self._state else None, False, None, 'inactive', 'no active goal', '')
+        origin, prompt = self._state.to_json(), self.next_continuation_prompt()
+        worker = copy.copy(self)
+        worker._state = GoalState.from_json(origin)
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError('automatic goal checkpoint store unavailable')
+        try:
+            raw = db.get_meta(_meta_key(self.session_id))
+            try:
+                data = json.loads(raw) if raw else None
+                json.dumps(data, allow_nan=False)
+                matches = (isinstance(data, dict) and not (data.keys() - asdict(self._state).keys())
+                           and GoalState.from_json(raw).to_json() == origin)
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                matches = False
+            if not matches:
+                raise _GoalEvaluationConflict('goal changed before automatic evaluation')
+            worker._evaluation_db, worker._evaluation_expected_raw = db, raw
+            decision = worker._evaluate_after_turn(last_response, user_initiated=user_initiated,
+                background_processes=background_processes, active_delegations=active_delegations)
+        except _GoalEvaluationConflict as exc:
+            self._state = load_goal(self.session_id)
+            decision = _decision(None, False, None, 'changed', str(exc), '')
+            decision.update(goal_evaluation_origin=origin, interrupted_continuation_prompt=prompt,
+                evaluated_goal_state=worker._state.to_json(),
+                goal_state_conflict={'stage': 'post-turn-goal-evaluation', 'reason': str(exc)})
+            return decision
+        self._state = worker._state
+        return decision
+
+    def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,

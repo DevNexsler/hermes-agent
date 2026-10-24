@@ -273,6 +273,16 @@ class GatewayGoalsMixin:
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
     ) -> None:
+        """Retain evaluation and durable handoff even if its delivered-turn waiter cancels."""
+        from gateway.admission import adopt_ingress_task
+        task = adopt_ingress_task(self, asyncio.create_task(self._post_turn_goal_work(
+            session_entry=session_entry, source=source, final_response=final_response)))
+        self._track_deferred_agent_worker(task, None)
+        await asyncio.shield(task)
+
+    async def _post_turn_goal_work(
+        self, *, session_entry: Any, source: Any, final_response: str,
+    ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
         def _load():
@@ -297,12 +307,25 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
-        decision = await self._run_in_executor_with_context(
-            lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
-            ),
-        )
+        try:
+            decision = await self._run_in_executor_with_context(
+                lambda: mgr.evaluate_after_turn(
+                    final_response or "", user_initiated=True, background_processes=_bg_procs,
+                    active_delegations=_active_deleg,
+                ),
+            )
+        except Exception:
+            self._ingress_barrier.fail_quiescence()
+            raise
+        if decision.get('goal_state_conflict'):
+            retained = await self._defer_goal_for_maintenance(mgr, source, decision['interrupted_continuation_prompt'],
+                final_response, expected_goal=decision['goal_evaluation_origin'],
+                ownership_conflict=decision['goal_state_conflict'],
+                input_context={'evaluated_goal_state': decision['evaluated_goal_state']})
+            if not retained:
+                self._ingress_barrier.fail_quiescence()
+                raise RuntimeError('goal conflict handoff unconfirmed')
+            return
         if await self._defer_goal_for_maintenance(
                 mgr, source, decision.get('continuation_prompt'), final_response):
             return
@@ -521,7 +544,8 @@ class GatewayGoalsMixin:
         barrier = getattr(self, '_ingress_barrier', None)
         closed = (getattr(self, '_draining', False) or getattr(self, '_external_drain_active', False)
                   or (barrier is not None and barrier._closed))
-        if not closed or not prompt or source is None or (not mgr.is_active() and expected_goal is None):
+        if ((not closed and not ownership_conflict) or not prompt or source is None
+                or (not mgr.is_active() and expected_goal is None)):
             return False
         hold = barrier.hold if barrier is not None else {}
         owner = hold.get('owner') or 'gateway-maintenance-operator'

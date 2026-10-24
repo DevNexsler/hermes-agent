@@ -70,6 +70,7 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
     goals._DB_CACHE.clear()
     command = command.format(pid=os.getpid())
     snapshots = []
+    generations = []
     for name in ('cli', surface):
         mgr = goals.GoalManager(session_id=name + '-parity-' + surface)
         mgr.set('original objective')
@@ -82,10 +83,14 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
         if state:
             from dataclasses import asdict
             state = asdict(state)
+            generation = state.pop('generation_id')
+            assert isinstance(generation, str) and generation
+            generations.append(generation)
             for key in ('created_at', 'updated_at', 'waiting_since'):
                 state.pop(key, None)
         snapshots.append(state)
     assert snapshots[0] == snapshots[1]
+    assert len(set(generations)) == len(generations)
 
 
 @pytest.mark.parametrize('surface', ['cli', 'gateway', 'tui'])
