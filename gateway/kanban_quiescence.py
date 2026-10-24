@@ -50,6 +50,9 @@ def kanban_worker_work_count():
         conn = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=1.0)
         try:
             conn.execute('BEGIN')
+            from hermes_cli.kanban_db_spawn import pending_worker_launch
+            if pending_worker_launch(conn) is not None:
+                raise RuntimeError('physical worker launch ownership UNKNOWN; inspect task events')
             total += conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' "
                                   "OR NULLIF(claim_lock, '') IS NOT NULL").fetchone()[0]
             workers = conn.execute(

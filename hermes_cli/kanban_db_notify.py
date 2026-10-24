@@ -431,6 +431,16 @@ def _claim_notify_events(
         return old_cursor, new_cursor, events, snapshot, task
 
 
+def _owned_notify_checkpoint(row, expected_attention):
+    metadata = json.loads(row['delivery_metadata'] or '{}') if row is not None else {}
+    if metadata.get('notification_attention_v1') != expected_attention:
+        raise RuntimeError('notification attention changed; existing owner preserved')
+    record = json.loads(expected_attention)
+    if record.get('version') != 1 or row['last_event_id'] != record['claimed_cursor']:
+        raise RuntimeError('notification cursor ownership changed')
+    return metadata, record
+
+
 def checkpoint_notify_delivery(
     conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
     thread_id: Optional[str] = None, expected_attention: str, outcome: str,
@@ -442,12 +452,7 @@ def checkpoint_notify_delivery(
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
         row = conn.execute('SELECT * FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
-        metadata = json.loads(row['delivery_metadata'] or '{}') if row is not None else {}
-        if metadata.get('notification_attention_v1') != expected_attention:
-            raise RuntimeError('notification attention changed; existing owner preserved')
-        record = json.loads(expected_attention)
-        if record.get('version') != 1 or row['last_event_id'] != record['claimed_cursor']:
-            raise RuntimeError('notification cursor ownership changed')
+        metadata, record = _owned_notify_checkpoint(row, expected_attention)
         if outcome == 'inspect':
             return
         if remove_archived and _remove_settled_archived_sub(conn, key, row):
@@ -501,15 +506,29 @@ def advance_notify_cursor(
 
 def record_notify_ping(
     conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
-    thread_id: Optional[str] = None, event_id: int,
+    thread_id: Optional[str] = None, event_id: int, expected_attention: Optional[str] = None,
 ) -> None:
     """Checkpoint a sent ping independently of the retryable wake cursor."""
     with _kb.write_txn(conn):
+        key = _sub_key(task_id, platform, chat_id, thread_id)
+        row = conn.execute('SELECT * FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
+        if row is None:
+            raise RuntimeError('ping subscription disappeared')
+        if expected_attention is not None:
+            _, record = _owned_notify_checkpoint(row, expected_attention)
+            if event_id not in {event['id'] for event in record['events']}:
+                raise RuntimeError('ping event not owned by notification attempt')
+        checkpoint = max(row['last_ping_event_id'], int(event_id))
         conn.execute(
             "UPDATE kanban_notify_subs SET last_ping_event_id = MAX(last_ping_event_id, ?) "
             + _SUB_KEY_WHERE,
-            (int(event_id), *_sub_key(task_id, platform, chat_id, thread_id)),
+            (int(event_id), *key),
         )
+        saved = conn.execute('SELECT * FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
+        if saved is None or saved['last_ping_event_id'] != checkpoint:
+            raise RuntimeError('notification ping readback unconfirmed')
+        if expected_attention is not None:
+            _owned_notify_checkpoint(saved, expected_attention)
 
 
 def rewind_notify_cursor(

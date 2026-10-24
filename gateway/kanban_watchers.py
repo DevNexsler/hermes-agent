@@ -216,7 +216,11 @@ class GatewayKanbanWatchersMixin:
         enabled, per_tick = _resolve_auto_decompose_settings(load_config)
         if enabled:
             await _to_thread_process_service(dispatcher.auto_decompose_tick, per_tick)
-        results = await _to_thread_process_service(dispatcher.tick_once)
+        try:
+            results = await _to_thread_process_service(dispatcher.tick_once)
+        except Exception:
+            self._ingress_barrier.fail_quiescence()
+            raise
         return results, await _to_thread_process_service(dispatcher.ready_nonempty)
 
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
-from gateway.admission import native_to_thread, refuse_control_ingress, startup_resume_admitted
+from gateway.admission import native_to_thread, refuse_control_ingress, startup_resume_admitted, mark_ingress_effect, refuse_queued_ingress
 import concurrent.futures
 import dataclasses
 import json
@@ -1279,17 +1279,16 @@ class GatewayInboundMixin:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        mark_ingress_effect(self)
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
         # Terminal-decline teardown follows authorization: rejected input must not clear a
         # running turn's refusal. Direct Discord interactions reach this same entry point.
-
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
             return _paused_notice
-
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
@@ -1327,8 +1326,9 @@ class GatewayInboundMixin:
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
+        _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source, event=event)
         if _limit_message is not None:
+            refuse_queued_ingress(self)
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             return _limit_message
 

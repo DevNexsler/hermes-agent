@@ -3642,6 +3642,7 @@ class GatewayTurnMixin:
         )
         pending_event = None
         pending = None
+        await self._preserve_maintenance_goal_fifo(adapter, session_key)
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
@@ -3669,7 +3670,6 @@ class GatewayTurnMixin:
                     pending = _pending_text or _build_media_placeholder(pending_event)
                 if pending:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
-
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         if result and not pending and not pending_event and result.get("pending_steer"):
             pending = result.get("pending_steer")

@@ -776,6 +776,9 @@ def detect_stale_running(
     ).fetchall()
 
     for row in rows:
+        from hermes_cli.kanban_db_spawn import pending_worker_launch
+        if pending_worker_launch(conn, row['id']) is not None:
+            continue
         if row["active_started_at"] is None:
             continue
         elapsed = now - int(row["active_started_at"])
@@ -860,6 +863,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
+        from hermes_cli.kanban_db_spawn import pending_worker_launch
+        if pending_worker_launch(conn, row['id']) is not None:
+            continue
         tid = row["id"]
         pid = row["worker_pid"]
         if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
@@ -1145,6 +1151,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
+            from hermes_cli.kanban_db_spawn import pending_worker_launch
+            if pending_worker_launch(conn, row['id']) is not None:
+                continue
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
@@ -1456,21 +1465,9 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
-    emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
-    decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
-    persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, expected_run_id=None, launch_id=None) -> None:
+    from hermes_cli.kanban_db_spawn import persist_worker_pid
+    persist_worker_pid(conn, task_id, pid, expected_run_id=expected_run_id, launch_id=launch_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1976,16 +1973,13 @@ def dispatch_once(
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+    """Signature fallback never repeats a callback that already started effects."""
     import inspect
     try:
-        sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
+        supports_board = "board" in inspect.signature(spawn_fn).parameters
     except (TypeError, ValueError):
-        return spawn_fn(task, workspace)
+        supports_board = False
+    return spawn_fn(task, workspace, board=board) if supports_board else spawn_fn(task, workspace)
 
 
 def _dispatch_lane_task(
@@ -2008,6 +2002,10 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    from hermes_cli.kanban_db_spawn import pending_worker_launch
+    if pending_worker_launch(conn, task_id) is not None:
+        result.respawn_guarded.append((task_id, 'worker_ownership_unknown'))
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2073,33 +2071,12 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
-        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-        _count_spawn(claimed.assignee)
-        return True
-    except Exception as exc:
-        from tools.process_registry import RestartSafeScopeUnavailable
-
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
-        if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
-        ):
-            result.auto_blocked.append(claimed.id)
+    from hermes_cli.kanban_db_spawn import spawn_claimed_worker
+    if not spawn_claimed_worker(conn, claimed, str(workspace), board, spawn_fn, failure_limit, result):
         return False
+    result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+    _count_spawn(claimed.assignee)
+    return True
 
 
 def _apply_default_assignee(
@@ -2891,7 +2868,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     except FileNotFoundError:
         log_f.close()
-        raise RuntimeError(
+        from hermes_cli.kanban_db_spawn import WorkerNotStarted
+        raise WorkerNotStarted(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )

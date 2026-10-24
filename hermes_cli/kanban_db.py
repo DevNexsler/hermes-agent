@@ -2423,9 +2423,6 @@ def release_stale_claims(
     ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (wedged; ``_touch_activity``
     keeps any genuinely active worker fresh). Safe to call often.
 
-    Reclaiming a live worker mid-flight produces the spawn- then-immediately-reclaim loop seen on slow
-    models that spend longer than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call (#23025):
-    no tool calls means no ``kanban_heartbeat``, even though the subprocess is healthy.
     Backstop (#29747 gap 3): if the worker's PID is still alive but its ``last_heartbeat_at`` is stale by
     more than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has been making no observable
     progress and we reclaim anyway — even if ``_pid_alive`` is still true. This catches the
@@ -2446,6 +2443,9 @@ def release_stale_claims(
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
+        from hermes_cli.kanban_db_spawn import pending_worker_launch
+        if pending_worker_launch(conn, row['id']) is not None:
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no

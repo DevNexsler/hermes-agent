@@ -438,6 +438,11 @@ history; sharing effect history grants no additional permission.
 Preflight refuses pending clarify/update/slash-confirm/tool-approval prompts before Base can acknowledge
 background dispatch; core resolver guards cover direct callers too. Unleased human replies retain
 their existing control behavior.
+Idle leased dispatch also acquires the existing cross-process active-session registry lease before
+Base acknowledgement, pinned to the routed profile home. Exact event/ingress ownership transfers
+that lease to core; competing ingress cannot reacquire its writer. Last owner releases any
+untransferred slot, including cancellation before task start. Unreadable ownership blocks readiness.
+Core/hook entry marks effect history before invocation; later refusal cannot regain positive proof.
 
 An extension may offer version1 refusal receipts only with explicit True and an allowlisted
 reason, synchronously authenticated request version/DD headers, and exact body/DD binding when
@@ -465,6 +470,8 @@ receipts survive. Wake reserves a separate native leg after ping checkpoints. SQ
 or ownership failures block strict readiness. Attention never expires or resolves automatically;
 no general manual resolution/resend command is introduced. Incapable older source can ignore
 these fields, so rollback safety still requires independent closure and retention proof.
+Ping checkpoints verify exact attention/cursor ownership and saved ping cursor in the same writer
+transaction. Ignored/restored updates or concurrent marker changes roll back and retain UNKNOWN.
 
 Owned notifier HTTP wake uses one POST attempt, including lost-response/timeout failures; generic
 errors and HTTP status alone never authorize replay. If an earlier diagnostic/result wake group
@@ -490,9 +497,22 @@ the supported `boards/_archived/` location stay in this read-only inventory afte
 This inventory
 does not fence independent dispatcher processes. Coordinator must verify their exclusion and
 actual machine-shared dispatcher-lock ownership alongside every served home's cron tick lock.
+Existing task events retain a version1 `worker_spawn_pending` intent before physical launch:
+exact task/run/claim, profile owner principal, input/history identity, workspace/database and
+required operator action. Only matching verified `spawned` or proven native pre-Popen
+`spawn_failed` receipt resolves that launch. PID handoff verifies actual task/run readback;
+post-spawn failure retains claim and, when writable, appends `worker_spawn_unknown` with PID.
+Unresolved intents block strict readiness, automatic dispatch and native reclaim across restart.
+Generic callback exceptions remain UNKNOWN; signature inspection never retries an invoked callback.
+Owner principal still needs named-human handoff. No queue/schema/automatic resolution introduced;
+incapable rollback remains separately held.
 
 Queued goal checkpoints bind their owning profile before lookup/pause. Fresh reservation spans
-preflight through core entry; already accepted in-core goal followups return to the existing Base
+capacity acquisition through core entry. Shutdown preserves all checkpointed goal entries
+in existing slot/overflow as durable owned maintenance pauses before destructive dequeue, including
+empty or muted final responses. A later capacity refusal preserves accepted goal checkpoint as
+maintenance handoff rather than dropping or automatically spinning the FIFO.
+Already accepted in-core goal followups return to the existing Base
 FIFO for a separately reserved task. Native boot continuation retains verified same-session boot
 provenance in a fresh event/session reservation; HTTP cannot borrow it. Session facade callbacks
 retain unleased physical futures too. Base carries runner I/O identity independently of ingress

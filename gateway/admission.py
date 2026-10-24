@@ -54,6 +54,7 @@ class GatewayAdmission:
         self._closed = False
         self._ingress = 0
         self._adopted = 0
+        self._capacity = {}
         self._uncertain_work = False
         self.hold = {'known': True, 'active': False, 'hold_id': None, 'owner': None}
 
@@ -105,6 +106,8 @@ class GatewayAdmission:
                 self._adopted -= 1
             else:
                 self._ingress -= 1
+        from gateway.admission_capacity import release_untransferred_capacity
+        release_untransferred_capacity(self, lease)
 
     def snapshot(self):
         with self._lock:
@@ -241,6 +244,9 @@ async def prepare_ingress_dispatch(adapter, event, session_key):
     if runner._is_session_running(session_key) and session_key not in adapter._active_sessions:
         await adapter._handle_message_while_active(event, session_key)
         return True
+    if not busy:
+        from gateway.admission_capacity import reserve_ingress_capacity
+        reserve_ingress_capacity(runner, event, session_key)
     return False
 
 

@@ -362,12 +362,21 @@ class GatewayGoalsMixin:
         guard = adapter._active_sessions.get(session_key)
         try:
             with scope:
+                from gateway.admission_capacity import reserve_ingress_capacity
+                reserve_ingress_capacity(self, event, session_key)
                 started = True
                 await adapter._process_message_background(event, session_key)
         except GatewayDraining:
-            if started or not await self._defer_queued_goal_for_maintenance(event):
+            if not started:
+                if await self._defer_queued_goal_for_maintenance(event):
+                    return
+                # Accepted FIFO cannot disappear on a later capacity refusal. Retain
+                # exact checkpoint as maintenance, never auto-spin/resend or borrow a slot.
                 self._ingress_barrier.fail_quiescence()
-                raise RuntimeError('goal continuation ownership unconfirmed')
+                if await self._defer_queued_goal_for_maintenance(event):
+                    return
+            self._ingress_barrier.fail_quiescence()
+            raise RuntimeError('goal continuation ownership unconfirmed')
         finally:
             if not started and adapter._session_tasks.get(session_key) is asyncio.current_task():
                 adapter._cleanup_finished_session_task(session_key, guard)
@@ -378,6 +387,29 @@ class GatewayGoalsMixin:
             adapter._pending_messages[session_key] = event
         else:
             self._session_state(session_key).conversation.queued_events.append(event)
+
+    async def _preserve_maintenance_goal_fifo(self, adapter, session_key):
+        """Checkpoint accepted continuations before any shutdown queue consumption."""
+        if not adapter or not session_key:
+            return
+        barrier = getattr(self, '_ingress_barrier', None)
+        if not (self._draining or self._external_drain_active or (barrier is not None and barrier._closed)):
+            return
+        pending = adapter._pending_messages
+        entries = [pending.get(session_key), *list(self._overflow_queue(session_key) or ())]
+        for event in entries:
+            if getattr(event, '_goal_admission_checkpoint', None) is None:
+                continue
+            if not await self._defer_queued_goal_for_maintenance(event):
+                if barrier is not None:
+                    barrier.fail_quiescence()
+                raise RuntimeError('accepted goal maintenance checkpoint unconfirmed')
+            # An await may have installed another event. Remove only this exact obligation.
+            if pending.get(session_key) is event:
+                del pending[session_key]
+            overflow = self._overflow_queue(session_key)
+            if overflow is not None:
+                overflow[:] = [queued for queued in overflow if queued is not event]
 
     def _track_goal_drain_checkpoint(self, adapter, event, session_key, task):
         """A queued goal cancelled before its first step still gets a durable maintenance handoff."""

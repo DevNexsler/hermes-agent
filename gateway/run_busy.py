@@ -216,9 +216,13 @@ class GatewayBusySessionMixin:
         return active_session_limit_message(active_count, max_sessions)
 
     def _claim_active_session_slot(
-        self, session_key: str, source: SessionSource
+        self, session_key: str, source: SessionSource, *, event=None,
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
+        from gateway.admission_capacity import take_ingress_capacity
+        reserved = take_ingress_capacity(self, event, session_key)
+        if reserved is not None:
+            return reserved
         if self._is_session_running(session_key):
             return None, None
         limit_message = self._active_session_limit_message(session_key)

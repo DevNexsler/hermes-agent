@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
-from gateway.admission import admit_gateway_message, native_to_thread
+from gateway.admission import admit_gateway_message, native_to_thread, mark_ingress_effect
 
 logger = logging.getLogger(__name__)
 
@@ -3981,11 +3981,11 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        if session_key in self._active_sessions:
+            self._heal_stale_session_lock(session_key)
         from gateway.admission import prepare_ingress_dispatch
         if await prepare_ingress_dispatch(self, event, session_key):
             return
-        if session_key in self._active_sessions:
-            self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
             return
@@ -4440,7 +4440,6 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
-
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
@@ -4455,6 +4454,7 @@ class BasePlatformAdapter(ABC):
             if (getattr(event, '_goal_admission_checkpoint', None) is not None
                     and await self.gateway_runner._defer_queued_goal_for_maintenance(event)):
                 return
+            mark_ingress_effect(self.gateway_runner)
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)

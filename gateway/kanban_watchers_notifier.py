@@ -518,15 +518,19 @@ class _KanbanNotification:
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
-    async def _checkpoint(self, outcome):
+    async def _checkpoint(self, outcome, *, event_id=None):
         """Actual SQLite future remains owned through cancellation; failures block readiness."""
         from gateway.admission import native_in_executor
         from gateway.kanban_watchers_common import _run_in_fresh_context
         def checkpoint():
             try:
-                self.runner._kanban_sub_op(self.board_slug, 'checkpoint_notify_delivery', self.sub,
-                    expected_attention=self.attention, outcome=outcome,
-                    remove_archived=(outcome == 'accepted' and self.task is not None and self.task.status == 'archived'))
+                if outcome == 'ping':
+                    self.runner._kanban_sub_op(self.board_slug, 'record_notify_ping', self.sub,
+                        expected_attention=self.attention, event_id=event_id)
+                else:
+                    self.runner._kanban_sub_op(self.board_slug, 'checkpoint_notify_delivery', self.sub,
+                        expected_attention=self.attention, outcome=outcome,
+                        remove_archived=(outcome == 'accepted' and self.task is not None and self.task.status == 'archived'))
             except Exception:
                 barrier = getattr(self.runner, '_ingress_barrier', None)
                 if barrier is not None:
@@ -742,10 +746,7 @@ class _KanbanNotification:
             try:
                 if await self._send_event(ev, msg) is False:
                     continue
-                await _to_thread_process_service(partial(
-                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
-                    event_id=ev.id,
-                ))
+                await self._checkpoint('ping', event_id=ev.id)
                 self.clear_failures()
             except Exception as exc:
                 await self._retain_unknown(exc)
