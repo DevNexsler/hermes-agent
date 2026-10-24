@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_db_spawn import require_settled_worker_launch
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -3888,6 +3889,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     the ``archived`` event stays atomic with the status flip.
     """
     with write_txn(conn):
+        require_settled_worker_launch(conn, task_id)
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -3931,6 +3933,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
+        require_settled_worker_launch(conn, task_id)
         if _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
@@ -3941,6 +3944,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        require_settled_worker_launch(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -4294,12 +4298,8 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     ``--event-retention-days 0`` to "disabled" before calling this.
     """
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+    from hermes_cli.kanban_db_spawn import gc_settled_events
+    return gc_settled_events(conn, cutoff)
 
 
 def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:
@@ -4313,13 +4313,8 @@ def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[
     if not log_dir.exists():
         return 0
     cutoff = time.time() - older_than_seconds
-    removed = 0
-    for p in log_dir.iterdir():
-        with contextlib.suppress(OSError):
-            if p.is_file() and p.stat().st_mtime < cutoff:
-                p.unlink()
-                removed += 1
-    return removed
+    from hermes_cli.kanban_db_spawn import gc_settled_worker_logs
+    return gc_settled_worker_logs(log_dir, cutoff, board)
 
 
 # --- Worker log accessor ---

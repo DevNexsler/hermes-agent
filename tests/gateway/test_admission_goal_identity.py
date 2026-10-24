@@ -33,7 +33,7 @@ async def test_replaced_goal_never_adopts_old_continuation_but_retains_exact_obl
             await runner._post_turn_goal_continuation(session_entry=session, source=source,
                                                       final_response='EXACT original G1 result')
         else:
-            await runner._handle_goal_command(MessageEvent(text='/goal resume', source=source))
+            await runner._handle_goal_command(MessageEvent(text='/goal resume', source=source, message_id='exact-owned-G1-message'))
     key = runner._session_key_for_source(source)
     event = adapter._pending_messages[key]
     event.message_id = 'exact-owned-G1-message'

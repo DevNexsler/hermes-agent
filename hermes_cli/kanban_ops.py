@@ -311,36 +311,40 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
     scratch_root = kb.workspaces_root()
     removed_ws = 0
-    with kbc.connect_closing() as conn:
+    with kbc.connect_closing() as conn, kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
             "WHERE status = 'archived'"
         ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] == "worktree":
-            # Backstop for worktrees that escaped the completion/archive hook.
-            # Same safety predicate: only clean, fully-pushed worktrees go.
-            wt_path = row["workspace_path"]
-            if wt_path and Path(wt_path).is_dir():
-                kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                if not Path(wt_path).is_dir():
-                    removed_ws += 1
-            continue
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+        from hermes_cli.kanban_db_spawn import unresolved_worker_task_ids
+        protected = unresolved_worker_task_ids(conn)
+        for row in rows:
+            if row['id'] in protected or kbw._has_active_children(conn, row['id']):
+                continue
+            if row["workspace_kind"] == "worktree":
+                # Backstop for worktrees that escaped the completion/archive hook.
+                # Same safety predicate: only clean, fully-pushed worktrees go.
+                wt_path = row["workspace_path"]
+                if wt_path and Path(wt_path).is_dir():
+                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                    if not Path(wt_path).is_dir():
+                        removed_ws += 1
+                continue
+            if row["workspace_kind"] != "scratch":
+                continue
+            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+            try:
+                path = path.resolve()
+            except OSError:
+                continue
+            try:
+                path.relative_to(scratch_root.resolve())
+            except ValueError:
+                # Safety: never delete outside the scratch root.
+                continue
+            if path.exists() and path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+                removed_ws += 1
 
     removed_events = 0
     if event_days:

@@ -12,13 +12,31 @@ class WorkerNotStarted(RuntimeError):
     """Native launcher proves Popen never created a child."""
 
 
-def pending_worker_launch(conn, task_id=None):
-    """Unresolved launch, including malformed payload, never grants reclaim/readiness."""
-    sql = """SELECT e.* FROM task_events e WHERE e.kind='worker_spawn_pending'
+_PENDING_WORKER_LAUNCH_SQL = """SELECT e.* FROM task_events e WHERE e.kind='worker_spawn_pending'
         AND NOT EXISTS (SELECT 1 FROM task_events f WHERE f.task_id=e.task_id
           AND f.run_id IS e.run_id AND f.id>e.id
           AND f.kind IN ('spawned', 'spawn_failed')
           AND json_extract(f.payload, '$.launch_id')=json_extract(e.payload, '$.launch_id'))"""
+
+_PROTECTED_WORKER_TASKS_SQL = """WITH RECURSIVE protected(id) AS (
+    SELECT task_id FROM (""" + _PENDING_WORKER_LAUNCH_SQL + """)
+    UNION SELECT l.parent_id FROM task_links l JOIN protected p ON l.child_id=p.id
+) SELECT id FROM protected"""
+
+
+def unresolved_worker_task_ids(conn):
+    """Retain an unresolved launch and ancestor handoff inputs until checked settlement."""
+    return {row[0] for row in conn.execute(_PROTECTED_WORKER_TASKS_SQL)}
+
+
+def require_settled_worker_launch(conn, task_id):
+    if task_id in unresolved_worker_task_ids(conn):
+        raise RuntimeError('physical worker launch ownership UNKNOWN; retain task and evidence')
+
+
+def pending_worker_launch(conn, task_id=None):
+    """Unresolved launch, including malformed payload, never grants reclaim/readiness."""
+    sql = _PENDING_WORKER_LAUNCH_SQL
     if task_id is not None:
         sql += ' AND e.task_id=?'
     return conn.execute(sql + ' LIMIT 1', () if task_id is None else (task_id,)).fetchone()
@@ -120,3 +138,31 @@ def persist_worker_pid(conn, task_id, pid, *, expected_run_id=None, launch_id=No
         if launch_id is not None:
             payload['launch_id'] = launch_id
         _append_checked_event(conn, task_id, 'spawned', payload, run_id)
+
+
+def gc_settled_events(conn, cutoff):
+    """Keep complete task history while any physical launch remains unresolved."""
+    from hermes_cli import kanban_db as kb
+    with kb.write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' "
+            "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND task_id NOT IN (" + _PROTECTED_WORKER_TASKS_SQL + ')', (cutoff,))
+    return int(cur.rowcount or 0)
+
+
+def gc_settled_worker_logs(log_dir, cutoff, board):
+    """Serialize retention against launch intent commit; uncertain logs stay actionable."""
+    import contextlib
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    removed = 0
+    with kbc.connect_closing(board=board) as conn, kb.write_txn(conn):
+        protected = unresolved_worker_task_ids(conn)
+        for path in log_dir.iterdir():
+            if path.stem in protected:
+                continue
+            with contextlib.suppress(OSError):
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+    return removed

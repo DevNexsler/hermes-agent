@@ -334,25 +334,57 @@ class GatewayGoalsMixin:
                 raise
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
-    async def _defer_queued_goal_for_maintenance(self, event):
+    @staticmethod
+    def _goal_input_snapshot(event):
+        """Freeze the same JSON-safe inputs the private maintenance receipt persists."""
+        import json
+        return json.loads(json.dumps({
+            'message_id': event.message_id, 'channel_prompt': event.channel_prompt,
+            'channel_context': event.channel_context, 'raw_message': event.raw_message}, default=str))
+
+    def _queued_goal_owner(self, event, checkpoint, resolved_session_id):
+        from hermes_cli.goals import GoalManager
+        origin = checkpoint['session_id']
+        key = self._session_key_for_source(event.source)
+        conflict = {'origin_session_id': origin, 'resolved_session_id': resolved_session_id, 'session_key': key}
+        try:
+            current = self.session_store.lookup_by_session_key(key)
+            current_id = current.session_id if current is not None else None
+            conflict.update(current_session_id=current_id, suspended=bool(current is not None and current.suspended))
+            tip = self.session_store._db_for_key(key).get_compression_tip(origin)
+        except Exception as exc:
+            conflict['reason'] = f'conversation lineage unreadable: {type(exc).__name__}'
+            return GoalManager(origin), conflict
+        if (current is None or current.suspended or current_id != tip
+                or (resolved_session_id is not None and current_id != resolved_session_id)):
+            conflict['reason'] = 'originating conversation replaced or suspended before execution'
+            return GoalManager(origin), conflict
+        return GoalManager(current_id), None
+
+    async def _defer_queued_goal_for_maintenance(self, event, *, resolved_session_id=None):
         checkpoint = getattr(event, '_goal_admission_checkpoint', None)
         if checkpoint is None:
             return False
         from gateway.run import _async_profile_runtime_scope
         home = self._resolve_profile_home_for_source(event.source)
         async with _async_profile_runtime_scope(home, offload=self._run_in_executor_with_context):
-            from hermes_cli.goals import GoalManager
-            mgr = await self._run_in_executor_with_context(lambda: GoalManager(checkpoint['session_id']))
+            resolved = resolved_session_id or getattr(event, '_goal_resolved_session_id', None)
+            mgr, conflict = await self._run_in_executor_with_context(
+                lambda: self._queued_goal_owner(event, checkpoint, resolved))
             expected = checkpoint.get('goal_state')
             if not isinstance(expected, str):
                 self._ingress_barrier.fail_quiescence()
                 raise RuntimeError('queued goal originating identity unavailable')
-            if mgr.state is None or mgr.state.to_json() != expected:
+            if conflict or mgr.state is None or mgr.state.to_json() != expected:
+                event._goal_ownership_refused = True
                 self._ingress_barrier.fail_quiescence()
+            elif resolved_session_id is not None:
+                event._goal_resolved_session_id = resolved_session_id
+            inputs = dict(checkpoint.get('input_context') or self._goal_input_snapshot(event))
+            inputs['origin_session_id'] = checkpoint['session_id']
             return await self._defer_goal_for_maintenance(
-                mgr, event.source, event.text, checkpoint['final_response'], expected_goal=expected, input_context={
-                    'message_id': event.message_id, 'channel_prompt': event.channel_prompt,
-                    'channel_context': event.channel_context, 'raw_message': event.raw_message})
+                mgr, event.source, event.text, checkpoint['final_response'], expected_goal=expected,
+                input_context=inputs, ownership_conflict=conflict)
 
     async def _run_goal_fifo_drain(self, adapter, event, session_key):
         """Fresh goal permission spans preflight through core entry; closed work becomes durable pause."""
@@ -434,7 +466,7 @@ class GatewayGoalsMixin:
             cleanup.add_done_callback(verified)
         task.add_done_callback(finished)
 
-    async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None, expected_goal=None):
+    async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None, expected_goal=None, ownership_conflict=None):
         """Retain a not-yet-started continuation as an owned, actionable maintenance checkpoint."""
         barrier = getattr(self, '_ingress_barrier', None)
         closed = (getattr(self, '_draining', False) or getattr(self, '_external_drain_active', False)
@@ -448,7 +480,7 @@ class GatewayGoalsMixin:
                 return mgr.pause_for_maintenance(
                     owner=owner, hold_id=hold.get('hold_id'), continuation_prompt=prompt,
                     final_response=final_response, source=dataclasses.asdict(source), input_context=input_context,
-                    expected_goal=expected_goal)
+                    expected_goal=expected_goal, ownership_conflict=ownership_conflict)
             except Exception:
                 if barrier is not None:
                     barrier.fail_quiescence()
@@ -469,6 +501,8 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
+        if getattr(event, '_goal_ownership_refused', False):
+            return  # No turn ran; post-turn bookkeeping must not reset a suspended route.
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(

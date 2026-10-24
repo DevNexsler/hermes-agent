@@ -402,8 +402,7 @@ class GatewayTurnMixin:
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
         the event."""
-        # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
-        # cross-topic Reply doesn't fragment the conversation.
+        # Recover topic routing before checking native conversation ownership.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
         recovered = (await native_to_thread(self._recover_telegram_topic_thread_id, source)
@@ -452,7 +451,8 @@ class GatewayTurnMixin:
         if await native_to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
-        if not await resolve_heartbeat_owner(self, event, session_entry):
+        if (not await resolve_heartbeat_owner(self, event, session_entry)
+                or await self._defer_queued_goal_for_maintenance(event, resolved_session_id=session_entry.session_id)):
             return
         return source, session_entry, session_key
 

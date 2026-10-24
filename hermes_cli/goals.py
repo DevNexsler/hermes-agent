@@ -1174,7 +1174,7 @@ class GoalManager:
         return self._save()
 
     def pause_for_maintenance(self, *, owner, hold_id, continuation_prompt, final_response, source,
-                              input_context=None, expected_goal=None):
+                              input_context=None, expected_goal=None, ownership_conflict=None):
         """Atomically pause unchanged active state and retain exact continuation inputs for its owner.
 
         Unlike best-effort user commands, maintenance needs verified durable readback before a
@@ -1210,11 +1210,12 @@ class GoalManager:
                 current = GoalState.from_json(row[0]).to_json() if row is not None else None
             except (ValueError, TypeError, AttributeError):
                 current = None
-            if current != expected:
+            if current != expected or ownership_conflict:
                 if expected_goal is None:
                     raise RuntimeError('goal changed before maintenance pause; existing owner preserved')
                 receipt.update(pause_applied=False, outcome='UNKNOWN', paused_goal_sha256=None,
-                    reason='originating goal changed; successor untouched',
+                    reason='originating goal or conversation changed; successor untouched',
+                    ownership_conflict=ownership_conflict,
                     observed_goal=json.loads(current) if current is not None else None,
                     observed_goal_raw=row[0] if row is not None else None,
                     required_action='Assign accountable operator; inspect exact old continuation and replacement goal. Do not resume/refund/resend automatically.')

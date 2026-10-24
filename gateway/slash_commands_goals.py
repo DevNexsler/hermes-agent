@@ -62,16 +62,14 @@ class GatewayGoalCommandsMixin:
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
-            if await self._defer_goal_for_maintenance(mgr, event.source, result.prompt, '', input_context={
-                    'message_id': event.message_id if result.kickoff else None,
-                    'channel_prompt': event.channel_prompt if result.kickoff else None,
-                    'channel_context': event.channel_context, 'raw_message': event.raw_message}):
+            inputs = self._goal_input_snapshot(event)
+            if await self._defer_goal_for_maintenance(mgr, event.source, result.prompt, '', input_context=inputs):
                 return mgr.status_line()
             try:
                 self._enqueue_goal_turn(event, result.prompt, label="command enqueue",
                                         kickoff=result.kickoff, session_id=mgr.session_id, goal_state=mgr.state.to_json())
             except Exception:
-                if await self._defer_goal_for_maintenance(mgr, event.source, result.prompt, ''):
+                if await self._defer_goal_for_maintenance(mgr, event.source, result.prompt, '', input_context=inputs):
                     return mgr.status_line()
                 raise
         return result.output
@@ -102,7 +100,8 @@ class GatewayGoalCommandsMixin:
                     message_id=event.message_id if kickoff else None,
                     channel_prompt=event.channel_prompt if kickoff else None,
                 )
-                turn._goal_admission_checkpoint = {'session_id': session_id, 'goal_state': goal_state, 'final_response': ''}
+                turn._goal_admission_checkpoint = {'session_id': session_id, 'goal_state': goal_state, 'final_response': '',
+                                                   'input_context': self._goal_input_snapshot(event)}
                 from gateway.admission import native_producer_ingress, without_gateway_ingress
                 with native_producer_ingress(self), without_gateway_ingress():
                     self._enqueue_fifo(quick_key, turn, adapter)

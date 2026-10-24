@@ -61,7 +61,9 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
 
 
 def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
-    return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+    from hermes_cli.kanban_db_spawn import unresolved_worker_task_ids
+    return (conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+            or task_id in unresolved_worker_task_ids(conn))
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -134,56 +136,60 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
     try:
-        row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
-        if not row:
-            return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind not in _REMOVABLE_KINDS or not path:
-            # Not removable itself, but completing may still unblock a deferred
-            # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
-            # See #33774.
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        # Defer while any child is not yet terminal so it can still read
-        # handoff artifacts from this workspace.
-        if _has_active_children(conn, task_id):
-            _kb._log.debug(
-                "Deferring %s workspace cleanup for task %s: "
-                "active children still need workspace at %s",
-                kind, task_id, path,
-            )
-            return
-        # Kill the (dead) tmux worker session BEFORE removing a worktree so a
-        # lingering worker never has its cwd deleted from under it.
-        if kind == "worktree":
-            _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard: a board's ``default_workdir`` can pair
-            # ``workspace_kind='scratch'`` with a user path pointing at a real
-            # source tree; without this, completion would rmtree the user's data.
-            # See #28818.
-            if _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _kb._log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
+        with _kb.write_txn(conn):
+            from hermes_cli.kanban_db_spawn import unresolved_worker_task_ids
+            if task_id in unresolved_worker_task_ids(conn):
+                return  # Physical ownership still needs this task's inputs and evidence.
+            row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
+            if not row:
+                return
+            kind: Optional[str] = row["workspace_kind"]
+            path: Optional[str] = row["workspace_path"]
+            if kind not in _REMOVABLE_KINDS or not path:
+                # Not removable itself, but completing may still unblock a deferred
+                # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
+                # See #33774.
+                _try_cleanup_parent_workspaces(conn, task_id)
+                return
+            # Defer while any child is not yet terminal so it can still read
+            # handoff artifacts from this workspace.
+            if _has_active_children(conn, task_id):
+                _kb._log.debug(
+                    "Deferring %s workspace cleanup for task %s: "
+                    "active children still need workspace at %s",
+                    kind, task_id, path,
                 )
-        # Kill the owning worker's tmux session if it is now dead, then let any
-        # parent whose children are all done run its deferred cleanup.
-        _cleanup_worker_tmux(conn, task_id)
-        # After cleaning up this task's workspace, check if any parent tasks now have all children done —
-        # their deferred cleanup can proceed (#33774).
-        _try_cleanup_parent_workspaces(conn, task_id)
+                return
+            # Kill the (dead) tmux worker session BEFORE removing a worktree so a
+            # lingering worker never has its cwd deleted from under it.
+            if kind == "worktree":
+                _cleanup_worker_tmux(conn, task_id)
+                _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+                _try_cleanup_parent_workspaces(conn, task_id)
+                return
+            wp = Path(path)
+            if wp.is_dir():
+                # Containment guard: a board's ``default_workdir`` can pair
+                # ``workspace_kind='scratch'`` with a user path pointing at a real
+                # source tree; without this, completion would rmtree the user's data.
+                # See #28818.
+                if _is_managed_scratch_path(wp):
+                    release_lsp_clients(str(wp))
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _kb._log.debug("Removed scratch workspace: %s", wp)
+                else:
+                    _kb._log.warning(
+                        "Refusing to remove out-of-scratch workspace for task %s: %s "
+                        "(workspace_kind='scratch' but path is outside any "
+                        "kanban-managed workspaces root)",
+                        task_id, wp,
+                    )
+            # Kill the owning worker's tmux session if it is now dead, then let any
+            # parent whose children are all done run its deferred cleanup.
+            _cleanup_worker_tmux(conn, task_id)
+            # After cleaning up this task's workspace, check if any parent tasks now have all children done —
+            # their deferred cleanup can proceed (#33774).
+            _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
         pass  # best-effort — never block completion
 

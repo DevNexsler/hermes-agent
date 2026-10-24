@@ -524,6 +524,22 @@ the successor stays untouched and strict readiness latches unknown. A successful
 explicit operator accounting, never automatic resume/refund/resend. The history remains in the same
 profile's existing database; no additional queue is created.
 
+Queued goals also bind the originating conversation to the resolved/current route before preparation
+and again before actual entry. Only a verified compression tip with the identical migrated goal may
+continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation
+as UNKNOWN with `ownership_conflict` (origin/resolved/current IDs, route, suspension and reason).
+No successor is paused or invoked, and rejected work runs no post-turn bookkeeping that could reset
+a suspended route. Kickoff/resume freeze original command message ID, channel prompt/context and raw
+payload as the same JSON-safe private snapshot for immediate, FIFO, cancellation and capacity handoff.
+These inputs remain preservation metadata; the synthetic execution envelope is unchanged.
+
+Unresolved physical launch evidence also protects the complete task history, worker logs and managed
+workspace, including ancestor handoff inputs. Event/log GC and workspace cleanup check this ownership
+under the existing SQLite writer transaction, serialized with launch intent commit. Archive/delete
+refuse unresolved task/ancestor ownership; completion may settle its result while preserving inputs.
+Verified matching launch settlement restores ordinary cleanup eligibility. No absence-of-PID or
+elapsed-time inference clears the launch, and no new settlement/resend interface is added.
+
 Supported pre-dispatch text rewrites clone the event while retaining private native checkpoints.
 Only the current live reservation's exact event may transfer its reserved capacity/startup ownership
 to that clone; matching session keys or inherited context alone grant no permission. Original
