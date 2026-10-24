@@ -52,6 +52,22 @@ def _has_attachment_files(conn, directory):
                for row in conn.execute('SELECT stored_path FROM task_attachments'))
 
 
+def _has_retained_workspace(conn, directory):
+    """Shared native workspace ownership protects both enclosing and nested inputs."""
+    from hermes_cli.kanban_db_spawn import retained_task_ids
+    root = Path(directory).expanduser().resolve()
+    protected = retained_task_ids(conn)
+    for task_id, path in conn.execute('SELECT id, workspace_path FROM tasks'):
+        if task_id not in protected:
+            continue
+        if not path:
+            return True  # An unbound retained workspace cannot authorize removal.
+        owner = Path(path).expanduser().resolve()
+        if owner.is_relative_to(root) or root.is_relative_to(owner):
+            return True
+    return False
+
+
 def delete_attachment(conn, attachment_id):
     """Retained worker/notification inputs and ancestor handoffs stay attached."""
     from hermes_cli.kanban_db_spawn import require_settled_task_ownership
@@ -185,7 +201,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 return
             kind: Optional[str] = row["workspace_kind"]
             path: Optional[str] = row["workspace_path"]
-            if path and _has_attachment_files(conn, path):
+            if path and (_has_attachment_files(conn, path) or _has_retained_workspace(conn, path)):
                 return
             if kind not in _REMOVABLE_KINDS or not path:
                 # Not removable itself, but completing may still unblock a deferred
@@ -317,28 +333,30 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     See #33774.
     """
     try:
-        parents = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ?",
-            (task_id,),
-        ).fetchall()
-        for (parent_id,) in parents:
-            row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
-            if (
-                not row
-                or row["workspace_kind"] not in _REMOVABLE_KINDS
-                or not row["workspace_path"]
-                or _has_active_children(conn, parent_id)
-                or _has_attachment_files(conn, row["workspace_path"])
-            ):
-                continue
-            if row["workspace_kind"] == "worktree":
-                _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
-                continue
-            wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+        with _kb.write_txn(conn, allow_nested=True):
+            conn.execute('UPDATE tasks SET id=id WHERE 0')
+            parents = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,),
+            ).fetchall()
+            for (parent_id,) in parents:
+                row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
+                if (
+                    not row
+                    or row["workspace_kind"] not in _REMOVABLE_KINDS
+                    or not row["workspace_path"]
+                    or _has_active_children(conn, parent_id)
+                    or _has_attachment_files(conn, row["workspace_path"])
+                    or _has_retained_workspace(conn, row["workspace_path"])
+                ):
+                    continue
+                if row["workspace_kind"] == "worktree":
+                    _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
+                    continue
+                wp = Path(row["workspace_path"])
+                if wp.is_dir() and _is_managed_scratch_path(wp):
+                    release_lsp_clients(str(wp))
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 

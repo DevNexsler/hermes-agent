@@ -5,9 +5,6 @@ claims and physical workers then remain visible independently of that tick's lea
 Independent dispatcher processes still require coordinator exclusion/lock ownership.
 """
 
-import sqlite3
-
-
 def _retained_board_paths(kb):
     """Inventory supported live and archived board locations; unreadability raises."""
     from hermes_cli.kanban_db_removal import require_no_board_removals
@@ -33,6 +30,7 @@ def _retained_board_paths(kb):
 def kanban_worker_work_count():
     """Unknown/unreadable stores raise; no migration, reconciliation or signals."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli.sqlite_safe_read import connect_tracked
 
     root = kb.boards_root()
     try:
@@ -49,7 +47,7 @@ def kanban_worker_work_count():
             path.stat()
         except FileNotFoundError:
             continue
-        conn = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=1.0)
+        conn = connect_tracked(path.as_uri() + '?mode=ro', uri=True, timeout=1.0)
         try:
             conn.execute('BEGIN')
             from hermes_cli.kanban_db_spawn import worker_ownership_count

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.secret_scope import set_multiplex_active
+from gateway.admission import initialize_gateway_admission
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
@@ -98,6 +99,7 @@ def test_notifier_pings_run_under_the_subscribers_profile(served, monkeypatch):
         conn.close()
 
     runner = GatewayRunner.__new__(GatewayRunner)
+    initialize_gateway_admission(runner, home=served.root)
     runner._running = True
     runner.config = SimpleNamespace(multiplex_profiles=True, profile_routes=[])
     alpha_adapter = RecordingAdapter()

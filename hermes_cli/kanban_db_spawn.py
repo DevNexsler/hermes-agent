@@ -205,6 +205,19 @@ def gc_settled_worker_logs(log_dir, cutoff, board):
     return removed
 
 
+def rotate_settled_worker_log(conn, task_id, board):
+    """Rotate before this claim exists, serialized against every retained owner."""
+    from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
+    database = kb._board_path(None, board, ('kanban.db',), 'kanban.db').resolve()
+    actual = Path(conn.execute('PRAGMA database_list').fetchone()[2]).resolve()
+    if actual != database or kb.kanban_db_path(board).resolve() != database:
+        return  # An injected worker DB cannot authorize canonical log deletion.
+    with kb.write_txn(conn):
+        if task_id not in retained_task_ids(conn):
+            rotate_bytes, backups = dispatch.worker_log_rotation_config()
+            dispatch._rotate_worker_log(kb.worker_log_path(task_id, board=board), rotate_bytes, backups)
+
+
 def worker_ownership_count(conn):
     """Shared strict inventory; unreadable/unknown launch ownership raises."""
     require_writable_board(conn)

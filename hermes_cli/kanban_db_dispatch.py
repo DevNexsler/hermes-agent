@@ -2053,6 +2053,9 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
+    if spawn_fn is None:
+        from hermes_cli.kanban_db_spawn import rotate_settled_worker_log
+        rotate_settled_worker_log(conn, task_id, board)
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
@@ -2695,15 +2698,13 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
-    """Append-mode per-task log (a re-run on unblock appends, never overwrites),
-    rotated first. Anchored at the board root (not the shared kanban root) so
+    """Append-mode per-task log; guarded rotation precedes native claim.
+    Anchored at the board root (not the shared kanban root) so
     `hermes kanban log` reads its own file and boards sharing task ids don't
     collide."""
     log_dir = _kb.worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
-    rotate_bytes, backup_count = worker_log_rotation_config()
-    _rotate_worker_log(log_path, rotate_bytes, backup_count)
     return open(log_path, "ab")
 
 

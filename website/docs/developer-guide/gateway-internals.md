@@ -580,6 +580,13 @@ Attachment reference checks and unlink share the writer transaction, including l
 a registration queued behind deletion refuses a missing blob before recording metadata or history.
 Failed-upload, size-rejection and staged-copy cleanup use the same serialized reference check;
 unreadable ownership retains the file and original failure. Referenced workspace inputs defer removal.
+Shared retained workspace realpaths also defer enclosing, nested and alias cleanup, even without
+attachment rows; direct, parent and CLI cleanup hold the writer boundary through removal.
+Native log rotation runs before claim under that same board's writer boundary. Prior physical,
+launch, notification or ancestor ownership preserves every generation, including zero-backup
+configuration. An injected database cannot authorize canonical log rotation; append-only spawn
+remains available. Read-only strict inventory uses tracked connections so concurrent header probes
+cannot discard SQLite snapshot locks.
 Legacy scalar process witnesses must be finite and positive; malformed witnesses retain ownership.
 Bounded media-history delivery may time out, but its deferred physical read remains registered until
 the actual daemon thread exits, including cancellation and post-read thread teardown.
