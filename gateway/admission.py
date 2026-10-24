@@ -383,11 +383,25 @@ async def native_session_offload(runner, function, /, *args, **kwargs):
 
 async def native_in_executor(runner, executor, function, /, *args):
     """Preserve the native pool choice and profile context across admission-aware offloads."""
-    if ingress_admitted(runner):
-        return await _ingress_in_executor(executor, function, *args)
-    future = asyncio.get_running_loop().run_in_executor(executor, copy_context().run, function, *args)
-    runner._track_deferred_agent_worker(future, None)
-    return await asyncio.shield(future)
+    token = _native_runner.set(runner)
+    try:
+        if ingress_admitted(runner):
+            return await _ingress_in_executor(executor, function, *args)
+        future = asyncio.get_running_loop().run_in_executor(executor, copy_context().run, function, *args)
+        runner._track_deferred_agent_worker(future, None)
+        return await asyncio.shield(future)
+    finally:
+        _native_runner.reset(token)
+
+
+def mark_native_work_uncertain():
+    """Fail the owning native context closed. Identity grants no admission or reopening authority."""
+    runner = _native_runner.get()
+    lease = _ingress.get()
+    if runner is None and lease is not None:
+        runner = lease.barrier.runner
+    if runner is not None:
+        _barrier(runner).fail_quiescence()
 
 
 async def _ingress_in_executor(executor, function, /, *args, **kwargs):
@@ -454,8 +468,8 @@ def gateway_admission_status(runner):
             raise GatewayDraining('deferred worker registry unreadable')
         work = (runner._running_agent_count() + runner._running_cron_job_count()
                 + api_count + api_worker_live_count() + kanban_worker_work_count()
-                + sum(not future.done() for future in list(deferred))
-                + sum(not task.done() for task in getattr(runner, '_deferred_agent_cleanup_tasks', ()))
+                + len(deferred)
+                + len(getattr(runner, '_deferred_agent_cleanup_tasks', ()))
                 + bool(getattr(runner, '_startup_restore_in_progress', False)))
         # A base task can be waiting on routing/auth before the runner has claimed a session.
         adapters = list(runner.adapters.values())

@@ -132,6 +132,20 @@ def store_has_active_heartbeat(db: Any) -> bool:
     return False
 
 
+def _confirmed_heartbeat_state(raw: str) -> HeartbeatState:
+    from hermes_cli.session_state_io import parse_confirmed_json, values_preserved
+    data = parse_confirmed_json(raw)
+    if not isinstance(data, dict) or data.keys() - HeartbeatState.__dataclass_fields__.keys():
+        raise ValueError('heartbeat checkpoint structure unconfirmed')
+    state = HeartbeatState.from_json(raw)
+    json.dumps(asdict(state), allow_nan=False)
+    if (not values_preserved(data, asdict(state))
+            or state.status not in ('active', 'paused', 'cleared')
+            or (state.status in ('active', 'paused') and not state.prompt.strip())):
+        raise ValueError('heartbeat checkpoint normalization would change stored inputs')
+    return state
+
+
 def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
     if not session_id:
         return
@@ -153,9 +167,16 @@ class HeartbeatManager:
     idle; a non-None return is the user-role message to inject.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, *, strict: bool = False):
         self.session_id = session_id
-        self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
+        self._strict = strict
+        if strict:
+            from hermes_cli.session_state_io import load_confirmed_state
+            self._state_db = _get_session_db()
+            self._state, self._expected_raw = load_confirmed_state(
+                self._state_db, _META_PREFIX + session_id, _confirmed_heartbeat_state)
+        else:
+            self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
         self._last_claim: Optional[tuple[float, int]] = None  # (last_fired_at, fire_count) before the last due_prompt
 
     @property
@@ -180,6 +201,15 @@ class HeartbeatManager:
         icon = "⏸ " if s.status == "paused" else ""
         return f"{icon}Heartbeat ({s.status}, every {every}{fired}): {s.prompt}"
 
+    def _save(self):
+        if self._strict:
+            from hermes_cli.session_state_io import save_confirmed_state
+            raw = self._state.to_json()
+            save_confirmed_state(self._state_db, _META_PREFIX + self.session_id, self._expected_raw, raw)
+            self._expected_raw = raw
+        else:
+            save_heartbeat(self.session_id, self._state)
+
     def set(self, prompt: str, interval_seconds: int) -> HeartbeatState:
         prompt = (prompt or "").strip()
         if not prompt:
@@ -189,7 +219,7 @@ class HeartbeatManager:
             raise ValueError(f"interval must be at least {MIN_INTERVAL_SECONDS}s")
         self._state = HeartbeatState(prompt=prompt, interval_seconds=interval_seconds, status="active",
                                      created_at=time.time())
-        save_heartbeat(self.session_id, self._state)
+        self._save()
         return self._state
 
     def _set_status(self, status: str, *, reanchor: bool = False) -> Optional[HeartbeatState]:
@@ -198,7 +228,7 @@ class HeartbeatManager:
         self._state.status = status
         if reanchor:
             self._state.last_fired_at = time.time()
-        save_heartbeat(self.session_id, self._state)
+        self._save()
         return self._state
 
     def pause(self) -> Optional[HeartbeatState]:
@@ -226,7 +256,7 @@ class HeartbeatManager:
         self._last_claim = (s.last_fired_at, s.fire_count)
         s.last_fired_at = now if now is not None else time.time()
         s.fire_count += 1
-        save_heartbeat(self.session_id, s)
+        self._save()
         return s.render_prompt()
 
     def abandon_fire(self) -> bool:
@@ -236,34 +266,29 @@ class HeartbeatManager:
         claim, s = self._last_claim, self._state
         if claim is None or s is None:
             return False
-        current = load_heartbeat(self.session_id)
+        if self._strict:
+            from hermes_cli.session_state_io import load_confirmed_state
+            current, current_raw = load_confirmed_state(
+                self._state_db, _META_PREFIX + self.session_id, _confirmed_heartbeat_state)
+            if current_raw != self._expected_raw:
+                return False  # A separately committed user control owns the row.
+        else:
+            current = load_heartbeat(self.session_id)
         if current is None or current.status != "active" or (current.last_fired_at, current.fire_count) != (
                 s.last_fired_at, s.fire_count):
             return False
         s.last_fired_at, s.fire_count = claim
         self._last_claim = None
-        save_heartbeat(self.session_id, s)
+        self._save()
         return True
 
 
-def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:
-    """Carry a heartbeat across a compression session rotation (copy to child, archive parent, never raise).
-
-    Same shape as ``goals.migrate_goal_to_session``.
-    """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
-        return False
-    try:
-        state = load_heartbeat(old_session_id)
-        if state is None or load_heartbeat(new_session_id) is not None:
-            return False
-        save_heartbeat(new_session_id, state)
-        state.status = "cleared"
-        save_heartbeat(old_session_id, state)
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("HeartbeatManager: migration failed: %s", exc)
-        return False
+def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str, *,
+                                  db=None, strict: bool = False) -> bool:
+    """Transfer exact validated heartbeat state in one checked writer transaction."""
+    from hermes_cli.session_state_io import migrate_confirmed_state
+    return migrate_confirmed_state('heartbeat:', old_session_id, new_session_id, _confirmed_heartbeat_state,
+                                    db=db, strict=strict)
 
 
 __all__ = [

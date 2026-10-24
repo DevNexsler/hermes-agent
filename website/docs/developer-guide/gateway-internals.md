@@ -551,6 +551,24 @@ The gateway also adopts the whole post-turn task before its earlier routing look
 SQLite routing persistence and its JSON fallback latches UNKNOWN before that task settles; cancellation
 cannot abandon later goal/loop accounting. A surviving authoritative routing path keeps normal behavior.
 
+Automatic loop completion, tick claims and heartbeat claims/refunds also use confirmed metadata
+reads and exact-row compare-and-swap with writer-transaction readback. Failed reads, malformed
+state, rejected writes or unconfirmed readback close readiness as UNKNOWN; cached changes never
+attest persisted completion. A concurrent user pause or replacement keeps ownership. Heartbeat
+refund runs off-loop; its task and physical executor remain tracked. A refund cancelled before
+its first step closes UNKNOWN before registry removal. Strict readiness includes registered
+completed futures until their accounting callbacks finish. Interactive managers retain their
+existing best-effort defaults.
+
+Rotating compression passes its actual session database to validated goal, loop and heartbeat
+transfer. Each transfer copies the exact original JSON to the child and marks the parent cleared
+in one checked SQLite writer transaction. Unknown fields, duplicate keys, lossy normalization,
+foreign child state or storage/readback failure cannot silently discard the parent's checkpoint.
+The existing native execution context closes UNKNOWN before ownership settles, even when
+compression catches the transfer error. The child session may already exist; this does not
+attest rollback of the whole compression. Raw state and ancestor history remain inspectable.
+This uncertainty latch is process-local and supplies no restart or OLD-source bootstrap proof.
+
 Queued goals also bind the originating conversation to the resolved/current route before preparation
 and again before actual entry. Only a verified compression tip with the identical migrated goal may
 continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation

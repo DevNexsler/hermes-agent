@@ -13,6 +13,16 @@ from hermes_cli.heartbeat import HeartbeatManager, HeartbeatState, save_heartbea
 from evals.heartbeat_idle_wire import WireAdapter
 
 
+async def settle_storage(runner):
+    for _ in range(200):
+        workers = list(getattr(runner, '_deferred_agent_workers', {}))
+        if not workers:
+            return
+        await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.sleep(0)
+    raise AssertionError('heartbeat persistence did not settle')
+
+
 @pytest.mark.asyncio
 async def test_cancelled_admission_is_refunded_but_started_execution_is_not():
     runner = object.__new__(GatewayRunner)
@@ -61,7 +71,7 @@ async def test_cancelled_admission_is_refunded_but_started_execution_is_not():
             await asyncio.wait_for(started.wait(), 2)
         await adapter.cancel_session_processing(key)
         await asyncio.gather(task, return_exceptions=True)
-        await asyncio.sleep(0)  # task callbacks settle the exact attempt
+        await settle_storage(runner)
         assert HeartbeatManager('cancel-test').state.fire_count == int(not cancel_before_start)
 
 
@@ -88,7 +98,7 @@ async def test_runner_rejection_does_not_consume_tick_or_overwrite_replacement()
     save_heartbeat('rejected-test', HeartbeatState(prompt='check', interval_seconds=60, created_at=1))
     await runner._heartbeat_poll_once(watch)
     await asyncio.gather(*adapter._background_tasks)
-    await asyncio.sleep(0)
+    await settle_storage(runner)
     assert HeartbeatManager('rejected-test').state.fire_count == 0
 
     async def replaced(event):
@@ -98,6 +108,6 @@ async def test_runner_rejection_does_not_consume_tick_or_overwrite_replacement()
     adapter.set_message_handler(replaced)
     await runner._heartbeat_poll_once(watch)
     await asyncio.gather(*adapter._background_tasks)
-    await asyncio.sleep(0)
+    await settle_storage(runner)
     state = HeartbeatManager('rejected-test').state
     assert state.prompt == 'replacement' and state.fire_count == 0

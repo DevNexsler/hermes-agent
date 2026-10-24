@@ -636,37 +636,16 @@ def _validate_goal_nested_state(data: dict) -> None:
             raise ValueError('goal optional text identity unconfirmed')
 
 
-def _goal_values_preserved(original, decoded) -> bool:
-    """Legacy fields may default; present values survive, including equivalent JSON numbers."""
-    if isinstance(original, dict):
-        return (isinstance(decoded, dict) and not (original.keys() - decoded.keys())
-                and all(_goal_values_preserved(v, decoded[k]) for k, v in original.items()))
-    if isinstance(original, list):
-        return (isinstance(decoded, list) and len(original) == len(decoded)
-                and all(_goal_values_preserved(a, b) for a, b in zip(original, decoded)))
-    if type(original) in (int, float) and type(decoded) in (int, float):
-        return original == decoded
-    return type(original) is type(decoded) and original == decoded
-
-
-def _goal_json_object(pairs) -> dict:
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError('duplicate goal checkpoint field')
-        result[key] = value
-    return result
-
-
 def _confirmed_goal_state(raw: str) -> GoalState:
     """Decode an automatic ownership witness without discarding unknown state."""
-    data = json.loads(raw, object_pairs_hook=_goal_json_object)
+    from hermes_cli.session_state_io import parse_confirmed_json, values_preserved
+    data = parse_confirmed_json(raw)
     if not isinstance(data, dict) or data.keys() - GoalState.__dataclass_fields__.keys():
         raise ValueError('goal checkpoint contains unknown fields or structure')
     _validate_goal_nested_state(data)
     state = GoalState.from_json(raw)
     json.dumps(asdict(state), allow_nan=False)
-    if not _goal_values_preserved(data, asdict(state)):
+    if not values_preserved(data, asdict(state)):
         raise ValueError('goal checkpoint normalization would discard or change stored inputs')
     if (state.status not in ('active', 'paused', 'done', 'cleared') or not isinstance(state.goal, str)
             or (state.status in ('active', 'paused') and not state.goal.strip())):
@@ -730,33 +709,12 @@ def clear_goal(session_id: str) -> None:
     save_goal(session_id, state)
 
 
-def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /goal from a parent session to its continuation. Best-effort, never raises
-    (a failure here must not block compression). Returns True when a goal was migrated.
-
-    Context compression rotates ``session_id`` to a fresh child session, but ``load_goal`` does a flat
-    ``goal:<session_id>`` lookup with no parent-lineage walk — so an active goal silently dies at the
-    compaction boundary (#33618). Copy the goal onto the new session and archive the old row as ``cleared``
-    so exactly one active goal row exists per logical conversation (avoids the "two active goals" hazard of
-    a pure copy).
-    """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
-        return False
-    try:
-        state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
-            return False
-        # Don't clobber a goal already set on the child (e.g. a resumed lineage).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug("GoalManager: migrated goal %s -> %s (%s)", old_session_id, new_session_id, reason or "rotation")
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("GoalManager: goal migration failed: %s", exc)
-        return False
+def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "",
+                            db=None, strict: bool = False) -> bool:
+    """Transfer validated state atomically; automatic compression requires confirmed failure closure."""
+    from hermes_cli.session_state_io import migrate_confirmed_state
+    return migrate_confirmed_state('goal:', old_session_id, new_session_id, _confirmed_goal_state,
+                                    db=db, strict=strict)
 
 
 # ── Judge ─────────────────────────────────────────────────────────────

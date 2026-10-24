@@ -152,12 +152,16 @@ class GatewayGoalsMixin:
             return  # keep missed intervals due until user work has drained
         from hermes_cli.heartbeat import HeartbeatManager
 
-        mgr = HeartbeatManager(session_id=session_id)
+        mgr = await self._run_in_executor_with_context(lambda: HeartbeatManager(session_id=session_id, strict=True))
         if not mgr.has_heartbeat():
             watch.pop(quick_key, None)
             return
-        prompt = mgr.due_prompt()
+        prompt = await self._run_in_executor_with_context(mgr.due_prompt)
         if not prompt:
+            return
+        if (self._is_session_running(quick_key) or quick_key in adapter._active_sessions
+                or self._queue_depth(quick_key, adapter=adapter) > 0):
+            await self._run_in_executor_with_context(mgr.abandon_fire)
             return
         event = self._synthetic_prompt_event(source, prompt)
         event.metadata["gateway_session_key"] = quick_key
@@ -165,17 +169,16 @@ class GatewayGoalsMixin:
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
         # non-internal so authorization and the emergency stop still apply.
         event._heartbeat_session_id = session_id
-        # A pinned route skips topic recovery: no await between the idle
-        # check and adapter claim. FIFO alone never wakes an idle session.
+        # Recheck above after the off-thread durable claim; a human keeps the idle boundary.
         try:
             await adapter.handle_message(event)
         finally:
             task = getattr(adapter, "_session_tasks", {}).get(quick_key)
             if task is not None:
                 from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
-                task.add_done_callback(lambda done: settle_heartbeat_attempt(event, mgr))
+                task.add_done_callback(lambda done: settle_heartbeat_attempt(self, event, mgr))
             elif quick_key not in adapter._active_sessions:
-                mgr.abandon_fire()
+                await self._run_in_executor_with_context(mgr.abandon_fire)
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
@@ -268,7 +271,7 @@ class GatewayGoalsMixin:
         if not sid:
             return None
         await self._warm_goals_session_db(label)
-        return factory(sid)
+        return await self._run_in_executor_with_context(factory, sid)
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
@@ -538,13 +541,13 @@ class GatewayGoalsMixin:
             with without_gateway_ingress():
                 cleanup = asyncio.create_task(self._defer_queued_goal_for_maintenance(event))
             tasks = self.__dict__.setdefault('_deferred_agent_cleanup_tasks', set())
-            self._track_task_in(tasks, cleanup)
             def verified(result):
                 if adapter._session_tasks.get(session_key) is done:
                     adapter._cleanup_finished_session_task(session_key, guard)
                 if result.cancelled() or result.exception() is not None:
                     barrier.fail_quiescence()
             cleanup.add_done_callback(verified)
+            self._track_task_in(tasks, cleanup)
         task.add_done_callback(finished)
 
     async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None, expected_goal=None, ownership_conflict=None):
@@ -638,10 +641,18 @@ class GatewayGoalsMixin:
         / --until judge / caps and schedules the next tick for the idle wakeup watcher."""
         def _load():
             from hermes_cli.loops import LoopManager
-            return lambda sid: LoopManager(session_id=sid)
+            return lambda sid: LoopManager(session_id=sid, strict=True)
 
-        mgr = await self._post_turn_manager(session_entry, "loop completion", "loops", _load)
-        state = mgr.state if mgr is not None else None
+        try:
+            mgr = await self._post_turn_manager(session_entry, "loop completion", "loops", _load)
+            if mgr is None:
+                raise RuntimeError('automatic loop lookup unavailable')
+        except Exception:
+            self._ingress_barrier.fail_quiescence()
+            logger.error('Loop lookup unconfirmed for session %s; inspect retained loop/history before release',
+                         getattr(session_entry, 'session_id', None), exc_info=True)
+            raise
+        state = mgr.state
         if state is None or not state.awaiting_response:
             return
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
@@ -697,10 +708,10 @@ class GatewayGoalsMixin:
             session_key = self._session_key_for_source(source)
         if session_key and session_key in self._running_agents:
             return  # busy — stays due, next scan retries
-        if goal_blocks_loop_tick(sid):
+        if await self._run_in_executor_with_context(lambda: goal_blocks_loop_tick(sid, strict=True)):
             return
 
-        mgr = LoopManager(session_id=sid)
+        mgr = await self._run_in_executor_with_context(lambda: LoopManager(session_id=sid, strict=True))
         if not mgr.is_due(now):
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
@@ -760,7 +771,7 @@ class GatewayGoalsMixin:
             # run the state.db init on the loop thread before the first read.
             await self._warm_goals_session_db("loop wakeup")
             # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
-            active_loops = await self._run_in_executor_with_context(list_active_loops)
+            active_loops = await self._run_in_executor_with_context(lambda: list_active_loops(strict=True))
             now = time.time()
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
