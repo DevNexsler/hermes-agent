@@ -578,6 +578,11 @@ Both persisted and current composed worker fingerprints require complete boot-ID
 partial epochs remain unknown. Log GC pins the effective board before selecting logs and database.
 Attachment reference checks and unlink share the writer transaction, including legacy path aliases;
 a registration queued behind deletion refuses a missing blob before recording metadata or history.
+Failed-upload, size-rejection and staged-copy cleanup use the same serialized reference check;
+unreadable ownership retains the file and original failure. Referenced workspace inputs defer removal.
+Legacy scalar process witnesses must be finite and positive; malformed witnesses retain ownership.
+Bounded media-history delivery may time out, but its deferred physical read remains registered until
+the actual daemon thread exits, including cancellation and post-read thread teardown.
 Any notification attention (including malformed/foreign)
 also keeps strict readiness UNKNOWN across restart. Normal completion/archive semantics remain;
 ordinary settled deletion/GC becomes eligible after physical ownership and attention both settle.

@@ -460,12 +460,12 @@ async def upload_task_attachment(
         dest_path = _collision_free_path(dest_dir, safe_name)  # foo.pdf → foo (1).pdf …
         total = 0  # stream in chunks with a hard size cap so one upload can't fill the disk
         try:
-            with open(dest_path, "wb") as out:
+            with open(dest_path, "xb") as out:
                 while chunk := await file.read(1024 * 1024):
                     total += len(chunk)
                     if total > KANBAN_ATTACHMENT_MAX_BYTES:
                         out.close()
-                        dest_path.unlink(missing_ok=True)
+                        kbw.cleanup_failed_attachment_blob(conn, dest_path)
                         raise HTTPException(
                             status_code=413, detail=f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit")
                     out.write(chunk)

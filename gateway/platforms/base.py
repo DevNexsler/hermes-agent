@@ -2607,50 +2607,8 @@ class BasePlatformAdapter(ABC):
         return _collect_history_media_paths(history)
 
     async def _bounded_history_media_paths_for_session(self, session_key: str) -> Optional[set]:
-        """Run best-effort history lookup in a bounded isolated daemon thread."""
-        def _fail_open(reason: str, *, exc_info: bool = False) -> None:
-            logger.warning(
-                "[%s] " + reason + " %s; delivering bare local file path(s) without history dedup",
-                self.name, session_key, exc_info=exc_info)
-        admission = _HISTORY_MEDIA_LOOKUP_ADMISSION
-        if not admission.acquire(blocking=False):
-            _fail_open("Media-delivery history lookup capacity exhausted for")
-            return None
-        loop = asyncio.get_running_loop()
-        result_future = loop.create_future()
-
-        def _publish_result(result=None, error=None):
-            if not result_future.done():
-                (result_future.set_exception(error) if error is not None
-                 else result_future.set_result(result))
-
-        def _worker():
-            result, error = None, None
-            try:
-                result = self._history_media_paths_for_session(session_key)
-            except BaseException as exc:
-                error = exc
-            try:
-                with contextlib.suppress(RuntimeError):  # loop already closed (gateway shutdown)
-                    loop.call_soon_threadsafe(_publish_result, result, error)
-            finally:
-                admission.release()
-        try:
-            threading.Thread(target=_worker, name="media-history-lookup", daemon=True).start()
-        except Exception:
-            # start() failed (thread exhaustion): the worker never ran, so release the permit here.
-            admission.release()
-            _fail_open("Could not start media-delivery history lookup worker for", exc_info=True)
-            return None
-        try:
-            return await asyncio.wait_for(result_future, timeout=_HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            _fail_open("Timed out loading media-delivery history for")
-            return None
-        except Exception:
-            # Best-effort/fail-open: never let a lookup failure kill media delivery.
-            _fail_open("Media-delivery history lookup failed for", exc_info=True)
-            return None
+        from gateway.platforms.base_history import bounded_history_media_paths
+        return await bounded_history_media_paths(self, session_key)
 
     @abstractmethod
     async def connect(self, *, is_reconnect: bool = False) -> bool:

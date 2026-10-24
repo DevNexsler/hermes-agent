@@ -264,6 +264,7 @@ body and hoping it finds them.
   row still references it (a file shared by several tasks stays until its
   last reference is removed). Registration and removal serialize through the
   board database; registering a missing blob refuses without recording a reference.
+  Failed-upload cleanup also preserves shared files; unreadable ownership leaves the file for review.
   From the CLI, `hermes kanban attach-rm
   ATTACHMENT_ID` removes an attachment the same way.
 

@@ -90,6 +90,7 @@ def test_unreadable_identity_keeps_live_worker_evidence(home, child, monkeypatch
             assert kb.get_task(reopened, tid) is not None
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize('operation', ['terminal', 'runtime'])
 def test_identity_lost_after_term_never_escalates_or_discards_owner(home, child, monkeypatch, operation):
     import gateway.status as status

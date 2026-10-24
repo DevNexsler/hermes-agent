@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import re
 import signal
@@ -423,8 +424,11 @@ def _pid_recycled(pid: Optional[int], started_at) -> Optional[bool]:
     if current is None:
         return None
     try:
-        return not _start_times_agree(current, started_at)
-    except (TypeError, ValueError):
+        current, recorded = float(current), float(started_at)
+        if not (math.isfinite(current) and math.isfinite(recorded) and current > 0 and recorded > 0):
+            return None
+        return not _start_times_agree(current, recorded)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

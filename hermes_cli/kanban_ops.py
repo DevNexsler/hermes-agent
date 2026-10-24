@@ -321,6 +321,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         for row in rows:
             if row['id'] in protected or kbw._has_active_children(conn, row['id']):
                 continue
+            if kbw._has_attachment_files(conn, row['workspace_path'] or (scratch_root / row['id'])):
+                continue
             if row["workspace_kind"] == "worktree":
                 # Backstop for worktrees that escaped the completion/archive hook.
                 # Same safety predicate: only clean, fully-pushed worktrees go.

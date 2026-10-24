@@ -26,6 +26,32 @@ if TYPE_CHECKING:
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
 
+def _unlink_unreferenced_attachment_blob(conn, path):
+    path = Path(path)
+    realpath = path.resolve()
+    if any(Path(row[0]).resolve() == realpath for row in conn.execute('SELECT stored_path FROM task_attachments')):
+        return
+    with contextlib.suppress(OSError):
+        if path.is_file():
+            path.unlink()
+
+
+def cleanup_failed_attachment_blob(conn, path):
+    """The original error remains authoritative; unknown ownership retains the failed copy."""
+    try:
+        with _kb.write_txn(conn, allow_nested=True):
+            conn.execute('UPDATE task_attachments SET id=id WHERE 0')  # Also reserve nested read transactions.
+            _unlink_unreferenced_attachment_blob(conn, path)
+    except Exception:
+        _kb._log.warning('Failed attachment cleanup ownership unknown; retaining %s', path, exc_info=True)
+
+
+def _has_attachment_files(conn, directory):
+    root = Path(directory).resolve()
+    return any(Path(row[0]).resolve().is_relative_to(root)
+               for row in conn.execute('SELECT stored_path FROM task_attachments'))
+
+
 def delete_attachment(conn, attachment_id):
     """Retained worker/notification inputs and ancestor handoffs stay attached."""
     from hermes_cli.kanban_db_spawn import require_settled_task_ownership
@@ -35,14 +61,8 @@ def delete_attachment(conn, attachment_id):
             return None
         require_settled_task_ownership(conn, att.task_id)
         conn.execute('DELETE FROM task_attachments WHERE id=?', (attachment_id,))
-        path = Path(att.stored_path)
-        has_reference = any(Path(row[0]).resolve() == path.resolve()
-                            for row in conn.execute('SELECT stored_path FROM task_attachments'))
         _kb._append_event(conn, att.task_id, 'attachment_removed', {'filename': att.filename})
-        if not has_reference:
-            with contextlib.suppress(OSError):
-                if path.is_file():
-                    path.unlink()
+        _unlink_unreferenced_attachment_blob(conn, att.stored_path)
     return att
 
 
@@ -165,6 +185,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 return
             kind: Optional[str] = row["workspace_kind"]
             path: Optional[str] = row["workspace_path"]
+            if path and _has_attachment_files(conn, path):
+                return
             if kind not in _REMOVABLE_KINDS or not path:
                 # Not removable itself, but completing may still unblock a deferred
                 # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
@@ -306,6 +328,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 or row["workspace_kind"] not in _REMOVABLE_KINDS
                 or not row["workspace_path"]
                 or _has_active_children(conn, parent_id)
+                or _has_attachment_files(conn, row["workspace_path"])
             ):
                 continue
             if row["workspace_kind"] == "worktree":

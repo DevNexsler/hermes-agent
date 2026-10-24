@@ -1858,17 +1858,16 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
+    with dest_path.open('xb') as output:
+        output.write(data)
     try:
         return add_attachment(
             conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
             content_type=content_type, size=len(data), uploaded_by=uploaded_by,
         )
     except Exception:
-        # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
-        with contextlib.suppress(OSError):
-            dest_path.unlink(missing_ok=True)
+        from hermes_cli.kanban_db_workspace import cleanup_failed_attachment_blob
+        cleanup_failed_attachment_blob(conn, dest_path)
         raise
 
 
@@ -3018,7 +3017,7 @@ def _persist_scratch_completion_artifacts(
     changed = False
 
     def _discard_copies() -> None:
-        _discard_staged_copies(used_destinations, attachment_dir)
+        _discard_staged_copies(conn, used_destinations, attachment_dir)
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
@@ -3051,11 +3050,8 @@ def _persist_scratch_completion_artifacts(
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            _copy_capped(resolved_src, dest, artifact)
+            _copy_capped(resolved_src, dest, artifact, used_destinations)
         except Exception as exc:
-            if dest is not None:
-                with contextlib.suppress(OSError):
-                    dest.unlink(missing_ok=True)
             _discard_copies()
             if isinstance(exc, ArtifactPreservationError):
                 raise
@@ -3073,19 +3069,20 @@ def _persist_scratch_completion_artifacts(
         ]
 
 
-def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
+def _discard_staged_copies(conn, copies: Iterable[Path], attachment_dir: Path) -> None:
     """Remove staged attachment copies whose DB rows never committed; a leaked
     copy would make the retry stage ``name_1.ext`` next to an orphan."""
+    from hermes_cli.kanban_db_workspace import cleanup_failed_attachment_blob
     for copied in copies:
-        with contextlib.suppress(OSError):
-            Path(copied).unlink(missing_ok=True)
+        cleanup_failed_attachment_blob(conn, copied)
     with contextlib.suppress(OSError):
         attachment_dir.rmdir()
 
 
-def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
+def _copy_capped(src: Path, dest: Path, artifact: str, created: set[Path]) -> None:
     """Chunked copy that aborts if the file grows past the attachment cap mid-copy."""
     with src.open("rb") as source_file, dest.open("xb") as destination_file:
+        created.add(dest)
         copied = 0
         while chunk := source_file.read(1024 * 1024):
             copied += len(chunk)
@@ -3461,7 +3458,7 @@ def request_review(
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
     except Exception:
         if staged_copies:
-            _discard_staged_copies(staged_copies, staged_copies[0].parent)
+            _discard_staged_copies(conn, staged_copies, staged_copies[0].parent)
         raise
     return _ret(True)
 
