@@ -384,6 +384,17 @@ checkpoint, continuation prompt and inputs, prior result, profile path and durab
 Existing user/foreign changes are preserved. Failed durable write/readback latches strict quiescence
 unknown; marker removal cannot clear that process-local uncertainty.
 
+Every accepted goal drain settles before its producer lease exits, including normal hook skip,
+authorization/preflight refusal, error and cancellation. No core entry means no goal post-turn
+evaluation; refusal text cannot spend a goal turn or replace its original checkpoint. A shared
+private witness records confirmed maintenance retention across supported event rewrites. Terminal
+callbacks cover cancellation before the first step and remain in the existing deferred registry
+until cleanup is registered or confirmed. Failed/cancelled settlement closes UNKNOWN and never
+starts another settlement attempt. An unexecuted accepted obligation refused while open also
+closes UNKNOWN before preserving its exact maintenance handoff; it is never silently replayed.
+Ordinary unleased human hook skips retain their existing behavior. Physical receipt writers stay
+owned after waiter cancellation. These controls provide no restart or business-completion proof.
+
 These pauses never resume automatically. Before fence release, the maintenance owner must inventory
 every profile's receipts and leave a named, actionable `/goal resume` handoff. A rollout must not
 resume user/foreign/changed pauses. No automatic maintenance-resume API is supplied here; source

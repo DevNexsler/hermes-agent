@@ -460,9 +460,12 @@ class GatewayGoalsMixin:
                 event._goal_resolved_session_id = resolved_session_id
             inputs = dict(checkpoint.get('input_context') or self._goal_input_snapshot(event))
             inputs['origin_session_id'] = checkpoint['session_id']
-            return await self._defer_goal_for_maintenance(
+            retained = await self._defer_goal_for_maintenance(
                 mgr, event.source, event.text, checkpoint['final_response'], expected_goal=expected,
                 input_context=inputs, ownership_conflict=conflict)
+            if retained:
+                checkpoint['maintenance_retained'] = True
+            return retained
 
     async def _run_goal_fifo_drain(self, adapter, event, session_key):
         """Fresh goal permission spans preflight through core entry; closed work becomes durable pause."""
@@ -477,7 +480,10 @@ class GatewayGoalsMixin:
                 from gateway.admission_capacity import reserve_ingress_capacity
                 reserve_ingress_capacity(self, event, session_key)
                 started = True
-                await adapter._process_message_background(event, session_key)
+                try:
+                    await adapter._process_message_background(event, session_key)
+                finally:
+                    await self._settle_goal_drain_checkpoint(event)
         except GatewayDraining:
             if not started:
                 if await self._defer_queued_goal_for_maintenance(event):
@@ -492,6 +498,24 @@ class GatewayGoalsMixin:
         finally:
             if not started and adapter._session_tasks.get(session_key) is asyncio.current_task():
                 adapter._cleanup_finished_session_task(session_key, guard)
+
+    async def _settle_goal_drain_checkpoint(self, event):
+        """Accepted work cannot disappear after any normal, failed or cancelled pre-core exit."""
+        checkpoint = event._goal_admission_checkpoint
+        if getattr(event, '_heartbeat_execution_started', False) or checkpoint.get('maintenance_retained'):
+            return
+        checkpoint['terminal_started'] = True
+        try:
+            if await self._defer_queued_goal_for_maintenance(event):
+                return
+            # An open-fence refusal is still an unexecuted accepted obligation. Stop
+            # automatic admission and retain it for inspection, never replay/refund it.
+            self._ingress_barrier.fail_quiescence()
+            if not await self._defer_queued_goal_for_maintenance(event):
+                raise RuntimeError('accepted goal terminal checkpoint unconfirmed')
+        except BaseException:
+            self._ingress_barrier.fail_quiescence()
+            raise
 
     def _retain_goal_fifo_followup(self, adapter, event, session_key):
         """Keep an already accepted goal in existing FIFO; its fresh Base task owns admission."""
@@ -524,16 +548,19 @@ class GatewayGoalsMixin:
                 overflow[:] = [queued for queued in overflow if queued is not event]
 
     def _track_goal_drain_checkpoint(self, adapter, event, session_key, task):
-        """A queued goal cancelled before its first step still gets a durable maintenance handoff."""
+        """Keep terminal ownership until execution or exact durable handoff is confirmed."""
         guard = adapter._active_sessions.get(session_key)
         def finished(done):
             barrier = self._ingress_barrier
-            closed = barrier._closed or self._draining or self._external_drain_active
-            if not done.cancelled() or getattr(event, '_heartbeat_execution_started', False) or not closed:
+            checkpoint = event._goal_admission_checkpoint
+            if getattr(event, '_heartbeat_execution_started', False) or checkpoint.get('maintenance_retained'):
+                return
+            if checkpoint.get('terminal_started'):
+                barrier.fail_quiescence()  # Failed/cancelled settlement never starts a second attempt.
                 return
             from gateway.admission import without_gateway_ingress
             with without_gateway_ingress():
-                cleanup = asyncio.create_task(self._defer_queued_goal_for_maintenance(event))
+                cleanup = asyncio.create_task(self._settle_goal_drain_checkpoint(event))
             tasks = self.__dict__.setdefault('_deferred_agent_cleanup_tasks', set())
             def verified(result):
                 if adapter._session_tasks.get(session_key) is done:
@@ -543,6 +570,8 @@ class GatewayGoalsMixin:
             cleanup.add_done_callback(verified)
             self._track_task_in(tasks, cleanup)
         task.add_done_callback(finished)
+        # Count done tasks until terminal callback registers cleanup or confirms handoff.
+        self._track_deferred_agent_worker(task, None)
 
     async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None, expected_goal=None, ownership_conflict=None):
         """Retain a not-yet-started continuation as an owned, actionable maintenance checkpoint."""
@@ -580,8 +609,10 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Retain routing through bookkeeping when the delivered-turn waiter is cancelled."""
-        if getattr(event, '_goal_ownership_refused', False):
-            return  # No turn ran; post-turn bookkeeping must not reset a suspended route.
+        if (getattr(event, '_goal_ownership_refused', False)
+                or (getattr(event, '_goal_admission_checkpoint', None) is not None
+                    and not getattr(event, '_heartbeat_execution_started', False))):
+            return  # No goal turn ran; do not advance its checkpoint or reset its route.
         from gateway.admission import adopt_ingress_task
         task = adopt_ingress_task(self, asyncio.create_task(self._post_turn_bookkeeping(
             agent_result=agent_result, source=source, is_internal=is_internal, event=event)))

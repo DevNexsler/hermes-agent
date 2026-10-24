@@ -40,8 +40,10 @@ async def native(tmp_path, monkeypatch):
     entered, finish = asyncio.Event(), asyncio.Event()
     effects = []
     async def inert(event, *_args):
-        if hasattr(event, '_heartbeat_execution_started'):
-            event._heartbeat_execution_started = True  # Actual inert execution entry, not completion.
+        if (hasattr(event, '_heartbeat_execution_started')
+                or getattr(event, '_goal_admission_checkpoint', None) is not None):
+            from gateway.admission_capacity import mark_event_execution_started
+            mark_event_execution_started(event)  # Explicit inert execution entry, not completion.
         effects.append(event.text)
         entered.set()
         await finish.wait()
@@ -55,7 +57,8 @@ async def native(tmp_path, monkeypatch):
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
         for _ in range(500):
             if (not runner._ingress_barrier.snapshot()['adopted']
-                    and not getattr(runner, '_deferred_agent_workers', {})):
+                    and not getattr(runner, '_deferred_agent_workers', {})
+                    and not getattr(runner, '_deferred_agent_cleanup_tasks', ())):
                 break
             await asyncio.sleep(.01)
         else:
