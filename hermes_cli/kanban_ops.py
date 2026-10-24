@@ -316,8 +316,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
             "WHERE status = 'archived'"
         ).fetchall()
-        from hermes_cli.kanban_db_spawn import unresolved_worker_task_ids
-        protected = unresolved_worker_task_ids(conn)
+        from hermes_cli.kanban_db_spawn import retained_task_ids
+        protected = retained_task_ids(conn)
         for row in rows:
             if row['id'] in protected or kbw._has_active_children(conn, row['id']):
                 continue

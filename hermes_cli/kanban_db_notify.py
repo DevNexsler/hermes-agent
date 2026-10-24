@@ -67,6 +67,12 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
             if key == 'notification_attention_v1' or isinstance(value, _SCALAR_TYPES)}
 
 
+def notification_attention_task_ids(conn):
+    """Any marker, including malformed/foreign metadata, retains task inputs and ownership."""
+    return {task_id for task_id, raw in conn.execute('SELECT task_id, delivery_metadata FROM kanban_notify_subs')
+            if 'notification_attention_v1' in _decode_notify_delivery_metadata(raw)}
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,

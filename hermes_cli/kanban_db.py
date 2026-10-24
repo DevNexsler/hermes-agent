@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from hermes_cli.kanban_db_spawn import require_settled_worker_launch
+from hermes_cli.kanban_db_spawn import require_settled_worker_launch, require_settled_task_ownership
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -616,6 +616,8 @@ def create_board(
 ) -> dict:
     """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
     normed = _require_slug(slug)
+    from hermes_cli.kanban_db_removal import require_open_board
+    require_open_board(board_dir(normed) / 'kanban.db')
     meta = write_board_metadata(
         normed, name=name, description=description, icon=icon, color=color,
         default_workdir=default_workdir, project_id=project_id,
@@ -660,7 +662,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    from hermes_cli.kanban_db_spawn import board_removal_guard
+    from hermes_cli.kanban_db_removal import board_removal_guard
     with (contextlib.nullcontext() if archive else board_removal_guard(normed)):
         # If the user removed the currently-active board, revert to default.
         if get_current_board() == normed:
@@ -1704,8 +1706,8 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
-        require_settled_worker_launch(conn, parent_id)
-        require_settled_worker_launch(conn, child_id)
+        require_settled_task_ownership(conn, parent_id)
+        require_settled_task_ownership(conn, child_id)
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )
@@ -3936,9 +3938,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
-        require_settled_worker_launch(conn, task_id)
         if _task_status(conn, task_id) != "archived":
             return False
+        require_settled_task_ownership(conn, task_id)
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -3947,7 +3949,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
-        require_settled_worker_launch(conn, task_id)
+        require_settled_task_ownership(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

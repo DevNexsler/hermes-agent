@@ -324,6 +324,7 @@ def test_board_delete_preserves_any_unknown_notification_attention(tmp_path, mon
         assert kb.get_task(conn, tid).title == 'EXACT notification input'
 
 
+@pytest.mark.linux_only
 def test_board_delete_serializes_preopened_native_claim_writer(tmp_path, monkeypatch):
     import shutil
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
@@ -340,10 +341,10 @@ def test_board_delete_serializes_preopened_native_claim_writer(tmp_path, monkeyp
         original = shutil.rmtree
         observed = []
         def remove(path):
-            # Existing native connection cannot commit a claim during the final inventory/removal.
+            # Durable closure rejects native admission even after its SQL writer lock releases.
             conn.execute('PRAGMA busy_timeout=0')
-            with pytest.raises(sqlite3.OperationalError, match='locked'):
-                conn.execute('BEGIN IMMEDIATE')
+            with pytest.raises(RuntimeError, match='removal ownership UNKNOWN'):
+                kb.claim_task(conn, tid)
             observed.append(path)
             return original(path)
         monkeypatch.setattr(shutil, 'rmtree', remove)

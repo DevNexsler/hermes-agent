@@ -990,6 +990,11 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
+Hard deletion and cleanup retain tasks, history and workspaces while a worker remains active or
+unverifiable, or a notification has an UNKNOWN outcome. Inspect `hermes kanban notify-list --json`
+for notification attention; preserve the exact task and ownership evidence for operator review.
+Interrupted board deletion stays closed until its retained removal ownership is explicitly accounted for.
+
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
 ### Concurrency, scheduling, and child promotion config

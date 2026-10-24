@@ -1,5 +1,4 @@
 """Existing task-event ownership spans physical launch and durable PID handoff."""
-from contextlib import contextmanager
 from dataclasses import asdict
 import json
 import logging
@@ -29,6 +28,32 @@ _PROTECTED_WORKER_TASKS_SQL = """WITH RECURSIVE protected(id) AS (
 def unresolved_worker_task_ids(conn):
     """Retain an unresolved launch and ancestor handoff inputs until checked settlement."""
     return {row[0] for row in conn.execute(_PROTECTED_WORKER_TASKS_SQL)}
+
+
+def physical_worker_task_ids(conn):
+    """Claims and live/unverifiable task/run PIDs remain owners after result publication."""
+    from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
+    owners = {row[0] for row in conn.execute(
+        "SELECT id FROM tasks WHERE status='running' OR NULLIF(claim_lock, '') IS NOT NULL")}
+    local = kb._host_prefix()
+    for task_id, pid, owner in conn.execute(
+            'SELECT id, worker_pid, claim_lock FROM tasks WHERE worker_pid IS NOT NULL UNION '
+            'SELECT task_id, worker_pid, claim_lock FROM task_runs WHERE worker_pid IS NOT NULL'):
+        if local == 'unknown:' or not str(owner or '').startswith(local) or dispatch._pid_alive(pid):
+            owners.add(task_id)
+    return owners
+
+
+def retained_task_ids(conn):
+    """Keep original ancestors until physical and notification ownership both settle."""
+    from hermes_cli.kanban_db_notify import notification_attention_task_ids
+    protected = unresolved_worker_task_ids(conn) | physical_worker_task_ids(conn) | notification_attention_task_ids(conn)
+    links = list(conn.execute('SELECT parent_id, child_id FROM task_links'))
+    while True:
+        parents = {parent for parent, child in links if child in protected} - protected
+        if not parents:
+            return protected
+        protected.update(parents)
 
 
 def require_settled_worker_launch(conn, task_id):
@@ -143,13 +168,14 @@ def persist_worker_pid(conn, task_id, pid, *, expected_run_id=None, launch_id=No
 
 
 def gc_settled_events(conn, cutoff):
-    """Keep complete task history while any physical launch remains unresolved."""
+    """Keep complete history until launch uncertainty and physical ownership both settle."""
     from hermes_cli import kanban_db as kb
     with kb.write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' "
-            "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
-            "AND task_id NOT IN (" + _PROTECTED_WORKER_TASKS_SQL + ')', (cutoff,))
+        protected = retained_task_ids(conn)
+        candidates = conn.execute("SELECT DISTINCT task_id FROM task_events WHERE created_at < ? "
+                                 "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,))
+        rows = [(cutoff, row[0]) for row in candidates if row[0] not in protected]
+        cur = conn.executemany("DELETE FROM task_events WHERE created_at < ? AND task_id=? AND kind != 'decomposed'", rows)
     return int(cur.rowcount or 0)
 
 
@@ -159,7 +185,7 @@ def gc_settled_worker_logs(log_dir, cutoff, board):
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
     removed = 0
     with kbc.connect_closing(board=board) as conn, kb.write_txn(conn):
-        protected = unresolved_worker_task_ids(conn)
+        protected = retained_task_ids(conn)
         for path in log_dir.iterdir():
             owner = re.fullmatch(r'(.+)\.log(?:\.\d+)?', path.name)
             if owner is not None and owner.group(1) in protected:
@@ -173,55 +199,27 @@ def gc_settled_worker_logs(log_dir, cutoff, board):
 
 def worker_ownership_count(conn):
     """Shared strict inventory; unreadable/unknown launch ownership raises."""
-    from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
     require_writable_board(conn)
+    from hermes_cli.kanban_db_notify import notification_attention_task_ids
+    if notification_attention_task_ids(conn):
+        raise RuntimeError('kanban notification outcome UNKNOWN; preserve exact task/attempt/owner attention')
     if pending_worker_launch(conn) is not None:
         raise RuntimeError('physical worker launch ownership UNKNOWN; inspect task events')
-    total = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running' OR NULLIF(claim_lock, '') IS NOT NULL").fetchone()[0]
-    workers = conn.execute('SELECT worker_pid, claim_lock FROM tasks WHERE worker_pid IS NOT NULL '
-                           'UNION SELECT worker_pid, claim_lock FROM task_runs WHERE worker_pid IS NOT NULL')
-    local = kb._host_prefix()
-    for pid, owner in workers:
-        if local == 'unknown:' or not str(owner or '').startswith(local) or dispatch._pid_alive(pid):
-            total += 1
-    return total
+    return len(physical_worker_task_ids(conn))
 
 
 def require_writable_board(conn):
     """A removed WAL file can remain writable through an old connection; intent closes it first."""
+    from hermes_cli.kanban_db_removal import require_open_board
+    path = conn.execute('PRAGMA database_list').fetchone()[2]
+    if path:
+        require_open_board(path)
     if conn.execute("SELECT 1 FROM task_events WHERE kind='board_removal_pending' LIMIT 1").fetchone():
         raise RuntimeError('board removal ownership UNKNOWN; preserve remaining store and inspect removal intent')
 
 
-@contextmanager
-def board_removal_guard(board):
-    """Keep destructive removal serialized with native claim/launch writers; never migrate."""
-    import sqlite3
-    from hermes_cli import kanban_db as kb
-    from hermes_cli.sqlite_safe_read import connect_tracked
-    # Removal targets this directory, regardless of a caller's DB override.
-    path = (kb.board_dir(board) / 'kanban.db').resolve()
-    conn = connect_tracked(path.as_uri() + '?mode=rw', uri=True, timeout=0, isolation_level=None)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute('BEGIN IMMEDIATE')
-        if worker_ownership_count(conn):
-            raise RuntimeError('board still owns active or unverifiable physical work')
-        for (raw,) in conn.execute('SELECT delivery_metadata FROM kanban_notify_subs'):
-            metadata = json.loads(raw or '{}')
-            if not isinstance(metadata, dict) or 'notification_attention_v1' in metadata:
-                raise RuntimeError('board notification outcome UNKNOWN; preserve attention and inputs')
-        record = {'version': 1, 'operation_id': uuid.uuid4().hex, 'board': board,
-                  'database_realpath': str(path), 'owner': 'native-board-removal',
-                  'outcome': 'UNKNOWN', 'required_action': 'Inspect exact removal and remaining files; no automatic reopen.'}
-        _append_checked_event(conn, '', 'board_removal_pending', record, None)
-        conn.commit()
-        # Old/preopened connections now see the durable stop even after unlink/recreation.
-        saved = conn.execute("SELECT payload FROM task_events WHERE kind='board_removal_pending'").fetchall()
-        if len(saved) != 1 or json.loads(saved[0][0]) != record:
-            raise RuntimeError('board removal intent readback unconfirmed')
-        conn.execute('BEGIN IMMEDIATE')
-        yield
-    finally:
-        conn.rollback()
-        conn.close()
+def require_settled_task_ownership(conn, task_id):
+    """Task evidence must outlive physical ownership and every uncertain notification."""
+    require_settled_worker_launch(conn, task_id)
+    if task_id in retained_task_ids(conn):
+        raise RuntimeError('task ownership active or UNKNOWN; preserve task/run/notification evidence')

@@ -546,7 +546,7 @@ then mark execution entry before releasing either lock. Preparation-time compres
 prepared identity only along that verified lineage with identical goal state. Contention or unreadable
 ownership retains the exact original obligation as UNKNOWN; no lock spans an await.
 
-Unlink cannot remove an unresolved launch's ancestor protection. Log retention covers both the current
+Unlink cannot remove an unresolved obligation's ancestor protection. Log retention covers both the current
 `<task>.log` and supported numbered rotations. Whole-board hard deletion checks the database inside
 the directory being removed, independently of a database override, and refuses active/unverifiable
 workers, unresolved launches or any notification attention. Before unlinking files, it commits and
@@ -555,9 +555,25 @@ task ID, operation identity, owner principal, database path and required operato
 transactions reject any present removal event. This also closes preopened WAL connections, which
 otherwise can keep claiming work after filesystem deletion. Failed/interrupted deletion leaves the
 surviving store closed and strict inventory UNKNOWN across restart; no automatic clearing/reopen.
-Explicit recreation creates an independent database, while old connections remain closed. Existing
+The matching private version1 record at `<kanban-home>/kanban/board-removals/<slug>.json` survives
+outside the deletion set. Stable nonwaiting file ownership serializes removal, while full byte CAS
+preserves any foreign/malformed replacement. Connect/create/writer checks refuse retained external
+ownership before automatic initialization. Only successful owned removal with absent target clears
+that exact outside record; failure after deleting the database or entire directory stays UNKNOWN.
+Our database descriptor closes after checked intent commit and before filesystem unlink; old WAL
+connections still refuse through their durable event. No lock inode is unlinked. Aliased directory/DB
+removal is refused because its physical ownership path cannot be retained by this contract.
+Explicit recreation after successful removal creates an independent database, while old connections remain closed. Existing
 archive behavior retains its database for inventory. These guards require the new source; old writers
 and incapable rollback still need separate exclusion. Owner principal does not assign a human.
+
+Inventory enumerates default/named/archived database realpaths plus any configured database override;
+an override cannot hide another board. Task deletion and archived-task purge retain running claims,
+live or unverifiable task/run PIDs, unresolved launch/notification attention and original ancestors.
+The same retained set protects events, current/rotated logs and workspace cleanup, including the
+completion-before-physical-exit window. Any notification attention (including malformed/foreign)
+also keeps strict readiness UNKNOWN across restart. Normal completion/archive semantics remain;
+ordinary settled deletion/GC becomes eligible after physical ownership and attention both settle.
 
 Supported pre-dispatch text rewrites clone the event while retaining private native checkpoints.
 Only the current live reservation's exact event may transfer its reserved capacity/startup ownership

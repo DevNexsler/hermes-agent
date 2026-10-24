@@ -61,9 +61,9 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
 
 
 def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
-    from hermes_cli.kanban_db_spawn import unresolved_worker_task_ids
+    from hermes_cli.kanban_db_spawn import retained_task_ids
     return (conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
-            or task_id in unresolved_worker_task_ids(conn))
+            or task_id in retained_task_ids(conn))
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -137,8 +137,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     remote-tracking ref); ``dir`` is intentionally preserved."""
     try:
         with _kb.write_txn(conn):
-            from hermes_cli.kanban_db_spawn import unresolved_worker_task_ids
-            if task_id in unresolved_worker_task_ids(conn):
+            from hermes_cli.kanban_db_spawn import retained_task_ids
+            if task_id in retained_task_ids(conn):
                 return  # Physical ownership still needs this task's inputs and evidence.
             row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
             if not row:

@@ -10,8 +10,11 @@ import sqlite3
 
 def _retained_board_paths(kb):
     """Inventory supported live and archived board locations; unreadability raises."""
-    paths = {kb.kanban_db_path(board['slug']).resolve()
-             for board in kb.list_boards(include_archived=True)}
+    from hermes_cli.kanban_db_removal import require_no_board_removals
+    require_no_board_removals()
+    paths = {(kb.kanban_home() / 'kanban.db').resolve(), kb.kanban_db_path().resolve()}
+    paths.update((kb.board_dir(board['slug']) / 'kanban.db').resolve()
+                 for board in kb.list_boards(include_archived=True) if board['slug'] != kb.DEFAULT_BOARD)
     archive_root = kb.boards_root() / '_archived'
     try:
         archive_root.stat()
