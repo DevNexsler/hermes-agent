@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
-from gateway.admission import adopt_ingress_task, native_to_thread
+from gateway.admission import adopt_ingress_task, native_thread, native_to_thread
 from gateway.run_loop_acceptance import mark_loop_failure
 import dataclasses
 import inspect
@@ -20,7 +20,7 @@ from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
-from contextvars import copy_context
+from contextvars import Context, copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
@@ -3458,15 +3458,13 @@ class GatewayTurnMixin:
                     _finished_agent._gateway_turn_process_baseline = frozenset()
 
         if _agent_timeout is not None:
-            threading.Thread(
-                target=_watch_gateway_turn_inactivity,
-                kwargs={
-                    "agent_holder": agent_holder, "timeout": _agent_timeout, "poll_interval": 5.0,
-                    **self._reaper_kwargs(worker),
-                },
+            native_thread(
+                self, _watch_gateway_turn_inactivity,
+                agent_holder=agent_holder, timeout=_agent_timeout, poll_interval=5.0,
+                **self._reaper_kwargs(worker),
                 name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
-                daemon=True,
-            ).start()
+                start=True, thread_context=Context(),
+            )
         from gateway.admission import mark_ingress_effect
         mark_ingress_effect(self)
         worker.executor_task = adopt_ingress_task(self, asyncio.ensure_future(
@@ -3581,11 +3579,11 @@ class GatewayTurnMixin:
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
                 if _idle_secs >= worker.agent_timeout:
-                    threading.Thread(
-                        target=_abandon_timed_out_gateway_turn,
-                        kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
-                        name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
-                    ).start()
+                    native_thread(
+                        self, _abandon_timed_out_gateway_turn, agent_holder=agent_holder,
+                        **self._reaper_kwargs(worker), name=f"gateway-turn-reaper-{worker.task_id[:12]}",
+                        start=True, thread_context=Context(),
+                    )
                     break
             await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
         return self._run_agent_timeout_result(worker, turn_ctx)

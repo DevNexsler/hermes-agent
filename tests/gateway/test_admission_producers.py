@@ -4,6 +4,8 @@ import asyncio
 
 import pytest
 
+from tests.gateway.test_admission_core_executor import settled_status
+
 from gateway.admission import (
     GatewayDraining, gateway_admission_status, gateway_ingress, initialize_gateway_admission,
 )
@@ -52,6 +54,7 @@ async def test_native_internal_refund_and_leased_busy_refusal_never_queue(tmp_pa
     finally:
         finish.set()
         await asyncio.gather(*adapter._background_tasks)
+    await settled_status()
     assert gateway_admission_status(runner)['quiescent'] is True
     assert effects == ['first']
 

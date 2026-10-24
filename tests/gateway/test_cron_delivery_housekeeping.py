@@ -61,11 +61,12 @@ def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
 ):
     root_adapters = {}
     secondary_adapters = {}
-    runner = SimpleNamespace(
-        config=SimpleNamespace(multiplex_profiles=True),
-        adapters=root_adapters,
-        _profile_adapters={"secondary": secondary_adapters},
-    )
+    from gateway.admission import initialize_gateway_admission
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner.adapters, runner._profile_adapters = root_adapters, {"secondary": secondary_adapters}
+    runner._running, runner._draining, runner._external_drain_active = True, False, False
+    initialize_gateway_admission(runner, home=tmp_path)
     root_home = tmp_path / "root"
     secondary_home = tmp_path / "secondary"
     calls = []

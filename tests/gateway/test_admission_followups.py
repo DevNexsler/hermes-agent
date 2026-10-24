@@ -11,7 +11,7 @@ from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionSource
 from hermes_cli.goals import GoalManager
-from tests.gateway.test_admission_core_executor import executor_futures, settled  # noqa: F401 — real futures
+from tests.gateway.test_admission_core_executor import executor_futures, settled, settled_status  # noqa: F401 — real futures
 from tests.gateway.test_admission_native_work import native  # noqa: F401 — real native fixture
 
 
@@ -203,6 +203,7 @@ async def test_failed_inherited_adoption_cancels_and_tracks_child_before_first_s
     native.runner._enter_external_drain()
     await asyncio.wait_for(task, 5)
     assert children[0].cancelled() and not effects
+    await settled_status()
     assert gateway_admission_status(native.runner)['quiescent']
 
 

@@ -4797,6 +4797,8 @@ def _start_gateway_housekeeping(
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+    from gateway.run_watchers import owned_housekeeping_chore
+    chore = partial(owned_housekeeping_chore, runner)
     chores: list[tuple[int, str, Any]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
@@ -4850,8 +4852,8 @@ def _start_gateway_housekeeping(
         tick_count += 1
         for every, label, fn in chores:
             if tick_count % every == 0:
-                _housekeeping_chore(label, fn)
-        wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
+                chore(label, fn)
+        wait_for_next_tick(stop_event, interval, queue_watch, chore)
     logger.info("Gateway housekeeping stopped")
 
 

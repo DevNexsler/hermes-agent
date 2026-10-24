@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from contextlib import suppress
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -37,12 +38,34 @@ logger = logging.getLogger("gateway.platforms.api_server")
 # in the worker thread's own ``finally``, which also keeps it visible past ``adapters.clear()``.
 _API_WORKER_LOCK = threading.Lock()
 _API_WORKER_LIVE = 0
+_API_DAEMON_WORKERS = set()
 
 
 def api_worker_live_count() -> int:
     """Executor threads still inside an API-server agent turn (``_run_agent`` and ``/v1/runs``)."""
     with _API_WORKER_LOCK:
-        return _API_WORKER_LIVE
+        if type(_API_WORKER_LIVE) is not int or _API_WORKER_LIVE < 0:
+            raise RuntimeError('invalid API worker ownership')
+        _API_DAEMON_WORKERS.difference_update(thread for thread in list(_API_DAEMON_WORKERS)
+                                            if not thread.is_alive())
+        return _API_WORKER_LIVE + len(_API_DAEMON_WORKERS)
+
+
+def _start_api_worker_thread(function, /, *args, name=None, **kwargs):
+    """Retain API cleanup daemons in the existing worker ownership domain through physical exit."""
+    thread = threading.Thread(target=copy_context().run, args=(function, *args), kwargs=kwargs,
+                              name=name, daemon=True)
+    with _API_WORKER_LOCK:
+        _API_DAEMON_WORKERS.difference_update(ended for ended in list(_API_DAEMON_WORKERS)
+                                            if not ended.is_alive())
+        _API_DAEMON_WORKERS.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            if not thread.is_alive():
+                _API_DAEMON_WORKERS.discard(thread)
+            raise
+    return thread
 
 
 def _submit_api_worker(loop, fn):

@@ -255,16 +255,35 @@ class GatewayShutdownMixin:
         workers = getattr(self, "_deferred_agent_workers", None)
         if not isinstance(workers, dict):
             return 0
-        return sum(1 for future in list(workers) if not future.done())
+        active = 0
+        for future in list(workers):
+            thread = getattr(future, '_hermes_native_thread', None)
+            if thread is not None and future.done() and not thread.is_alive():
+                workers.pop(future, None)
+            elif not future.done() or (thread is not None and thread.is_alive()):
+                active += 1
+        return active
 
-    def _track_deferred_agent_worker(self, future: asyncio.Future, agent: Any) -> None:
+    def _track_deferred_agent_worker(self, future: Any, agent: Any) -> None:
         """Expose an executor worker to drain/interrupt until it really exits."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, '_gateway_loop', None)
         workers = getattr(self, "_deferred_agent_workers", None)
         if workers is None:
             workers = self._deferred_agent_workers = {}
         workers[future] = agent
 
         def _discard_worker(done_future: asyncio.Future) -> None:
+            thread = getattr(done_future, '_hermes_native_thread', None)
+            if thread is not None and thread.is_alive():
+                # Completion runs inside the daemon. Keep its physical tail, then release on the loop.
+                if loop is not None and not loop.is_closed():
+                    with suppress(RuntimeError):
+                        loop.call_soon_threadsafe(
+                            loop.call_later, .001, _discard_worker, done_future)
+                return  # A standalone caller without a loop reaps on its next count/snapshot.
             workers.pop(done_future, None)
             # Workers that outlive their starting coroutine have no later waiter: consume the
             # terminal exception so asyncio emits no unhandled-future warning.

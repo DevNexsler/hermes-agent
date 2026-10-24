@@ -14,7 +14,7 @@ import hmac
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar
 from functools import wraps
 import logging
 import os
@@ -603,10 +603,11 @@ def _reap_disconnected_agent_processes(
             return current is None or current == _epoch
         is_still_current = _epoch_still_current
     from gateway.run import _reap_gateway_turn_processes
-    threading.Thread(
-        target=copy_context().run, args=(_reap_gateway_turn_processes, process_task_id, process_baseline),
-        kwargs={"source": source, "is_still_current": is_still_current},
-        name=f"api-turn-reaper-{process_task_id[:12]}", daemon=True).start()
+    from gateway.platforms.api_server_runs import _start_api_worker_thread
+    _start_api_worker_thread(
+        _reap_gateway_turn_processes, process_task_id, process_baseline,
+        source=source, is_still_current=is_still_current,
+        name=f"api-turn-reaper-{process_task_id[:12]}")
 
 
 # Per-task-id run epochs for the reap gate: monotonic counter (never reused),

@@ -66,13 +66,16 @@ def wait_for_next_tick(stop_event, interval: float, watch: Optional[DeliveryQueu
     if watch is None:
         stop_event.wait(timeout=interval)
         return
-    watch.refresh_homes()
+    chore("Cron durable delivery queue watch refresh", watch.refresh_homes)
+
+    def drain_when_changed():
+        if watch.changed():
+            watch.drain()
     deadline = time.monotonic() + interval
     while True:
         remaining = max(0.0, deadline - time.monotonic())
         if stop_event.wait(timeout=min(remaining, DELIVERY_QUEUE_WATCH_SECONDS)):
             return
-        if watch.changed():
-            chore(DRAIN_LABEL, watch.drain)
+        chore(DRAIN_LABEL, drain_when_changed)
         if time.monotonic() >= deadline:
             return

@@ -28,6 +28,13 @@ async def executor_futures(monkeypatch):
 
 async def settled(futures):
     await asyncio.wait_for(asyncio.gather(*(asyncio.shield(f) for f in futures), return_exceptions=True), 5)
+    await settled_status()
+
+
+async def settled_status():
+    # Drain entry publishes asynchronously; terminal quiescence includes that real generation.
+    from gateway.status import flush_runtime_status_async
+    assert await flush_runtime_status_async(timeout=5)
 
 
 @pytest.mark.asyncio

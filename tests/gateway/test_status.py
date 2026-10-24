@@ -494,7 +494,8 @@ class TestRuntimeStatusBackgroundWriter:
                 write_started.set()
                 assert release_write.wait(timeout=5.0)
 
-        writer = status._RuntimeStatusWriter(write_fn=controlled_write)
+        from gateway.status_writer import RuntimeStatusWriter
+        writer = RuntimeStatusWriter(write_fn=controlled_write)
         monkeypatch.setattr(status, "_runtime_status_writer", writer)
 
         def publish_initial_status():
@@ -548,7 +549,8 @@ class TestRuntimeStatusBackgroundWriter:
             write_started.set()
             assert release_write.wait(timeout=5.0)
 
-        writer = status._RuntimeStatusWriter(write_fn=blocked_write)
+        from gateway.status_writer import RuntimeStatusWriter
+        writer = RuntimeStatusWriter(write_fn=blocked_write)
         monkeypatch.setattr(status, "_runtime_status_writer", writer)
         try:
             persisted = status.write_runtime_status(

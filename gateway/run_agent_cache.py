@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import importlib
 import logging
-import threading
 import time
 from contextlib import nullcontext, suppress
+from contextvars import Context
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -448,7 +448,7 @@ class GatewayAgentCacheMixin:
         agent, invalidate its run generation, and reap the tool processes that turn spawned.
         ``tool_reason`` names a system issuer (eviction); ``None`` keeps the user attribution of /stop and /new.
         Returns the post-bump generation."""
-        from contextvars import copy_context
+        from gateway.admission import native_thread
         from gateway.run import _AGENT_PENDING_SENTINEL, _reap_gateway_turn_processes, request_hard_interrupt
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
@@ -467,16 +467,12 @@ class GatewayAgentCacheMixin:
         # covers its cleanup, so nothing stays unreaped.
         _generation_at_interrupt = self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         if _process_task_id and _process_baseline is not None:
-            threading.Thread(
-                target=copy_context().run,
-                args=(_reap_gateway_turn_processes, _process_task_id, _process_baseline),
-                kwargs={
-                    "source": "gateway_turn_interrupt",
-                    "is_still_current": lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
-                },
-                name=f"gateway-turn-reaper-{_process_task_id[:12]}",
-                daemon=True,
-            ).start()
+            native_thread(
+                self, _reap_gateway_turn_processes, _process_task_id, _process_baseline,
+                source="gateway_turn_interrupt",
+                is_still_current=lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
+                name=f"gateway-turn-reaper-{_process_task_id[:12]}", start=True,
+            )
         return _generation_at_interrupt
 
     async def _interrupt_and_clear_session(
@@ -724,16 +720,25 @@ class GatewayAgentCacheMixin:
         """Run a release on a daemon thread. ``inline_fallback`` runs it inline (best-effort) when no
         thread can start (interpreter shutdown); otherwise a spawn failure propagates, as on main.
         The thread runs inside the owning profile's scope (see ``_run_release_in_profile_scope``)."""
-        import contextvars
-        ctx = contextvars.copy_context()
+        from gateway.admission import native_thread
+        thread = None
         try:
-            threading.Thread(target=ctx.run, args=(self._run_release_in_profile_scope, target, args, session_key),
-                             daemon=True, name=name).start()
-        except Exception:
+            thread = native_thread(self, self._run_release_in_profile_scope, target, args, session_key, name=name)
+            thread.start()
+        except Exception as exc:
+            if thread is not None and thread.ident is not None:
+                if not inline_fallback:
+                    raise
+                return  # A start reply can fail after execution began; never replay or settle its future.
             if not inline_fallback:
+                if thread is not None:
+                    thread._hermes_native_completion.set_exception(exc)
                 raise
             with suppress(Exception):
-                ctx.run(self._run_release_in_profile_scope, target, args, session_key)
+                if thread is None:  # Construction failure already made strict readiness UNKNOWN.
+                    self._run_release_in_profile_scope(target, args, session_key)
+                else:
+                    thread.run()
 
     def _run_release_in_profile_scope(self, target, args: tuple, session_key: Optional[str]) -> None:
         """Call ``target(*args)`` under the profile that OWNS ``session_key``.
@@ -900,12 +905,20 @@ class GatewayAgentCacheMixin:
             "Agent cache pressure: anon RSS %dMB over budget %dMB — evicting %d LRU session(s): %s",
             rss_mb, bounds.memory_high_mb, evicted_count, ", ".join(key for key, _ in plan),
         )
+        from gateway.admission import native_thread
+        thread = None
         try:
-            threading.Thread(target=self._release_pressure_batch, args=(plan,), daemon=True,
-                             name="agent-cache-pressure").start()
+            thread = native_thread(self, self._release_pressure_batch, plan, name="agent-cache-pressure",
+                                   thread_context=Context())
+            thread.start()
         except Exception:
             # Thread spawn failed (interpreter shutdown): release inline, unguarded (as on main).
-            self._release_pressure_batch(plan)
+            if thread is not None and thread.ident is not None:
+                raise  # The original daemon owns the batch; an inline replay could duplicate extraction.
+            if thread is None:
+                self._release_pressure_batch(plan)
+            else:
+                thread.run()
         # _release_pressure_batch drains `plan` in place (so the trim runs with no lingering agent
         # refs) — len(plan) is 0 once the daemon thread finishes, hence the pre-captured count.
         return evicted_count

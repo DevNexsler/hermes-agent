@@ -11,10 +11,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import Future
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Coroutine, Optional
 
 
 _DEFAULT_LOGGER = logging.getLogger(__name__)
+_threadsafe_future_owner = ContextVar('threadsafe_future_owner', default=None)
+
+
+@contextmanager
+def threadsafe_future_owner(track):
+    """Bind an existing caller's lifetime registry without coupling the bridge to a host."""
+    token = _threadsafe_future_owner.set(track)
+    try:
+        yield
+    finally:
+        _threadsafe_future_owner.reset(token)
 
 
 def safe_schedule_threadsafe(
@@ -32,12 +45,17 @@ def safe_schedule_threadsafe(
     try:
         if loop is None:
             raise RuntimeError("loop is None")
-        return asyncio.run_coroutine_threadsafe(coro, loop)
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
     except Exception as exc:
         if asyncio.iscoroutine(coro):
             coro.close()
         log.log(log_level, "%s: %s", log_message, exc)
         return None
+    # Once submitted, a tracking failure is ambiguous: never close/cancel an accepted coroutine.
+    track = _threadsafe_future_owner.get()
+    if track is not None:
+        track(future)
+    return future
 
 
 def consume_detached_task_result(task: "asyncio.Future[Any]") -> None:

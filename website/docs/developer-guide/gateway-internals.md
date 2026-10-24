@@ -428,6 +428,17 @@ Finite boot sends are registered before their first yield and remain owned after
 restore gate opens. Boot/reconnect ledger, retry-timer and startup metadata offloads bind their
 runner explicitly even when called without a supervisor. These counters are physical-work
 ownership, not delivery receipts or a proof that an old process can be stopped safely.
+Finite cache-release and turn/API reaper daemons register before starting and remain counted
+through physical thread exit. A failed start reply never authorizes replaying an already-started
+worker inline. Cache housekeeping reserves ordinary native admission before eviction; OS-thread
+chores register under the same fence lock before reading or mutating their stores. Idle waits
+remain excluded. Scoped async-bridge ownership retains a queued coroutine after its submitting
+chore times out; a tracking failure leaves readiness UNKNOWN and never cancels accepted work.
+These ownership callbacks grant no ingress permission and leave standalone bridge calls unchanged.
+The coalesced runtime-status writer lives in `gateway/status_writer.py`; `gateway/status.py`
+retains its existing publication/singleton API. Pending and writing snapshots count as work,
+failed or inconsistent persistence is UNKNOWN, and the idle writer thread does not count.
+Memory extraction, pool choice, profile binding, status coalescing and transport policy stay native.
 
 Maintenance pause/receipt writes verify both final rows inside their SQLite writer transaction
 before commit. Rejected or altered writes roll back the whole handoff, including any accidental

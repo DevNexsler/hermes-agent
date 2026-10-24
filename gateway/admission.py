@@ -6,6 +6,7 @@ This process-local capability requires a running gateway built with this module.
 """
 
 import asyncio
+from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar, copy_context
 from functools import partial
@@ -391,6 +392,73 @@ async def native_session_offload(runner, function, /, *args, **kwargs):
     return await native_in_executor(runner, None, partial(function, *args, **kwargs))
 
 
+def native_thread(runner, function, /, *args, name=None, start=False, thread_context=None, **kwargs):
+    """Register a finite daemon before its caller starts it; Thread.run keeps inline fallback owned."""
+    completion = Future()
+    completion.set_running_or_notify_cancel()
+    ctx = copy_context() if thread_context is None else thread_context
+
+    def work():
+        try:
+            result = ctx.run(function, *args, **kwargs)
+        except BaseException as exc:
+            completion.set_exception(exc)
+            raise
+        else:
+            completion.set_result(result)
+
+    thread = None
+    try:
+        thread = threading.Thread(target=work, daemon=True, name=name)
+        completion._hermes_native_thread = thread
+        thread._hermes_native_completion = completion
+        runner._track_deferred_agent_worker(completion, None)
+        if start:
+            thread.start()
+    except BaseException as exc:
+        if thread is not None and thread.ident is None and not completion.done():
+            completion.set_exception(exc)
+        _barrier(runner).fail_quiescence()
+        raise
+    return thread
+
+
+@contextmanager
+def native_housekeeping_work(runner):
+    """Fence one synchronous native chore; retain its queued coroutine handoff after a timeout."""
+    from agent.async_utils import threadsafe_future_owner
+    barrier = _barrier(runner)
+    completion = None
+    try:
+        with barrier._lock:
+            if not barrier._closed and barrier._ready() and barrier.hold['known']:
+                completion = Future()
+                completion.set_running_or_notify_cancel()
+                runner._track_deferred_agent_worker(completion, None)
+    except BaseException:
+        barrier.fail_quiescence()
+        raise
+    if completion is None:
+        yield False
+        return
+
+    def track(future):
+        try:
+            runner._track_deferred_agent_worker(future, None)
+        except BaseException:
+            barrier.fail_quiescence()
+            raise
+
+    try:
+        with native_observer_context(runner), threadsafe_future_owner(track):
+            yield True
+    except BaseException as exc:
+        completion.set_exception(exc)
+        raise
+    else:
+        completion.set_result(None)
+
+
 async def native_in_executor(runner, executor, function, /, *args):
     """Preserve the native pool choice and profile context across admission-aware offloads."""
     token = _native_runner.set(runner)
@@ -468,6 +536,7 @@ def gateway_admission_status(runner):
             raise GatewayDraining('persistent admission hold unreadable')
         from gateway.platforms.api_server_runs import api_worker_live_count
         from gateway.kanban_quiescence import kanban_worker_work_count
+        from gateway.status_writer import runtime_status_work_count
         from gateway.config import Platform
         api = runner.adapters.get(Platform.API_SERVER)
         api_count = 0 if api is None else api.active_agent_work_count(strict=True)
@@ -476,9 +545,10 @@ def gateway_admission_status(runner):
         deferred = getattr(runner, '_deferred_agent_workers', {})
         if not isinstance(deferred, dict):
             raise GatewayDraining('deferred worker registry unreadable')
+        runner._active_deferred_agent_worker_count()  # Reap only physically exited native daemon witnesses.
         work = (runner._running_agent_count() + runner._running_cron_job_count()
                 + api_count + api_worker_live_count() + kanban_worker_work_count()
-                + len(deferred)
+                + len(deferred) + runtime_status_work_count()
                 + len(getattr(runner, '_deferred_agent_cleanup_tasks', ()))
                 + bool(getattr(runner, '_startup_restore_in_progress', False)))
         # A base task can be waiting on routing/auth before the runner has claimed a session.
