@@ -19,7 +19,7 @@ import weakref as _weakref
 from agent.async_utils import consume_detached_task_result
 from contextvars import Context
 from datetime import datetime, timedelta, timezone
-from gateway.admission import admit_gateway_work, adopt_ingress_task
+from gateway.admission import admit_gateway_work, adopt_ingress_task, native_observer_context, native_session_offload
 from gateway.config import SHARED_LISTENER_MIRROR_PLATFORMS, Platform, platform_binds_port as _platform_binds_port
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, inbound_dedup_caches
@@ -417,7 +417,10 @@ class GatewayAdapterLifecycleMixin:
         # Spawn timestamp lets ``_done`` tell a rapid crash-loop from a healthy-run-then-crash.
         _started = time.monotonic()
         # No create_task kwargs (test doubles mock a narrow signature); Context().run isolates instead.
-        task = Context().run(lambda: asyncio.create_task(coro_factory()))
+        async def owned_observer():
+            with native_observer_context(self):
+                return await coro_factory()
+        task = Context().run(lambda: asyncio.create_task(owned_observer()))
         # PERMANENT watcher: the scale-to-zero idle check ignores it (else busy forever).
         task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
         self._retain_background_task(task)
@@ -969,7 +972,7 @@ class GatewayAdapterLifecycleMixin:
         from gateway.config import load_gateway_config
         from hermes_cli.env_loader import hydrate_profile_secret_sources
         # Hydrate external secret sources off-loop ONCE: sync hydration would stall every heartbeat.
-        await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
+        await native_session_offload(self, hydrate_profile_secret_sources, profile_home)
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
             profile_runtime_cfg = _load_gateway_config()
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
@@ -1229,7 +1232,7 @@ class GatewayAdapterLifecycleMixin:
         from gateway.config import load_gateway_config
         profile_home = get_profile_dir(profile_name)
         # Hydrate external secret sources off-loop so they cannot starve heartbeats.
-        await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
+        await native_session_offload(self, hydrate_profile_secret_sources, profile_home)
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
             profile_config = load_gateway_config().platforms.get(platform)
             if profile_config is None or not profile_config.enabled:

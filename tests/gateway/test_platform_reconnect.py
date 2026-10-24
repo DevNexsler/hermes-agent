@@ -53,11 +53,15 @@ class StubAdapter(BasePlatformAdapter):
 
 def _make_runner():
     """Create a minimal GatewayRunner via object.__new__ to skip __init__."""
+    from gateway.admission import GatewayAdmission
+    from hermes_constants import get_hermes_home
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="test")}
     )
     runner._running = True
+    runner._draining = runner._external_drain_active = False
+    runner._ingress_barrier = GatewayAdmission(runner, get_hermes_home())
     runner._shutdown_event = asyncio.Event()
     runner._exit_reason = None
     runner._exit_with_failure = False

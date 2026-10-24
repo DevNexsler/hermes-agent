@@ -406,6 +406,15 @@ fails. A failed or empty query cannot authorize terminal-worker cleanup; a confi
 observed exit keeps the existing cleanup contract. Native macOS fault-path qualification remains
 required separately from Linux tests.
 
+Supervised gateway observers start in a fresh context that binds their runner's physical-I/O
+ownership without carrying parent ingress permission. Profile hydration via `native_to_thread`
+therefore retains its real executor future through cancellation, even before a poller's admitted
+business tick. Secondary configuration/reconnect hydration explicitly uses the same native
+offload ownership. These reads grant no admission permission or business-effect/completion proof.
+Startup warm-up likewise stays in the existing deferred registry after its bounded restore gate
+opens. Launch-scope hydration and the actual probe use tracked, shielded default-executor futures,
+so cancelling the warm-up waiter cannot conceal a still-running physical worker.
+
 These pauses never resume automatically. Before fence release, the maintenance owner must inventory
 every profile's receipts and leave a named, actionable `/goal resume` handoff. A rollout must not
 resume user/foreign/changed pauses. No automatic maintenance-resume API is supplied here; source

@@ -365,6 +365,16 @@ async def ingress_to_thread(function, /, *args, **kwargs):
     return await _ingress_in_executor(None, function, *args, **kwargs)
 
 
+@contextmanager
+def native_observer_context(runner):
+    """Bind physical I/O ownership for an observer; grant no ingress permission."""
+    token = _native_runner.set(runner)
+    try:
+        yield
+    finally:
+        _native_runner.reset(token)
+
+
 async def native_to_thread(function, /, *args, **kwargs):
     """Native I/O retains physical work; runner identity grants no admission permission."""
     lease = _ingress.get()

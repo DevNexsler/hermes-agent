@@ -8,7 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
-from gateway.admission import native_to_thread
+from gateway.admission import native_to_thread, native_session_offload
 import dataclasses
 import faulthandler
 import logging
@@ -16,7 +16,7 @@ import os
 import signal
 import time
 from contextlib import nullcontext, suppress
-from contextvars import copy_context
+from functools import partial
 from datetime import datetime
 from pathlib import Path
 from gateway.config import Platform
@@ -138,6 +138,7 @@ class GatewayStartupMixin:
             self._startup_warmup_task = None
             return
         self._startup_warmup_task = asyncio.ensure_future(self._warm_turn_prerequisites())
+        self._track_deferred_agent_worker(self._startup_warmup_task, None)
 
     async def _run_boot_probe_in_launch_scope(self, fn):
         """Run a boot-time probe on the default executor under the LAUNCH profile's scope when
@@ -145,19 +146,19 @@ class GatewayStartupMixin:
         free-tier bootstrap) read profile-scoped secrets; an unscoped read under multiplex fails
         closed, so routing overrides resolve as absent and default routing applies. ``copy_context``
         carries the contextvars across the executor hop; single-profile keeps environ semantics."""
-        loop = asyncio.get_running_loop()
+        offload = partial(native_session_offload, self)
         if getattr(self.config, "multiplex_profiles", False):
             from gateway.run import _async_profile_runtime_scope
             from hermes_constants import get_hermes_home
             try:
-                async with _async_profile_runtime_scope(get_hermes_home()):
-                    return await loop.run_in_executor(None, copy_context().run, fn)
+                async with _async_profile_runtime_scope(get_hermes_home(), offload=offload):
+                    return await offload(fn)
             except Exception:
                 # Same fallback as load_gateway_config_for_runner: a scope that cannot be built must not
                 # abort startup; the probe runs unscoped as it did before.
                 logger.debug("multiplex launch-scope entry failed for boot probe %s; running unscoped",
                              getattr(fn, "__name__", fn), exc_info=True)
-        return await loop.run_in_executor(None, copy_context().run, fn)
+        return await offload(fn)
 
     async def _run_free_tier_bootstrap(self) -> None:
         """The free-tier bootstrap mints the Portal identity through the same profile-scoped routing

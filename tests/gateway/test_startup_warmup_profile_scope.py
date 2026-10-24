@@ -45,6 +45,8 @@ def _probe(seen: dict):
 
 
 class _Runner(GatewayStartupMixin):
+    _track_deferred_agent_worker = gateway_run.GatewayRunner._track_deferred_agent_worker
+
     def __init__(self, *, multiplex: bool):
         self.config = types.SimpleNamespace(multiplex_profiles=multiplex)
 

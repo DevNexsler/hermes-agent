@@ -1121,7 +1121,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._begin_session_run_generation = lambda session_key: 1
     runner._is_session_run_current = lambda session_key, generation: True
     runner._invalidate_session_run_generation = lambda *a, **k: 0
-    runner._claim_active_session_slot = lambda session_key, source: (object(), None)
+    runner._claim_active_session_slot = lambda session_key, source, *, event=None: (object(), None)
     runner._active_session_leases = {}
     runner._busy_ack_ts = {}
     runner._post_turn_goal_continuation = AsyncMock()
