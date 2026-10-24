@@ -435,7 +435,7 @@ Related nested reservations share one monotonic effect history, including adopte
 run after the nested scope exits. False/error/BaseException/cancellation never restores parent
 no-effect proof. Explicit independent human/goal/producer scopes retain separate admission and
 history; sharing effect history grants no additional permission.
-Preflight refuses pending clarify/update/slash-confirm prompts before Base can acknowledge
+Preflight refuses pending clarify/update/slash-confirm/tool-approval prompts before Base can acknowledge
 background dispatch; core resolver guards cover direct callers too. Unleased human replies retain
 their existing control behavior.
 
@@ -456,6 +456,8 @@ crash and cancellation never rewind, automatically retry or drop after a failure
 and shows owner/attempt/cursors. Private attention never travels in platform send metadata.
 Owner identifies the exact profile/subscriber principal; rollout must map this to a named
 accountable operator and preserve actionable handoff, not claim a human assignment was automatic.
+Claim compares the complete subscription generation under its writer lock. Concurrent ownership
+or routing changes defer the claim until a later collection resolves the new profile/home.
 
 Only an unchanged owned attention+cursor can settle successful delivery. Proven pre-effect
 refusal clears its exact attempt and rewinds only its owned cursor; independently committed ping
@@ -483,7 +485,9 @@ Embedded dispatcher reserves its complete decomposition/claim/spawn tick before 
 Repeated cancellation waits for admitted physical tick completion before releasing singleton lock.
 Strict status also reads machine-shared board claims and task/run worker records without schema
 initialization, reconciliation or signals: running/orphan claims, live terminal workers and
-unverifiable foreign-host workers prevent zero; unreadable stores mean unknown. This inventory
+unverifiable foreign-host workers prevent zero; unreadable stores mean unknown. Retained DBs under
+the supported `boards/_archived/` location stay in this read-only inventory after board removal.
+This inventory
 does not fence independent dispatcher processes. Coordinator must verify their exclusion and
 actual machine-shared dispatcher-lock ownership alongside every served home's cron tick lock.
 

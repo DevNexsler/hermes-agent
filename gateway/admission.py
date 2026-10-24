@@ -223,10 +223,10 @@ async def prepare_ingress_dispatch(adapter, event, session_key):
     runner = adapter.gateway_runner
     if not ingress_admitted(runner) or startup_resume_admitted(runner, event, session_key):
         return False
-    from tools import clarify_gateway, slash_confirm
+    from tools import approval, clarify_gateway, slash_confirm
     state = runner._peek_session_state(session_key)
     if (clarify_gateway.get_pending_for_session(session_key, include_choice_prompts=True) is not None
-            or slash_confirm.get_pending(session_key)
+            or slash_confirm.get_pending(session_key) or approval.has_blocking_approval(session_key)
             or (state is not None and state.persistent.update_prompt_pending)):
         refuse_control_ingress(runner)
     busy = session_key in adapter._active_sessions or runner._is_session_running(session_key)

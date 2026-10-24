@@ -8,6 +8,25 @@ Independent dispatcher processes still require coordinator exclusion/lock owners
 import sqlite3
 
 
+def _retained_board_paths(kb):
+    """Inventory supported live and archived board locations; unreadability raises."""
+    paths = {kb.kanban_db_path(board['slug']).resolve()
+             for board in kb.list_boards(include_archived=True)}
+    archive_root = kb.boards_root() / '_archived'
+    try:
+        archive_root.stat()
+    except FileNotFoundError:
+        return paths
+    for directory in archive_root.iterdir():
+        # remove_board archives whole directories, including live worker records.
+        # stat/iterdir raise on unreadability rather than silently omitting stores.
+        if directory.is_dir():
+            for entry in directory.iterdir():
+                if entry.name == 'kanban.db':
+                    paths.add(entry.resolve())
+    return paths
+
+
 def kanban_worker_work_count():
     """Unknown/unreadable stores raise; no migration, reconciliation or signals."""
     from hermes_cli import kanban_db as kb
@@ -21,8 +40,7 @@ def kanban_worker_work_count():
     else:
         # list_boards' is_dir probe alone can conceal an unreadable directory.
         list(root.iterdir())
-    paths = {kb.kanban_db_path(board['slug']).resolve()
-             for board in kb.list_boards(include_archived=True)}
+    paths = _retained_board_paths(kb)
     total = 0
     for path in paths:
         try:

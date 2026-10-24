@@ -539,6 +539,8 @@ class GatewayBusySessionMixin:
             # The busy-handler path does not auto-send that return, so we deliver it ourselves (mirroring
             # the draining-case send above).
             if event.allow_gateway_control and has_blocking_approval(session_key):
+                from gateway.admission import refuse_control_ingress
+                refuse_control_ingress(self)
                 _raw_text = (event.text or "").strip().lower()
                 _match = self._PLAINTEXT_APPROVAL_WORDS.get(_raw_text)
                 if _match is not None:
@@ -562,6 +564,8 @@ class GatewayBusySessionMixin:
                             await self._send_busy_reply(event, _adapter, _text, plain_anchor=True)
                     return True
         except Exception:
+            if ingress_admitted(self):
+                raise
             logger.warning(
                 "Plain-text approval routing failed for session %s; "
                 "falling through to busy handling", session_key, exc_info=True,

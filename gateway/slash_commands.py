@@ -1176,6 +1176,8 @@ class GatewaySlashCommandsMixin(
         """``(session_key, None)`` when an agent thread is blocked on approval, else the reply to send.
         A pending-approvals entry with no blocked thread is a stale prompt: drop it and say so."""
         from tools.approval import has_blocking_approval
+        from gateway.admission import refuse_control_ingress
+        refuse_control_ingress(self)
         session_key = self._session_key_for_source(event.source)
         if has_blocking_approval(session_key):
             return session_key, None

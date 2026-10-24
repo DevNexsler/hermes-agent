@@ -295,6 +295,7 @@ class _Collector:
         old_cursor, cursor, events, claimed_sub, task = _kbn().claim_notify_delivery(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+            expected_subscription=sub,
             attention_context={'owner': f"profile:{profile}/{platform}:subscriber:{sub.get('user_id') or sub['chat_id']}",
                                'profile': profile, 'profile_home': str(profile_home), 'board': slug},
         )

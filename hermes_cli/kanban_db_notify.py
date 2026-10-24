@@ -380,6 +380,7 @@ def _claim_notify_events(
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
     attention_context: Optional[dict] = None,
+    expected_subscription: Optional[dict] = None,
 ) -> tuple[int, int, list[Event], Optional[dict], Optional[Task]]:
     """Claim cursor/events plus subscription/task snapshots under one writer lock.
 
@@ -393,6 +394,12 @@ def _claim_notify_events(
         if not isinstance(metadata, dict):
             raise ValueError('notification metadata unreadable')
         old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
+        if expected_subscription is not None:
+            current = dict(row, delivery_metadata=metadata) if row is not None else None
+            if current != expected_subscription:
+                # Routing/home were resolved from this generation before the writer lock.
+                # A changed subscription must be freshly routed on the next collection.
+                return old_cursor or 0, old_cursor or 0, [], None, None
         if 'notification_attention_v1' in metadata:
             return old_cursor or 0, old_cursor or 0, [], None, None
         if old_cursor is None:
