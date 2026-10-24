@@ -62,7 +62,16 @@ class GatewayGoalCommandsMixin:
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
-            self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
+            inputs = self._goal_input_snapshot(event)
+            if await self._defer_goal_for_maintenance(mgr, event.source, result.prompt, '', input_context=inputs):
+                return mgr.status_line()
+            try:
+                self._enqueue_goal_turn(event, result.prompt, label="command enqueue",
+                                        kickoff=result.kickoff, session_id=mgr.session_id, goal_state=mgr.state.to_json())
+            except Exception:
+                if await self._defer_goal_for_maintenance(mgr, event.source, result.prompt, '', input_context=inputs):
+                    return mgr.status_line()
+                raise
         return result.output
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
@@ -74,7 +83,7 @@ class GatewayGoalCommandsMixin:
             logger.debug("goal %s: pending continuation cleanup failed: %s", verb, exc)
 
     def _enqueue_goal_turn(
-        self, event: MessageEvent, text: str, *, label: str, kickoff: bool
+        self, event: MessageEvent, text: str, *, label: str, kickoff: bool, session_id: str, goal_state: str
     ) -> None:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
@@ -91,8 +100,15 @@ class GatewayGoalCommandsMixin:
                     message_id=event.message_id if kickoff else None,
                     channel_prompt=event.channel_prompt if kickoff else None,
                 )
-                self._enqueue_fifo(quick_key, turn, adapter)
+                turn._goal_admission_checkpoint = {'session_id': session_id, 'goal_state': goal_state, 'final_response': '',
+                                                   'input_context': self._goal_input_snapshot(event)}
+                from gateway.admission import native_producer_ingress, without_gateway_ingress
+                with native_producer_ingress(self), without_gateway_ingress():
+                    self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
+            from gateway.admission import GatewayDraining
+            if isinstance(exc, GatewayDraining):
+                raise
             logger.debug("goal %s failed: %s", label, exc)
 
     async def _handle_heartbeat_command(self, event: MessageEvent) -> str:

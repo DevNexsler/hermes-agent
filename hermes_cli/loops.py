@@ -283,6 +283,27 @@ def load_loop(session_id: str) -> Optional[LoopState]:
     return _parse_state(raw, session_id) if raw else None
 
 
+def _confirmed_loop_state(raw: str) -> LoopState:
+    from hermes_cli.session_state_io import parse_confirmed_json, values_preserved
+    data = parse_confirmed_json(raw)
+    if not isinstance(data, dict) or data.keys() - LoopState.__dataclass_fields__.keys():
+        raise ValueError('loop checkpoint structure unconfirmed')
+    state = LoopState.from_json(raw)
+    json.dumps(asdict(state), allow_nan=False)
+    if not values_preserved(data, asdict(state)):
+        raise ValueError('loop checkpoint normalization would change stored inputs')
+    if (state.status not in ('active', 'paused', 'done', 'cleared')
+            or state.mode not in ('interval', 'self_paced') or not isinstance(state.prompt, str)
+            or (state.status in ('active', 'paused') and not state.prompt.strip())
+            or any(value is not None and not isinstance(value, str)
+                   for value in (state.paused_reason, state.last_stop_reason))
+            or not isinstance(state.route, dict)
+            or any(not isinstance(k, str) or (v is not None and not isinstance(v, str))
+                   for k, v in state.route.items())):
+        raise ValueError('loop checkpoint identity unconfirmed')
+    return state
+
+
 def save_loop(session_id: str, state: LoopState) -> None:
     """Persist a loop to SessionDB. No-op if DB unavailable."""
     if not session_id:
@@ -304,12 +325,23 @@ def clear_loop(session_id: str) -> None:
         save_loop(session_id, state)
 
 
-def list_active_loops() -> List[Tuple[str, LoopState]]:
+def list_active_loops(*, strict: bool = False) -> List[Tuple[str, LoopState]]:
     """``[(session_id, LoopState), ...]`` for every ACTIVE loop; ``[]`` on any DB error.
 
     Used by the gateway's idle wakeup watcher, which scans for due loops on a coarse tick.
     """
     db = _get_session_db()
+    if strict:
+        from gateway.admission import mark_native_work_uncertain
+        try:
+            if db is None:
+                raise RuntimeError('automatic loop scan store unavailable')
+            return [(key[len(_META_PREFIX):], state)
+                    for key, raw in db.list_meta_prefix(_META_PREFIX)
+                    if (state := _confirmed_loop_state(raw)).status == 'active']
+        except BaseException:
+            mark_native_work_uncertain()
+            raise
     if db is None:
         return []
     out: List[Tuple[str, LoopState]] = []
@@ -332,31 +364,12 @@ def store_has_active_loop(db: Any) -> bool:
     return False
 
 
-def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a /loop from a parent session to its continuation. Best-effort, never raises.
-
-    Context compression rotates ``session_id`` to a fresh child; without this the loop silently
-    dies at the compaction boundary.
-
-    Copies the loop onto the new session and archives the old row as ``cleared`` so exactly one active loop
-    row exists per logical conversation. See #33618.
-    """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
-        return False
-    try:
-        state = load_loop(old_session_id)
-        if state is None or state.status == "cleared" or load_loop(new_session_id) is not None:
-            return False
-        save_loop(new_session_id, state)
-        clear_loop(old_session_id)
-        logger.debug(
-            "LoopManager: migrated loop %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
-        )
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("LoopManager: loop migration failed: %s", exc)
-        return False
+def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason: str = "",
+                            db=None, strict: bool = False) -> bool:
+    """Transfer exact validated loop state in one checked writer transaction."""
+    from hermes_cli.session_state_io import migrate_confirmed_state
+    return migrate_confirmed_state('loop:', old_session_id, new_session_id, _confirmed_loop_state,
+                                    db=db, strict=strict)
 
 
 def _ticks_label(n: int) -> str:
@@ -391,9 +404,16 @@ class LoopManager:
     evaluate the finished turn, and ``status_line()``.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, *, strict: bool = False):
         self.session_id = session_id
-        self._state: Optional[LoopState] = load_loop(session_id)
+        self._strict = strict
+        if strict:
+            from hermes_cli.session_state_io import load_confirmed_state
+            self._state_db = _get_session_db()
+            self._state, self._expected_raw = load_confirmed_state(
+                self._state_db, _meta_key(session_id), _confirmed_loop_state)
+        else:
+            self._state: Optional[LoopState] = load_loop(session_id)
 
     @property
     def state(self) -> Optional[LoopState]:
@@ -401,7 +421,12 @@ class LoopManager:
 
     def refresh(self) -> None:
         """Re-read state from the DB (cross-process safety for the gateway)."""
-        self._state = load_loop(self.session_id)
+        if self._strict:
+            from hermes_cli.session_state_io import load_confirmed_state
+            self._state, self._expected_raw = load_confirmed_state(
+                self._state_db, _meta_key(self.session_id), _confirmed_loop_state)
+        else:
+            self._state = load_loop(self.session_id)
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -410,7 +435,13 @@ class LoopManager:
         return self._state is not None and self._state.status in {"active", "paused"}
 
     def _save(self) -> LoopState:
-        save_loop(self.session_id, self._state)
+        if self._strict:
+            from hermes_cli.session_state_io import save_confirmed_state
+            raw = self._state.to_json()
+            save_confirmed_state(self._state_db, _meta_key(self.session_id), self._expected_raw, raw)
+            self._expected_raw = raw
+        else:
+            save_loop(self.session_id, self._state)
         return self._state
 
     def status_line(self) -> str:
@@ -610,7 +641,7 @@ class LoopManager:
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 
 
-def goal_blocks_loop_tick(session_id: str) -> bool:
+def goal_blocks_loop_tick(session_id: str, *, strict: bool = False) -> bool:
     """True when an ACTIVE, non-parked /goal should defer this session's /loop tick.
 
     Both features inject synthetic turns at idle boundaries; interleaving them would burn the
@@ -619,9 +650,13 @@ def goal_blocks_loop_tick(session_id: str) -> bool:
     try:
         from hermes_cli.goals import GoalManager
 
-        mgr = GoalManager(session_id=session_id)
-        return mgr.is_active() and not mgr.is_waiting()
+        mgr = GoalManager(session_id=session_id, strict=strict)
+        return mgr.is_active() and not mgr.is_waiting(clear_satisfied=False)
     except Exception:
+        if strict:
+            from gateway.admission import mark_native_work_uncertain
+            mark_native_work_uncertain()
+            raise
         return False
 
 

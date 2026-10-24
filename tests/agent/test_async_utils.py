@@ -7,9 +7,10 @@ import gc
 import warnings
 from concurrent.futures import Future
 from unittest.mock import patch
+import pytest
 
 
-from agent.async_utils import safe_schedule_threadsafe
+from agent.async_utils import safe_schedule_threadsafe, threadsafe_future_owner
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +37,24 @@ def _no_unawaited_warnings(caught, *, coro_name: str = "") -> bool:
 # ---------------------------------------------------------------------------
 
 class TestSafeScheduleThreadsafe:
+    @pytest.mark.asyncio
+    async def test_scoped_owner_tracks_only_its_real_future(self):
+        loop, owned = asyncio.get_running_loop(), []
+
+        async def sample():
+            await asyncio.sleep(0)
+            return 'exact synthetic result'
+
+        def submit():
+            with threadsafe_future_owner(owned.append):
+                first = safe_schedule_threadsafe(sample(), loop)
+            second = safe_schedule_threadsafe(sample(), loop)
+            assert first.result(5) == second.result(5) == 'exact synthetic result'
+            return first, second
+
+        first, second = await asyncio.to_thread(submit)
+        assert owned == [first] and second is not first
+
     def test_returns_future_on_success(self):
         loop = asyncio.new_event_loop()
         try:

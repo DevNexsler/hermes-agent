@@ -21,6 +21,7 @@ import types
 import pytest
 
 import gateway.run as run
+from tests.gateway.restart_test_helpers import install_watcher_admission
 
 
 class _RecordingSessionDB:
@@ -72,18 +73,7 @@ def _make_fake_runner(session_db, *, fail_process=False):
 
     fake = types.SimpleNamespace()
     fake._session_db = AsyncSessionDB(session_db)
-    # _running yields True for the first loop check, then False so the loop
-    # exits after a single tick.
-    states = iter([True, False])
-
-    class _Running:
-        def __bool__(_self):
-            try:
-                return next(states)
-            except StopIteration:
-                return False
-
-    fake._running = _Running()
+    # The explicit admission fixture installs real readiness flags and a bounded poll clock.
 
     async def _process_handoff(row):
         if fail_process:
@@ -100,7 +90,8 @@ async def _run_one_tick(fake, monkeypatch):
         return None
 
     monkeypatch.setattr(run.asyncio, "sleep", _no_sleep)
-    # Bind the real (patched) method onto our minimal stand-in.
+    install_watcher_admission(fake, monkeypatch)
+    # Bind the real method onto our minimal stand-in.
     coro = run.GatewayRunner._handoff_watcher(fake, interval=0.0)
     await asyncio.wait_for(coro, timeout=5)
 

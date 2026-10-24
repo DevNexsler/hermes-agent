@@ -75,6 +75,8 @@ def _make_runner_with_adapter(session_id: str = None):
     import uuid
 
     runner = object.__new__(GatewayRunner)
+    from tests.gateway.restart_test_helpers import install_native_admission
+    install_native_admission(runner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
     )

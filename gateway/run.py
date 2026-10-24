@@ -10,6 +10,8 @@ except ModuleNotFoundError:
     pass  # a partial ``hermes update`` can leave the bootstrap unregistered; only Windows UTF-8 stdio suffers
 
 import asyncio
+from gateway.admission import native_to_thread, native_session_offload
+from functools import partial
 import concurrent.futures
 import dataclasses
 import json
@@ -1843,9 +1845,9 @@ def _profile_runtime_scope(
 
 
 @_asynccontextmanager
-async def _async_profile_runtime_scope(profile_home: "Path"):
+async def _async_profile_runtime_scope(profile_home: "Path", *, offload=None):
     """Enter a profile scope without loading secret files on the event loop."""
-    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
+    secrets = await (offload or native_to_thread)(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
 
@@ -1895,15 +1897,14 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
     """
     from tools.mcp_oauth import suppress_interactive_oauth
     from tools.mcp_tool_discovery import discover_mcp_tools
-    loop = asyncio.get_running_loop()
     with suppress_interactive_oauth():
         if not getattr(config, "multiplex_profiles", False):
-            await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+            await native_to_thread(discover_mcp_tools)
             return
         for profile_name, profile_home in _multiplex_profile_homes(config):
             try:
                 with _profile_runtime_scope(Path(profile_home)):
-                    await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+                    await native_to_thread(discover_mcp_tools)
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
@@ -2583,7 +2584,7 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
                     frames = wf.getnframes()
                     rate = wf.getframerate() or 1
                     return frames / float(rate)
-            return _format_duration(await asyncio.to_thread(_wav_duration))
+            return _format_duration(await native_to_thread(_wav_duration))
         except Exception:
             pass
     if ext in (".ogg", ".opus", ".oga"):
@@ -2591,7 +2592,7 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
             def _ogg_duration() -> float:
                 from mutagen.oggopus import OggOpus
                 return float(OggOpus(path).info.length)
-            return _format_duration(await asyncio.to_thread(_ogg_duration))
+            return _format_duration(await native_to_thread(_ogg_duration))
         except Exception:
             pass
     try:
@@ -3559,8 +3560,7 @@ class GatewayRunner(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key))
-        # Loop-side boundary: sync helpers use ``session_store`` directly; async handlers await this facade.
-        self._async_session_store = AsyncSessionStore(self.session_store)
+        self._async_session_store = AsyncSessionStore(self.session_store, offload=partial(native_session_offload, self))
         self.delivery_router = DeliveryRouter(self.config)
 
     def _init_lifecycle_state(self) -> None:
@@ -3572,11 +3572,11 @@ class GatewayRunner(
         self._exit_code: Optional[int] = None
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
-        # External (NAS-driven) drain, distinct from one-way ``_draining``: set while ``.drain_request.json``
-        # exists — NEW turns refused, process stays up, removing the marker reverts to ``running``.
+        # Reversible admission drain is separate from one-way shutdown.
         self._external_drain_active = False
-        # ``_signal_initiated_shutdown``: SIGTERM/SIGINT with no planned-stop/takeover marker (container,
-        # OOM, bare kill); _stop_impl must NOT persist gateway_state=stopped or container_boot won't restart.
+        from gateway.admission import initialize_gateway_admission
+        initialize_gateway_admission(self)
+        # Unplanned signals must not persist stopped or container_boot won't restart.
         self._restart_requested = self._signal_initiated_shutdown = self._restart_task_started = False
         self._restart_detached = self._restart_via_service = self._detached_restart_helper_started = False
         self._restart_command_source: Optional[SessionSource] = None
@@ -3806,16 +3806,11 @@ class GatewayRunner(
         def _open():
             # Borrow the SessionStore's handle (same path) so state.db doesn't get two writers/pools.
             # The store owns/sweeps it at shutdown; this cache holds only the async wrapper (close_all).
-            # Both caches resolve the SAME ``_default_db_path()``, so the process was holding two writer
-            # connections and two read pools against one state.db — the fd budget doubled for nothing, and
-            # doubled again per profile on a multiplexed gateway (#98573). A borrowed wrapper cannot go
-            # stale in practice: the store's cache only drops handles in close_all_db_handles() (shutdown),
-            # and while the store's own open is failing there is nothing to borrow, so nothing is cached
-            # here either.
+            # Borrowed handles stay valid until the store's shutdown sweep (#98573).
             store = getattr(self, "session_store", None)
             borrowed = getattr(store, "_db", None) if store is not None else None
             if borrowed is not None:
-                wrapper = AsyncSessionDB(borrowed)
+                wrapper = AsyncSessionDB(borrowed, offload=partial(native_session_offload, self))
                 # close_all_session_db_handles() must not close what the store owns (its sweep runs first).
                 wrapper.__dict__["_hermes_borrowed_handle"] = True
                 return wrapper
@@ -3823,7 +3818,7 @@ class GatewayRunner(
                 # Store handle unavailable: opening our own would resurrect the duplicate borrowed away.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                return AsyncSessionDB(acquire())
+                return AsyncSessionDB(acquire(), offload=partial(native_session_offload, self))
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise
@@ -4130,7 +4125,7 @@ class GatewayRunner(
         """Return the single async facade for this runner's SessionStore."""
         facade = getattr(self, "_async_session_store", None)
         if facade is None or facade._store is not self.session_store:
-            facade = AsyncSessionStore(self.session_store)
+            facade = AsyncSessionStore(self.session_store, offload=partial(native_session_offload, self))
             self._async_session_store = facade
         return facade
 
@@ -4308,9 +4303,8 @@ class GatewayRunner(
 
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
-        loop = asyncio.get_running_loop()
-        ctx = copy_context()
-        return await loop.run_in_executor(self._get_executor(), ctx.run, func, *args)
+        from gateway.admission import native_in_executor
+        return await native_in_executor(self, self._get_executor(), func, *args)
 
     async def _run_housekeeping_in_executor(self, func, *args):
         """Run best-effort session housekeeping off the TURN pool.
@@ -4324,9 +4318,8 @@ class GatewayRunner(
         its own bounded pool; exhausting that one delays only more housekeeping, which is
         best-effort by construction.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._get_housekeeping_executor(), copy_context().run, func, *args)
+        from gateway.admission import native_in_executor
+        return await native_in_executor(self, self._get_housekeeping_executor(), func, *args)
 
     def _get_or_create_pool(self, attr: str, max_workers: int, prefix: str) -> concurrent.futures.ThreadPoolExecutor:
         """Return (creating under ``_executor_lock``) the pool at ``attr``; one lock + closing flag fences both."""
@@ -4612,13 +4605,13 @@ def _housekeeping_chore(label: str, fn, *args, **kwargs) -> None:
         logger.debug("%s error: %s", label, exc)
 
 
-def _housekeeping_channel_directory(adapters, loop) -> None:
-    from gateway.channel_directory import build_channel_directory
+def _housekeeping_channel_directory(adapters, loop, runner=None) -> None:
+    from gateway.channel_directory import _housekeeping_directory_refresh
     if loop is not None:
         # build_channel_directory is async (Slack web calls) and this is a background thread:
         # schedule onto the gateway loop and wait briefly so refresh failures still log.
         fut = safe_schedule_threadsafe(
-            build_channel_directory(adapters), loop, logger=logger,
+            _housekeeping_directory_refresh(adapters, runner), loop, logger=logger,
             log_message="Channel directory refresh scheduling error")
         if fut is not None:
             fut.result(timeout=30)
@@ -4804,6 +4797,8 @@ def _start_gateway_housekeeping(
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+    from gateway.run_watchers import owned_housekeeping_chore
+    chore = partial(owned_housekeeping_chore, runner)
     chores: list[tuple[int, str, Any]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
@@ -4815,7 +4810,7 @@ def _start_gateway_housekeeping(
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
     chores += [
-        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
+        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop, runner)),
         (60, "Media cache cleanup", _housekeeping_media_caches),
         (60, "Paste sweep", _housekeeping_paste_sweep)]
     if cron_provider is not None:
@@ -4857,8 +4852,8 @@ def _start_gateway_housekeeping(
         tick_count += 1
         for every, label, fn in chores:
             if tick_count % every == 0:
-                _housekeeping_chore(label, fn)
-        wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
+                chore(label, fn)
+        wait_for_next_tick(stop_event, interval, queue_watch, chore)
     logger.info("Gateway housekeeping stopped")
 
 

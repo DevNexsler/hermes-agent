@@ -19,7 +19,10 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    from gateway.status_writer import RuntimeStatusWriter
 
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
 from utils import atomic_json_write
@@ -47,103 +50,6 @@ _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple, Opt
 logger = logging.getLogger(__name__)
 
 
-class _RuntimeStatusWriter:
-    """Persist the latest complete status snapshot on one daemon thread.
-
-    Runtime status is diagnostic state, not an event log. While one write is
-    blocked in filesystem I/O, newer submissions replace the single pending
-    snapshot. This bounds memory and keeps every status producer off asyncio.
-    """
-
-    def __init__(self, write_fn: Optional[Callable[[Path, dict[str, Any]], None]] = None):
-        self._write_fn = write_fn
-        self._condition = threading.Condition()
-        self._pending: Optional[tuple[int, Path, dict[str, Any]]] = None
-        self._writing_generation = 0
-        self._submitted_generation = 0
-        self._completed_generation = 0
-        self._successful_generation = 0
-        self._last_error: Optional[BaseException] = None
-        self._failure_logged = False
-        self._thread: Optional[threading.Thread] = None
-
-    def submit(self, path: Path, payload: dict[str, Any]) -> int:
-        with self._condition:
-            self._submitted_generation += 1
-            generation = self._submitted_generation
-            self._pending = (generation, path, copy.deepcopy(payload))
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(
-                    target=self._run, daemon=True, name="gateway-runtime-status-writer")
-                self._thread.start()
-            self._condition.notify_all()
-            return generation
-
-    def wait(self, generation: int, timeout: Optional[float] = None) -> bool:
-        """Block until ``generation`` (or a later snapshot) is persisted; ``False`` on timeout/failure."""
-        deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
-        with self._condition:
-            while (state := self.settled(generation)) is None:
-                if deadline is None:
-                    self._condition.wait()
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(timeout=remaining)
-            if not state and timeout is None and self._last_error is not None:
-                raise self._last_error
-            return state
-
-    def flush(self, timeout: float = 2.0) -> bool:
-        with self._condition:
-            generation = self._submitted_generation
-        return generation == 0 or self.wait(generation, timeout=timeout)
-
-    def settled(self, generation: int) -> Optional[bool]:
-        """``True`` once ``generation`` persisted, ``False`` once it can no longer, else ``None``."""
-        with self._condition:
-            if self._successful_generation >= generation:
-                return True
-            no_more_work = (
-                self._completed_generation >= generation
-                and self._writing_generation == 0
-                and self._pending is None
-            )
-            return False if no_more_work else None
-
-    def _run(self) -> None:
-        while True:
-            with self._condition:
-                while self._pending is None:
-                    self._condition.wait()
-                generation, path, payload = self._pending
-                self._pending = None
-                self._writing_generation = generation
-            error: Optional[BaseException] = None
-            try:
-                (self._write_fn or _write_json_file)(path, _merge_over_on_disk(path, payload))
-            except BaseException as exc:
-                error = exc
-            with self._condition:
-                self._writing_generation = 0
-                self._completed_generation = max(self._completed_generation, generation)
-                if error is None:
-                    self._successful_generation = max(self._successful_generation, generation)
-                    self._last_error = None
-                else:
-                    self._last_error = error
-                self._condition.notify_all()
-            if error is None:
-                if self._failure_logged:
-                    logger.info("Gateway runtime-status persistence recovered")
-                    self._failure_logged = False
-            elif not self._failure_logged:
-                logger.warning(
-                    "Failed to persist gateway runtime status; later updates will retry: %s", error)
-                self._failure_logged = True
-            else:
-                logger.debug("Failed to persist gateway runtime status: %s", error)
 
 
 _runtime_status_state_lock = threading.RLock()
@@ -159,15 +65,16 @@ def _merge_over_on_disk(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     return {**existing, **payload} if isinstance(existing, dict) else payload
 
 
-_runtime_status_writer: Optional[_RuntimeStatusWriter] = None
+_runtime_status_writer: Optional['RuntimeStatusWriter'] = None
 
 
-def _get_runtime_status_writer() -> _RuntimeStatusWriter:
+def _get_runtime_status_writer() -> 'RuntimeStatusWriter':
     """Lazily create the single writer; callers serialise on ``_runtime_status_state_lock``."""
     global _runtime_status_writer
+    from gateway.status_writer import RuntimeStatusWriter
     with _runtime_status_state_lock:
         if _runtime_status_writer is None:
-            _runtime_status_writer = _RuntimeStatusWriter()
+            _runtime_status_writer = RuntimeStatusWriter()
         return _runtime_status_writer
 
 

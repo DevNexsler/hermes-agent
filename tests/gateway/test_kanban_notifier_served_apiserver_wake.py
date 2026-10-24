@@ -152,16 +152,8 @@ def _unseen(task, chat_id=SESSION):
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(delay):
-        if delay == 5:
-            return None
-        runner._running = False
-        await real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    from tests.gateway.restart_test_helpers import run_one_notifier_tick
+    await run_one_notifier_tick(runner, monkeypatch)
 
 
 def _api_sub(chat_id=SESSION, profile="builder"):

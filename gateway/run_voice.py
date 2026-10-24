@@ -5,6 +5,7 @@ the MRO). ``gateway.run`` internals are imported lazily inside method bodies (im
 from __future__ import annotations
 
 import asyncio
+from gateway.admission import native_to_thread
 import functools
 import json
 import logging
@@ -339,7 +340,7 @@ class GatewayVoiceMixin:
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an
             # explicit .ogg path; the TTS tool's container repair guarantees real Ogg/Opus bytes.
             audio_path = build_auto_tts_output_path(event.source.platform)
-            raw = await asyncio.to_thread(text_to_speech_tool, text=tts_text,
+            raw = await native_to_thread(text_to_speech_tool, text=tts_text,
                                           output_path=audio_path)
             try:
                 result = json.loads(raw)

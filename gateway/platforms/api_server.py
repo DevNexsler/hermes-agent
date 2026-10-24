@@ -14,7 +14,7 @@ import hmac
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar
 from functools import wraps
 import logging
 import os
@@ -603,10 +603,11 @@ def _reap_disconnected_agent_processes(
             return current is None or current == _epoch
         is_still_current = _epoch_still_current
     from gateway.run import _reap_gateway_turn_processes
-    threading.Thread(
-        target=copy_context().run, args=(_reap_gateway_turn_processes, process_task_id, process_baseline),
-        kwargs={"source": source, "is_still_current": is_still_current},
-        name=f"api-turn-reaper-{process_task_id[:12]}", daemon=True).start()
+    from gateway.platforms.api_server_runs import _start_api_worker_thread
+    _start_api_worker_thread(
+        _reap_gateway_turn_processes, process_task_id, process_baseline,
+        source=source, is_still_current=is_still_current,
+        name=f"api-turn-reaper-{process_task_id[:12]}")
 
 
 # Per-task-id run epochs for the reap gate: monotonic counter (never reused),
@@ -1229,18 +1230,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
-        # Per-profile single-flight locks for the off-loop store construction in
-        # _artifact_store_for_async(); a lost race would strand receipts (in-memory index).
+        # Per-profile _artifact_store_for_async locks prevent stranded in-memory receipts.
         self._browser_control_artifact_locks: Dict[str, asyncio.Lock] = {}
 
-    def active_agent_work_count(self) -> int:
-        """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
-        (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
+    def active_agent_work_count(self, *, strict: bool = False) -> int:
+        """Pending admissions + turns + live tasks; strict reads propagate unavailable counters."""
         try:
-            return (int(getattr(self, "_pending_agent_requests", 0))
+            return (int(self._pending_agent_requests if strict else getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
                     + sum(not task.done() for task in self._active_run_tasks.values()))
         except Exception:
+            if strict:
+                raise
             return 0
 
     def interrupt_active_runs(self, reason: str) -> int:

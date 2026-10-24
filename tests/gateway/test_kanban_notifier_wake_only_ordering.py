@@ -22,6 +22,9 @@ from hermes_cli import kanban_db_notify as kbn
 class RecordingAdapter:
     """Push-capable adapter (no supports_async_delivery attr => push)."""
 
+    from gateway.platforms.base import BasePlatformAdapter
+    extract_local_files = staticmethod(BasePlatformAdapter.extract_local_files)
+
     def __init__(self):
         self.sent = []
         self.handled = []
@@ -57,7 +60,8 @@ async def _run_one_notifier_tick(monkeypatch, runner):
 
 def _make_runner(adapter):
     runner = GatewayRunner.__new__(GatewayRunner)
-    runner._running = True
+    from tests.gateway.restart_test_helpers import install_native_admission
+    install_native_admission(runner)
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
     runner._kanban_dispatcher_lock_handle = object()
@@ -128,76 +132,46 @@ def test_wake_only_success_advances_cursor_single_wake(tmp_path, monkeypatch):
     assert runner._kanban_sub_fail_counts == {}
 
 
-def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
-    """Wake fails: cursor rewound, counter bumped, event retried next tick."""
+def test_generic_wake_failure_retains_unknown_without_retry(tmp_path, monkeypatch):
+    """Semantic change: generic effects are UNKNOWN, never failure-budget retries."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-fail.db"))
     kb.init_db()
     tid = _make_completed_task("wake")
-
     adapter = FailingWakeAdapter()
     runner = _make_runner(adapter)
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert len(adapter.handled) == 1, "one wake attempt on the first tick"
-    events = _unseen_terminal_events(tid)
-    assert len(events) == 1, (
-        "a failed wake-only delivery must REWIND the claim so the event "
-        "is redelivered on a later tick — it was permanently lost before "
-        "this fix (cursor advanced before the best-effort wake)"
-    )
-    assert list(runner._kanban_sub_fail_counts.values()) == [1], (
-        "failure counter must bump on a failed wake-only delivery"
-    )
-    assert len(_subs(tid)) == 1, "one transient failure must not drop the sub"
-
-    # Next tick: the same event is claimed and the wake retried.
-    runner2 = _make_runner(adapter)
-    runner2._kanban_sub_fail_counts = runner._kanban_sub_fail_counts
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner2))
-    assert len(adapter.handled) == 2, "event must be redelivered next tick"
-    assert list(runner2._kanban_sub_fail_counts.values()) == [2]
+    for _ in range(13):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.handled) == 1
+    assert len(_subs(tid)) == 1
+    assert 'notification_attention_v1' in _subs(tid)[0]['delivery_metadata']
+    assert runner._kanban_sub_fail_counts == {}
 
 
-def test_notify_wake_failure_retries_without_repeating_ping(tmp_path, monkeypatch):
-    """notify+wake requires both deliveries, retaining the sent-ping checkpoint."""
+def test_notify_wake_generic_failure_retains_ping_and_attention(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake.db"))
     kb.init_db()
     tid = _make_completed_task("notify+wake")
-
     adapter = FailingWakeAdapter()
     runner = _make_runner(adapter)
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert len(adapter.sent) == 1, "text ping delivered"
-    assert len(adapter.handled) == 1, "wake attempted after the ping"
-    assert len(_unseen_terminal_events(tid)) == 1
-    assert list(runner._kanban_sub_fail_counts.values()) == [1]
-    runner._running = True
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    assert len(adapter.sent) == 1
-    assert len(adapter.handled) == 2
-    assert list(runner._kanban_sub_fail_counts.values()) == [2]
+    for _ in range(2):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == len(adapter.handled) == 1
+    sub = _subs(tid)[0]
+    assert sub['last_ping_event_id'] > 0 and 'notification_attention_v1' in sub['delivery_metadata']
+    assert runner._kanban_sub_fail_counts == {}
+    assert 'notification_attention_v1' not in adapter.sent[0]['metadata']
 
 
-def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
-    """After MAX_SEND_FAILURES consecutive wake failures the sub is dropped."""
+def test_unknown_never_drops_subscription_at_old_failure_cap(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-cap.db"))
     kb.init_db()
     tid = _make_completed_task("wake")
-
     adapter = FailingWakeAdapter()
     runner = _make_runner(adapter)
-    # Simulate 11 prior consecutive failures (MAX_SEND_FAILURES = 12).
-    runner._kanban_sub_fail_counts = {
-        (tid, "telegram", "chat-1", ""): 11,
-    }
+    runner._kanban_sub_fail_counts = {(tid, "telegram", "chat-1", ""): 11}
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert len(adapter.handled) == 1
-    assert _subs(tid) == [], (
-        "subscription must drop after MAX_SEND_FAILURES consecutive "
-        "wake-only delivery failures, like text sends do"
-    )
-    assert runner._kanban_sub_fail_counts == {}, (
-        "counter entry must clear when the subscription is dropped"
-    )
+    assert len(adapter.handled) == 1 and len(_subs(tid)) == 1
+    assert list(runner._kanban_sub_fail_counts.values()) == [11]
+    assert 'notification_attention_v1' in _subs(tid)[0]['delivery_metadata']

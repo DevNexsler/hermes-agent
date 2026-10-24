@@ -12,6 +12,7 @@ on transient errors) so callers can rewind cursors / retry instead of silently l
 from __future__ import annotations
 
 import asyncio
+from gateway.admission import native_to_thread
 import logging
 from typing import Any, Optional
 
@@ -89,7 +90,8 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
+                       notification_category: str = "result", profile: Optional[str] = None,
+                       single_attempt: bool = False) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
@@ -112,6 +114,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
+    if single_attempt:
+        extra['single_attempt'] = True
     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
@@ -156,7 +160,7 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
     ensure = getattr(adapter, "_ensure_session_db", None)
-    db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
+    db: Any = await native_to_thread(ensure) if callable(ensure) else None
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")
@@ -169,12 +173,12 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     resolver = getattr(db, "resolve_resume_session_id", None)
     if callable(resolver):
         try:
-            resolved = await asyncio.to_thread(resolver, session_id)
+            resolved = await native_to_thread(resolver, session_id)
             if resolved:
                 session_id = str(resolved)
         except Exception:
             logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
-    await asyncio.to_thread(
+    await native_to_thread(
         db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
     logger.info(
@@ -184,7 +188,7 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
+                                      profile: Optional[str] = None, single_attempt: bool = False) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -225,7 +229,7 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     if notification_category == "diagnostic":
         payload["hermes_notification_category"] = "diagnostic"
     last_err: Optional[BaseException] = None
-    attempts = 1 + len(_RETRY_DELAYS_SECONDS)
+    attempts = 1 if single_attempt else 1 + len(_RETRY_DELAYS_SECONDS)
     for attempt in range(attempts):
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])

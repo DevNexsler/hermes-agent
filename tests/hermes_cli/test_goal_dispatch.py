@@ -24,9 +24,10 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
         return execute
     if surface == "gateway":
         from gateway.run_busy import GatewayBusySessionMixin
+        from gateway.run_goals import GatewayGoalsMixin
         from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 
-        class Runner(GatewayBusySessionMixin, GatewayGoalCommandsMixin):
+        class Runner(GatewayBusySessionMixin, GatewayGoalCommandsMixin, GatewayGoalsMixin):
             pass
 
         runner = object.__new__(Runner)
@@ -40,7 +41,8 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
         runner._enqueue_goal_turn = lambda event, text, **kwargs: prompts.append(text)
         runner._resume_caller_is_admin = lambda source: True
         def execute(arg):
-            event = SimpleNamespace(get_command_args=lambda: arg, source=None)
+            event = SimpleNamespace(get_command_args=lambda: arg, source=None, message_id=None,
+                                    channel_prompt=None, channel_context=None, raw_message=None)
             if arg == 'show':
                 return asyncio.run(runner._busy_goal_command(event, mgr.session_id, None))
             return asyncio.run(runner._handle_goal_command(event))
@@ -68,6 +70,7 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
     goals._DB_CACHE.clear()
     command = command.format(pid=os.getpid())
     snapshots = []
+    generations = []
     for name in ('cli', surface):
         mgr = goals.GoalManager(session_id=name + '-parity-' + surface)
         mgr.set('original objective')
@@ -80,10 +83,14 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
         if state:
             from dataclasses import asdict
             state = asdict(state)
+            generation = state.pop('generation_id')
+            assert isinstance(generation, str) and generation
+            generations.append(generation)
             for key in ('created_at', 'updated_at', 'waiting_since'):
                 state.pop(key, None)
         snapshots.append(state)
     assert snapshots[0] == snapshots[1]
+    assert len(set(generations)) == len(generations)
 
 
 @pytest.mark.parametrize('surface', ['cli', 'gateway', 'tui'])

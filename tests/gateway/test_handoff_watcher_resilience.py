@@ -23,20 +23,7 @@ from pathlib import Path
 import pytest
 
 from gateway import run
-
-
-def _running_flag(ticks):
-    """A ``_running`` stand-in that is True for ``ticks`` reads, then False."""
-    states = iter([True] * ticks + [False])
-
-    class _Running:
-        def __bool__(_self):
-            try:
-                return next(states)
-            except StopIteration:
-                return False
-
-    return _Running()
+from tests.gateway.restart_test_helpers import install_watcher_admission
 
 
 class _SlowDB:
@@ -100,7 +87,7 @@ async def test_slow_handoff_does_not_block_later_polls(monkeypatch):
 
     fake = types.SimpleNamespace()
     fake._session_db = db
-    fake._running = _running_flag(3)
+    install_watcher_admission(fake, monkeypatch, ticks=3)
     fake._process_handoff = _process_handoff
 
     async def _watch():
@@ -148,7 +135,7 @@ async def test_inflight_row_is_not_claimed_twice(monkeypatch):
 
     fake = types.SimpleNamespace()
     fake._session_db = db
-    fake._running = _running_flag(4)
+    install_watcher_admission(fake, monkeypatch, ticks=4)
     fake._process_handoff = _process_handoff
 
     coro = run.GatewayRunner._handoff_watcher(fake, interval=0.0, drain_timeout=0.01)
@@ -189,7 +176,7 @@ async def test_startup_reclaims_rows_stranded_in_running(monkeypatch):
     db = _ReclaimDB()
     fake = types.SimpleNamespace()
     fake._session_db = db
-    fake._running = _running_flag(1)
+    install_watcher_admission(fake, monkeypatch, ticks=1)
 
     async def _process_handoff(row, profile_name=None):
         return None
@@ -235,7 +222,7 @@ async def test_reclaim_runs_per_profile_store(monkeypatch):
     db = _ReclaimDB(stale_ids=[])
     fake = types.SimpleNamespace()
     fake._session_db = db
-    fake._running = _running_flag(1)
+    install_watcher_admission(fake, monkeypatch, ticks=1)
 
     async def _process_handoff(row, profile_name=None):
         return None

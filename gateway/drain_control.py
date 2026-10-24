@@ -168,6 +168,7 @@ def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any
     except OSError as e:
         if not isinstance(e, FileNotFoundError):
             _log.warning("drain-control: failed to read %s: %s", path, e)
+            return {}
         return None
     try:
         data = json.loads(raw)

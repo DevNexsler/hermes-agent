@@ -567,14 +567,12 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
 
-    def spawn_via_real_boundary(task, workspace, board=None):
-        kbd._restart_safe_worker_argv(task, ["hermes", "chat"])  # raises: real probe verdict, real _degrade()
-        raise AssertionError("unreachable")
+    monkeypatch.setattr(kbd, '_worker_argv', lambda *args: ['hermes', 'chat'])
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="bus is down", assignee="a")
         for _ in range(3):
-            res = kbd.dispatch_once(conn, spawn_fn=spawn_via_real_boundary, failure_limit=2)
+            res = kbd.dispatch_once(conn, failure_limit=2)  # Actual native pre-Popen provenance.
             assert res.auto_blocked == []
         row = conn.execute(
             "SELECT status, block_kind, consecutive_failures, last_failure_error FROM tasks WHERE id = ?", (tid,),
@@ -593,10 +591,12 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
         # Control: an ordinary spawn failure on the same card still spends budget.
         monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
 
-        def spawn_broken(task, workspace, board=None):
-            raise RuntimeError("profile launcher exploded")
+        def missing_executable(*args, **kwargs):
+            raise FileNotFoundError('EXACT inert pre-Popen missing executable')
 
-        kbd.dispatch_once(conn, spawn_fn=spawn_broken, failure_limit=2)
+        monkeypatch.setattr(process_registry, '_is_supervised_gateway_process', lambda: False)
+        monkeypatch.setattr(kbd.subprocess, 'Popen', missing_executable)
+        kbd.dispatch_once(conn, failure_limit=2)
         assert conn.execute(
             "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,),
         ).fetchone()[0] == 1
@@ -1432,11 +1432,11 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
         a = kb.create_task(conn, title="parent-done")
         kb.complete_task(conn, a, result="done")
 
-        # C is running (not done) — blocks child B.
-        c = kb.create_task(conn, title="parent-running")
-        kb.claim_task(conn, c, claimer="worker:1")
+        # An unfinished, explicitly parked parent blocks B without owning live handoff inputs.
+        c = kb.create_task(conn, title="parent-parked")
+        kb.block_task(conn, c, reason='EXACT parked without physical worker')
 
-        # B depends on both A (done) and C (running) → stays todo.
+        # B depends on both A (done) and C (blocked) → stays todo.
         b = kb.create_task(conn, title="child", parents=[a, c])
         assert kb.get_task(conn, b).status == "todo"
 
@@ -1967,11 +1967,11 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
         host = kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         # A verified spawn: an uncaptured fingerprint would (correctly) refuse the signal.
-        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot:1|777")
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "00000000-0000-4000-8000-000000000001:1|777")
         kbd._set_worker_pid(conn, t, 54321)
 
-        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         signalled = []
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: not signalled)
         assert kb.archive_task(
             conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
         ) is True

@@ -9,6 +9,7 @@ import contextlib
 import json
 import logging
 import time
+from gateway.admission import native_observer_context, native_to_thread
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -128,6 +129,15 @@ def _report_slack_failure(team_id: str, error_code: Optional[str], detail: str) 
 
 # --- Build / refresh -------------------------------------------------------
 
+async def _housekeeping_directory_refresh(adapters, runner):
+    """Own a finite refresh scheduled by the gateway's housekeeping thread."""
+    if runner is None:
+        return await build_channel_directory(adapters)
+    with native_observer_context(runner):
+        runner._track_deferred_agent_worker(asyncio.current_task(), None)
+        return await build_channel_directory(adapters)
+
+
 async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """Build the directory from connected adapters + session data and persist it."""
     from gateway.config import Platform
@@ -141,7 +151,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                     platforms[platform.value] = _normalize_adapter_channels(platform_channels)
                     continue
             if platform == Platform.DISCORD:
-                platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
+                platforms["discord"] = await native_to_thread(_build_discord, adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
         except Exception as e:
@@ -153,7 +163,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     async def _discover(plat_name: str) -> None:
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms or plat_name not in adapter_platform_names:
             return
-        platforms[plat_name] = await asyncio.to_thread(_build_from_sessions, plat_name)
+        platforms[plat_name] = await native_to_thread(_build_from_sessions, plat_name)
     for plat in Platform:
         await _discover(plat.value)
     # Plugin platforms are dynamic enum members missing from Platform.__members__.
@@ -164,7 +174,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     _apply_channel_aliases(platforms)
     directory = {"updated_at": datetime.now().isoformat(), "platforms": platforms}
     try:
-        await asyncio.to_thread(atomic_json_write, _directory_path(), directory)
+        await native_to_thread(atomic_json_write, _directory_path(), directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
     return directory
@@ -296,7 +306,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     session-history DMs. Missing channels:read falls back to session history quietly."""
     team_clients = getattr(adapter, "_team_clients", None) or {}
     if not team_clients:
-        return await asyncio.to_thread(_build_from_sessions, "slack")
+        return await native_to_thread(_build_from_sessions, "slack")
     channels: List[Dict[str, Any]] = []
     seen_ids: set = set()
     for team_id, client in team_clients.items():
@@ -304,7 +314,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     # Merge session-history DM/group entries, naming raw-ID entries from the
     # API-discovered channels where the base conversation ID is known.
     api_name_lookup = {ch["id"]: ch["name"] for ch in channels}
-    for entry in await asyncio.to_thread(_build_from_sessions, "slack"):
+    for entry in await native_to_thread(_build_from_sessions, "slack"):
         eid = entry.get("id")
         if not isinstance(eid, str) or eid in seen_ids:
             continue

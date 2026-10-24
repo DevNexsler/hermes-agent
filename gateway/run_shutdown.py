@@ -21,6 +21,7 @@ from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from gateway.admission import native_session_offload
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -175,11 +176,13 @@ class GatewayShutdownMixin:
     # Active-work accounting
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
+        from gateway.admission import ingress_work_count
         return (
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + ingress_work_count(self)
         )
 
     @staticmethod
@@ -195,16 +198,8 @@ class GatewayShutdownMixin:
         return len(get_running_job_ids())
 
     def _active_cron_job_count(self) -> int:
-        """Cron jobs currently executing — they run outside ``_running_agents``; 0 if cron can't import.
-
-        Cron jobs run through a standalone ``AIAgent`` on the scheduler's own thread pool
-        (``cron/scheduler.py::run_job``), entirely outside ``self._running_agents`` — the dict every OTHER
-        active-work check on this class (``_running_agent_count``, ``_drain_active_agents``) reads. Without
-        this, the shutdown drain is structurally blind to in-flight cron work: it can report
-        ``active_at_start=0`` and proceed straight to killing tool subprocesses while a cron job's terminal
-        command is still running (#60432). Best-effort: returns 0 if the cron module can't be imported (e.g.
-        a minimal test double for this class).
-        """
+        """Cron runs outside ``_running_agents`` (#60432). Best-effort shutdown count;
+        activation readiness calls the strict registry accessor instead."""
         try:
             return self._running_cron_job_count()
         except Exception:
@@ -260,16 +255,35 @@ class GatewayShutdownMixin:
         workers = getattr(self, "_deferred_agent_workers", None)
         if not isinstance(workers, dict):
             return 0
-        return sum(1 for future in list(workers) if not future.done())
+        active = 0
+        for future in list(workers):
+            thread = getattr(future, '_hermes_native_thread', None)
+            if thread is not None and future.done() and not thread.is_alive():
+                workers.pop(future, None)
+            elif not future.done() or (thread is not None and thread.is_alive()):
+                active += 1
+        return active
 
-    def _track_deferred_agent_worker(self, future: asyncio.Future, agent: Any) -> None:
+    def _track_deferred_agent_worker(self, future: Any, agent: Any) -> None:
         """Expose an executor worker to drain/interrupt until it really exits."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, '_gateway_loop', None)
         workers = getattr(self, "_deferred_agent_workers", None)
         if workers is None:
             workers = self._deferred_agent_workers = {}
         workers[future] = agent
 
         def _discard_worker(done_future: asyncio.Future) -> None:
+            thread = getattr(done_future, '_hermes_native_thread', None)
+            if thread is not None and thread.is_alive():
+                # Completion runs inside the daemon. Keep its physical tail, then release on the loop.
+                if loop is not None and not loop.is_closed():
+                    with suppress(RuntimeError):
+                        loop.call_soon_threadsafe(
+                            loop.call_later, .001, _discard_worker, done_future)
+                return  # A standalone caller without a loop reaps on its next count/snapshot.
             workers.pop(done_future, None)
             # Workers that outlive their starting coroutine have no later waiter: consume the
             # terminal exception so asyncio emits no unhandled-future warning.
@@ -595,7 +609,7 @@ class GatewayShutdownMixin:
         )
         try:
             if self_suspend_available():
-                accepted = await asyncio.to_thread(suspend_self)
+                accepted = await native_session_offload(self, suspend_self)
                 lever = "self-suspend"
                 if accepted:
                     # flaps answers seconds BEFORE the kernel freezes, so the fence has to span
@@ -617,7 +631,7 @@ class GatewayShutdownMixin:
                     )
                     return
                 # The watcher already holds the supervisor across this call.
-                accepted = await asyncio.to_thread(request_brokered_suspend, url)
+                accepted = await native_session_offload(self, request_brokered_suspend, url)
                 lever = "brokered suspend"
                 if not accepted:
                     self._scale_to_zero_abandon_suspend()
@@ -687,6 +701,8 @@ class GatewayShutdownMixin:
     # the watcher flips between accepting and refusing NEW turns WITHOUT exiting (reversible).
     def _enter_external_drain(self) -> None:
         """Begin external drain: refuse NEW turns (in-flight ones are NOT interrupted). Idempotent."""
+        if (barrier := getattr(self, '_ingress_barrier', None)) is not None:
+            barrier.close()
         if self._external_drain_active:
             return
         self._external_drain_active = True
@@ -694,14 +710,17 @@ class GatewayShutdownMixin:
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.", self._active_work_count(),
         )
-        # Persist "draining" so /api/status tracks it; active_agents is read-merged, only state changes.
         self._update_runtime_status("draining")
 
     def _exit_external_drain(self) -> None:
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
+        if (barrier := getattr(self, '_ingress_barrier', None)) is not None and barrier.hold['active']:
+            return
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        if (barrier := getattr(self, '_ingress_barrier', None)) is not None:
+            barrier.reopen()
         if self._draining or not self._running:
             logger.info(
                 "External drain marker cleared during shutdown — not reverting "
@@ -716,18 +735,18 @@ class GatewayShutdownMixin:
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Poll ``.drain_request.json`` at 1s: present -> enter drain, absent -> exit; a stale epoch = absent."""
-        from gateway.drain_control import drain_requested
+        from gateway.admission import read_admission_controls, reconcile_admission_controls
         while self._running:
             try:
                 # Off-thread: a synchronous marker read at 1s cadence can stall 30s+ under host I/O
                 # pressure and take every platform heartbeat down.
-                if await asyncio.to_thread(drain_requested):
-                    self._enter_external_drain()
+                barrier = getattr(self, '_ingress_barrier', None)
+                controls = await native_session_offload(self, read_admission_controls, barrier.home)
+                reconcile_admission_controls(self, controls)
+                if controls['drain']:
                     # API and cron work live outside messaging's _running_agents map; refresh the
                     # aggregate while an external caller polls this reversible drain state.
                     self._persist_active_agents()
-                else:
-                    self._exit_external_drain()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -785,8 +804,9 @@ class GatewayShutdownMixin:
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
         """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        from gateway.admission import ingress_work_count
         return (
-            self._running_agent_count(), self._active_cron_job_count(),
+            self._running_agent_count() + ingress_work_count(self), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
         )
 
@@ -809,7 +829,7 @@ class GatewayShutdownMixin:
         # Cron/API/deferred work lives outside ``_running_agents``; fold it in or it is killed unwarned.
         _cron0, _api0, _deferred0 = last_counts[1:]
         _maybe_update_status(force=True)
-        if not self._running_agents and not (_cron0 or _api0 or _deferred0):
+        if not any(last_counts):
             return snapshot, False
         # Cron has its own deadline: a chat turn is announced+resumable; a killed cron run is a permanent failure.
         # ``timeout`` (``restart_drain_timeout``) defaults to 0 because interrupting a chat turn is
@@ -1368,7 +1388,7 @@ class GatewayShutdownMixin:
             if session_key in counts:
                 del counts[session_key]
                 if counts:
-                    await asyncio.to_thread(atomic_json_write, path, counts, indent=None)
+                    await native_session_offload(self, atomic_json_write, path, counts, indent=None)
                 else:
                     path.unlink(missing_ok=True)
         except Exception:

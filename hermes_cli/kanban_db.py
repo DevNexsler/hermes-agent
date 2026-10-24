@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_db_spawn import require_settled_worker_launch, require_settled_task_ownership
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -615,6 +616,8 @@ def create_board(
 ) -> dict:
     """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
     normed = _require_slug(slug)
+    from hermes_cli.kanban_db_removal import require_open_board
+    require_open_board(board_dir(normed) / 'kanban.db')
     meta = write_board_metadata(
         normed, name=name, description=description, icon=icon, color=color,
         default_workdir=default_workdir, project_id=project_id,
@@ -659,28 +662,29 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
+    from hermes_cli.kanban_db_removal import board_removal_guard
+    with (contextlib.nullcontext() if archive else board_removal_guard(normed)):
+        # If the user removed the currently-active board, revert to default.
+        if get_current_board() == normed:
+            clear_current_board()
 
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        # Recreated stores must initialize again after rename/removal.
+        _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        suffix = 1
-        while target.exists():  # rapid double-archive
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            suffix = 1
+            while target.exists():  # rapid double-archive
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {"slug": normed, "action": "archived", "new_path": str(target)}
+        import shutil
+        shutil.rmtree(d)
+        return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # --- Data classes ---
@@ -1702,6 +1706,8 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        require_settled_task_ownership(conn, parent_id)
+        require_settled_task_ownership(conn, child_id)
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )
@@ -1852,17 +1858,16 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
+    with dest_path.open('xb') as output:
+        output.write(data)
     try:
         return add_attachment(
             conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
             content_type=content_type, size=len(data), uploaded_by=uploaded_by,
         )
     except Exception:
-        # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
-        with contextlib.suppress(OSError):
-            dest_path.unlink(missing_ok=True)
+        from hermes_cli.kanban_db_workspace import cleanup_failed_attachment_blob
+        cleanup_failed_attachment_blob(conn, dest_path)
         raise
 
 
@@ -1878,6 +1883,8 @@ def add_attachment(
     now = int(time.time())
     with write_txn(conn):
         _require_task(conn, task_id)
+        if not Path(stored_path).is_file():
+            raise ValueError('attachment blob missing or unreadable; no reference recorded')
         cur = conn.execute(
             "INSERT INTO task_attachments "
             "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
@@ -1902,22 +1909,8 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
 
 def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
     """Delete the row (source of truth) and best-effort its blob; None when no row matched."""
-    with write_txn(conn):
-        att = get_attachment(conn, attachment_id)
-        if att is None:
-            return None
-        conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
-        has_remaining_blob_reference = conn.execute(
-            "SELECT 1 FROM task_attachments WHERE stored_path = ? LIMIT 1",
-            (att.stored_path,),
-        ).fetchone() is not None
-        _append_event(conn, att.task_id, "attachment_removed", {"filename": att.filename})
-    if not has_remaining_blob_reference:
-        with contextlib.suppress(OSError):
-            p = Path(att.stored_path)
-            if p.is_file():
-                p.unlink()
-    return att
+    from hermes_cli.kanban_db_workspace import delete_attachment
+    return delete_attachment(conn, attachment_id)
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
@@ -2423,9 +2416,6 @@ def release_stale_claims(
     ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (wedged; ``_touch_activity``
     keeps any genuinely active worker fresh). Safe to call often.
 
-    Reclaiming a live worker mid-flight produces the spawn- then-immediately-reclaim loop seen on slow
-    models that spend longer than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call (#23025):
-    no tool calls means no ``kanban_heartbeat``, even though the subprocess is healthy.
     Backstop (#29747 gap 3): if the worker's PID is still alive but its ``last_heartbeat_at`` is stale by
     more than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has been making no observable
     progress and we reclaim anyway — even if ``_pid_alive`` is still true. This catches the
@@ -2446,6 +2436,9 @@ def release_stale_claims(
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
+        from hermes_cli.kanban_db_spawn import pending_worker_launch
+        if pending_worker_launch(conn, row['id']) is not None:
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
@@ -3024,7 +3017,7 @@ def _persist_scratch_completion_artifacts(
     changed = False
 
     def _discard_copies() -> None:
-        _discard_staged_copies(used_destinations, attachment_dir)
+        _discard_staged_copies(conn, used_destinations, attachment_dir)
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
@@ -3057,11 +3050,8 @@ def _persist_scratch_completion_artifacts(
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            _copy_capped(resolved_src, dest, artifact)
+            _copy_capped(resolved_src, dest, artifact, used_destinations)
         except Exception as exc:
-            if dest is not None:
-                with contextlib.suppress(OSError):
-                    dest.unlink(missing_ok=True)
             _discard_copies()
             if isinstance(exc, ArtifactPreservationError):
                 raise
@@ -3079,19 +3069,20 @@ def _persist_scratch_completion_artifacts(
         ]
 
 
-def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
+def _discard_staged_copies(conn, copies: Iterable[Path], attachment_dir: Path) -> None:
     """Remove staged attachment copies whose DB rows never committed; a leaked
     copy would make the retry stage ``name_1.ext`` next to an orphan."""
+    from hermes_cli.kanban_db_workspace import cleanup_failed_attachment_blob
     for copied in copies:
-        with contextlib.suppress(OSError):
-            Path(copied).unlink(missing_ok=True)
+        cleanup_failed_attachment_blob(conn, copied)
     with contextlib.suppress(OSError):
         attachment_dir.rmdir()
 
 
-def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
+def _copy_capped(src: Path, dest: Path, artifact: str, created: set[Path]) -> None:
     """Chunked copy that aborts if the file grows past the attachment cap mid-copy."""
     with src.open("rb") as source_file, dest.open("xb") as destination_file:
+        created.add(dest)
         copied = 0
         while chunk := source_file.read(1024 * 1024):
             copied += len(chunk)
@@ -3467,7 +3458,7 @@ def request_review(
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
     except Exception:
         if staged_copies:
-            _discard_staged_copies(staged_copies, staged_copies[0].parent)
+            _discard_staged_copies(conn, staged_copies, staged_copies[0].parent)
         raise
     return _ret(True)
 
@@ -3888,6 +3879,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     the ``archived`` event stays atomic with the status flip.
     """
     with write_txn(conn):
+        require_settled_worker_launch(conn, task_id)
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -3933,6 +3925,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
+        require_settled_task_ownership(conn, task_id)
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -3941,6 +3934,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        require_settled_task_ownership(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -4294,12 +4288,8 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     ``--event-retention-days 0`` to "disabled" before calling this.
     """
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+    from hermes_cli.kanban_db_spawn import gc_settled_events
+    return gc_settled_events(conn, cutoff)
 
 
 def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:
@@ -4309,17 +4299,13 @@ def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[
     ``--log-retention-days 0`` to "disabled" before calling this.
     """
     older_than_seconds = _retention_seconds(older_than_seconds)
+    board = _normalize_board_slug(board) or get_current_board()
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0
     cutoff = time.time() - older_than_seconds
-    removed = 0
-    for p in log_dir.iterdir():
-        with contextlib.suppress(OSError):
-            if p.is_file() and p.stat().st_mtime < cutoff:
-                p.unlink()
-                removed += 1
-    return removed
+    from hermes_cli.kanban_db_spawn import gc_settled_worker_logs
+    return gc_settled_worker_logs(log_dir, cutoff, board)
 
 
 # --- Worker log accessor ---

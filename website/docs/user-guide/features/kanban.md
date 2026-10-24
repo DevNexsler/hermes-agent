@@ -262,7 +262,10 @@ body and hoping it finds them.
   link and a remove (×) control. Removing an attachment deletes its
   metadata row; the on-disk file is deleted only when no other attachment
   row still references it (a file shared by several tasks stays until its
-  last reference is removed). From the CLI, `hermes kanban attach-rm
+  last reference is removed). Registration and removal serialize through the
+  board database; registering a missing blob refuses without recording a reference.
+  Failed-upload cleanup also preserves shared files; unreadable ownership leaves the file for review.
+  From the CLI, `hermes kanban attach-rm
   ATTACHMENT_ID` removes an attachment the same way.
 
 :::note Remote terminal backends
@@ -989,6 +992,12 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+Hard deletion and cleanup retain tasks, history, attachments and workspaces while a worker remains active or
+unverifiable, or a notification has an UNKNOWN outcome. Inspect `hermes kanban notify-list --json`
+for notification attention; preserve the exact task and ownership evidence for operator review.
+Log cleanup refuses mismatched database overrides or a missing board database; it preserves the logs.
+Interrupted board deletion stays closed until its retained removal ownership is explicitly accounted for.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 

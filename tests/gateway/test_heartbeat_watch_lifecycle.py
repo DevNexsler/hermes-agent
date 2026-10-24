@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform
+from gateway.admission import initialize_gateway_admission
 from gateway.run import GatewayRunner, _profile_runtime_scope
 from gateway.session import SessionSource
 from hermes_cli.heartbeat import HeartbeatManager, HeartbeatState, save_heartbeat, migrate_heartbeat_to_session
@@ -16,6 +17,8 @@ async def test_watches_read_and_admit_in_each_owner_profile(tmp_path, monkeypatc
     monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
     monkeypatch.setenv('HERMES_HOME', str(tmp_path / '.hermes'))
     runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner.config = SimpleNamespace(multiplex_profiles=True)
     runner._run_in_executor_with_context = asyncio.to_thread
     runner._is_session_running = lambda key: False
@@ -29,6 +32,8 @@ async def test_watches_read_and_admit_in_each_owner_profile(tmp_path, monkeypatc
         async def handle_message(self, event):
             rows.append((event.source.profile, str(get_hermes_home()), event.text))
             self._active_sessions[event.metadata['gateway_session_key']] = True
+            event._gateway_accepted = event._heartbeat_execution_started = True  # Explicit inert execution fixture.
+            return True
 
     runner._delivery_adapter_for = lambda source: Adapter()
     watch = {}
@@ -50,6 +55,8 @@ async def test_watches_read_and_admit_in_each_owner_profile(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_watch_tracks_rotated_route_owner_without_reviving_parent():
     runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner._run_in_executor_with_context = asyncio.to_thread
     runner._is_session_running = lambda key: False
     runner._queue_depth = lambda key, adapter: 0
@@ -63,6 +70,8 @@ async def test_watch_tracks_rotated_route_owner_without_reviving_parent():
         async def handle_message(self, event):
             events.append(event)
             self._active_sessions['route'] = True
+            event._gateway_accepted = event._heartbeat_execution_started = True  # Explicit inert execution fixture.
+            return True
 
     runner._delivery_adapter_for = lambda source: Adapter()
     await runner._warm_goals_session_db('test')

@@ -9,6 +9,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND, display_kind_for_event
+from gateway.admission import initialize_gateway_admission
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 from hermes_cli.heartbeat import HeartbeatManager
@@ -42,7 +43,10 @@ def poller(monkeypatch):
     key = build_session_key(source)
     adapter = _HeartbeatAdapter(PlatformConfig(enabled=True, typing_indicator=False), Platform.TELEGRAM)
     runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
     runner._running_agents = {}
+    adapter.gateway_runner = runner
     runner._delivery_adapter_for = lambda source: adapter
     runner._run_in_executor_with_context = asyncio.to_thread
     watch = {key: (source, "heartbeat-session")}
@@ -98,6 +102,7 @@ async def test_unavailable_or_busy_session_leaves_persisted_tick_due(poller):
     # Missing adapter and missing handler must not consume a due tick.
     runner._delivery_adapter_for = lambda source: None
     await runner._heartbeat_poll_once(watch)
+    adapter.gateway_runner = runner
     runner._delivery_adapter_for = lambda source: adapter
     await runner._heartbeat_poll_once(watch)
 
@@ -113,7 +118,6 @@ async def test_unavailable_or_busy_session_leaves_persisted_tick_due(poller):
         state.pop(key)
     assert HeartbeatManager("heartbeat-session").state.to_json() == original
     await runner._heartbeat_poll_once(watch)
-    assert key in adapter._active_sessions
-    await asyncio.gather(*adapter._background_tasks)
+    await asyncio.gather(*adapter._background_tasks)  # Fast owned work may already have settled.
     assert HeartbeatManager("heartbeat-session").state.fire_count == 1
     assert runner._queue_depth(key, adapter=adapter) == 0

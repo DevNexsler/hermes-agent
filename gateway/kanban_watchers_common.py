@@ -31,7 +31,8 @@ def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
 
 async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) -> Any:
     """Offload blocking process-service work without inheriting request ContextVars."""
-    return await asyncio.to_thread(_run_in_fresh_context, func, *args)
+    from gateway.admission import native_to_thread
+    return await native_to_thread(_run_in_fresh_context, func, *args)
 
 
 def _list_boards(kb: Any) -> list:

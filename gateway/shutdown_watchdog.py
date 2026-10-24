@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+from gateway.admission import native_to_thread
 from hermes_constants import get_hermes_home, get_process_hermes_home
 from utils import atomic_json_write
 
@@ -380,8 +381,8 @@ async def loop_heartbeat_forever(
     try:
         while True:  # first write is immediate so monitors see a fresh file at once
             try:
-                await asyncio.to_thread(write_loop_heartbeat, start_time=start_time, home=home,
-                                        extra=extra)
+                await native_to_thread(write_loop_heartbeat, start_time=start_time, home=home,
+                                       extra=extra)
             except Exception:  # write_loop_heartbeat never raises: executor problem, keep the task
                 logger.debug("Loop heartbeat write failed off-loop", exc_info=True)
             if should_continue is not None and not should_continue():

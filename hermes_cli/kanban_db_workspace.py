@@ -26,6 +26,64 @@ if TYPE_CHECKING:
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
 
+def _unlink_unreferenced_attachment_blob(conn, path):
+    path = Path(path)
+    realpath = _resolved_input_path(path)
+    if (_has_retained_workspace(conn, path)
+            or any(_same_input_path(_resolved_input_path(row[0]), realpath)
+                   for row in conn.execute('SELECT stored_path FROM task_attachments'))):
+        return
+    with contextlib.suppress(OSError):
+        if path.is_file():
+            path.unlink()
+
+
+def cleanup_failed_attachment_blob(conn, path):
+    """The original error remains authoritative; unknown ownership retains the failed copy."""
+    try:
+        with _kb.write_txn(conn, allow_nested=True):
+            conn.execute('UPDATE task_attachments SET id=id WHERE 0')  # Also reserve nested read transactions.
+            _unlink_unreferenced_attachment_blob(conn, path)
+    except Exception:
+        _kb._log.warning('Failed attachment cleanup ownership unknown; retaining %s', path, exc_info=True)
+
+
+def _has_attachment_files(conn, directory):
+    root = _resolved_input_path(directory)
+    return any(_input_path_contains(root, _resolved_input_path(row[0]))
+               for row in conn.execute('SELECT stored_path FROM task_attachments'))
+
+
+def _has_retained_workspace(conn, directory):
+    """Shared native workspace ownership protects both enclosing and nested inputs."""
+    from hermes_cli.kanban_db_spawn import retained_task_ids
+    root = _resolved_input_path(directory)
+    protected = retained_task_ids(conn)
+    for task_id, path in conn.execute('SELECT id, workspace_path FROM tasks'):
+        if task_id not in protected:
+            continue
+        if not path:
+            return True  # An unbound retained workspace cannot authorize removal.
+        owner = _resolved_input_path(path)
+        if _input_path_contains(owner, root) or _input_path_contains(root, owner):
+            return True
+    return False
+
+
+def delete_attachment(conn, attachment_id):
+    """Retained worker/notification inputs and ancestor handoffs stay attached."""
+    from hermes_cli.kanban_db_spawn import require_settled_task_ownership
+    with _kb.write_txn(conn):
+        att = _kb.get_attachment(conn, attachment_id)
+        if att is None:
+            return None
+        require_settled_task_ownership(conn, att.task_id)
+        conn.execute('DELETE FROM task_attachments WHERE id=?', (attachment_id,))
+        _kb._append_event(conn, att.task_id, 'attachment_removed', {'filename': att.filename})
+        _unlink_unreferenced_attachment_blob(conn, att.stored_path)
+    return att
+
+
 def _path_key(path: Path | str | None) -> str:
     """Unicode-form-insensitive identity for a filesystem path.
 
@@ -37,6 +95,27 @@ def _path_key(path: Path | str | None) -> str:
     check here goes through this key.
     """
     return unicodedata.normalize("NFC", str(path)) if path is not None else ""
+
+
+def _resolved_input_path(path) -> Path:
+    """Resolve original spelling; comparison keys never become filesystem lookup paths."""
+    return Path(path).expanduser().resolve()
+
+
+def _same_input_path(left: Path, right: Path) -> bool:
+    if _path_key(left) == _path_key(right):
+        return True
+    try:
+        return left.samefile(right)
+    except FileNotFoundError:
+        return False
+
+
+def _input_path_contains(parent: Path, child: Path) -> bool:
+    """Keep conservative Unicode keys and actual case-insensitive ancestor identities."""
+    if Path(_path_key(child)).is_relative_to(Path(_path_key(parent))):
+        return True
+    return any(_same_input_path(parent, ancestor) for ancestor in (child, *child.parents))
 
 # Statuses after which a child no longer needs its parent's workspace artifacts.
 _ACTIVE_CHILDREN_SQL = (
@@ -61,7 +140,9 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
 
 
 def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
-    return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+    from hermes_cli.kanban_db_spawn import retained_task_ids
+    return (conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+            or task_id in retained_task_ids(conn))
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -134,56 +215,62 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
     try:
-        row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
-        if not row:
-            return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind not in _REMOVABLE_KINDS or not path:
-            # Not removable itself, but completing may still unblock a deferred
-            # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
-            # See #33774.
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        # Defer while any child is not yet terminal so it can still read
-        # handoff artifacts from this workspace.
-        if _has_active_children(conn, task_id):
-            _kb._log.debug(
-                "Deferring %s workspace cleanup for task %s: "
-                "active children still need workspace at %s",
-                kind, task_id, path,
-            )
-            return
-        # Kill the (dead) tmux worker session BEFORE removing a worktree so a
-        # lingering worker never has its cwd deleted from under it.
-        if kind == "worktree":
-            _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard: a board's ``default_workdir`` can pair
-            # ``workspace_kind='scratch'`` with a user path pointing at a real
-            # source tree; without this, completion would rmtree the user's data.
-            # See #28818.
-            if _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _kb._log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
+        with _kb.write_txn(conn):
+            from hermes_cli.kanban_db_spawn import retained_task_ids
+            if task_id in retained_task_ids(conn):
+                return  # Physical ownership still needs this task's inputs and evidence.
+            row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
+            if not row:
+                return
+            kind: Optional[str] = row["workspace_kind"]
+            path: Optional[str] = row["workspace_path"]
+            if path and (_has_attachment_files(conn, path) or _has_retained_workspace(conn, path)):
+                return
+            if kind not in _REMOVABLE_KINDS or not path:
+                # Not removable itself, but completing may still unblock a deferred
+                # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
+                # See #33774.
+                _try_cleanup_parent_workspaces(conn, task_id)
+                return
+            # Defer while any child is not yet terminal so it can still read
+            # handoff artifacts from this workspace.
+            if _has_active_children(conn, task_id):
+                _kb._log.debug(
+                    "Deferring %s workspace cleanup for task %s: "
+                    "active children still need workspace at %s",
+                    kind, task_id, path,
                 )
-        # Kill the owning worker's tmux session if it is now dead, then let any
-        # parent whose children are all done run its deferred cleanup.
-        _cleanup_worker_tmux(conn, task_id)
-        # After cleaning up this task's workspace, check if any parent tasks now have all children done —
-        # their deferred cleanup can proceed (#33774).
-        _try_cleanup_parent_workspaces(conn, task_id)
+                return
+            # Kill the (dead) tmux worker session BEFORE removing a worktree so a
+            # lingering worker never has its cwd deleted from under it.
+            if kind == "worktree":
+                _cleanup_worker_tmux(conn, task_id)
+                _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+                _try_cleanup_parent_workspaces(conn, task_id)
+                return
+            wp = Path(path)
+            if wp.is_dir():
+                # Containment guard: a board's ``default_workdir`` can pair
+                # ``workspace_kind='scratch'`` with a user path pointing at a real
+                # source tree; without this, completion would rmtree the user's data.
+                # See #28818.
+                if _is_managed_scratch_path(wp):
+                    release_lsp_clients(str(wp))
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _kb._log.debug("Removed scratch workspace: %s", wp)
+                else:
+                    _kb._log.warning(
+                        "Refusing to remove out-of-scratch workspace for task %s: %s "
+                        "(workspace_kind='scratch' but path is outside any "
+                        "kanban-managed workspaces root)",
+                        task_id, wp,
+                    )
+            # Kill the owning worker's tmux session if it is now dead, then let any
+            # parent whose children are all done run its deferred cleanup.
+            _cleanup_worker_tmux(conn, task_id)
+            # After cleaning up this task's workspace, check if any parent tasks now have all children done —
+            # their deferred cleanup can proceed (#33774).
+            _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
         pass  # best-effort — never block completion
 
@@ -269,27 +356,30 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     See #33774.
     """
     try:
-        parents = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ?",
-            (task_id,),
-        ).fetchall()
-        for (parent_id,) in parents:
-            row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
-            if (
-                not row
-                or row["workspace_kind"] not in _REMOVABLE_KINDS
-                or not row["workspace_path"]
-                or _has_active_children(conn, parent_id)
-            ):
-                continue
-            if row["workspace_kind"] == "worktree":
-                _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
-                continue
-            wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+        with _kb.write_txn(conn, allow_nested=True):
+            conn.execute('UPDATE tasks SET id=id WHERE 0')
+            parents = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,),
+            ).fetchall()
+            for (parent_id,) in parents:
+                row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
+                if (
+                    not row
+                    or row["workspace_kind"] not in _REMOVABLE_KINDS
+                    or not row["workspace_path"]
+                    or _has_active_children(conn, parent_id)
+                    or _has_attachment_files(conn, row["workspace_path"])
+                    or _has_retained_workspace(conn, row["workspace_path"])
+                ):
+                    continue
+                if row["workspace_kind"] == "worktree":
+                    _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
+                    continue
+                wp = Path(row["workspace_path"])
+                if wp.is_dir() and _is_managed_scratch_path(wp):
+                    release_lsp_clients(str(wp))
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 

@@ -4,6 +4,7 @@ import threading
 from types import SimpleNamespace
 
 from gateway.run_agent_cache import GatewayAgentCacheMixin
+from gateway.run import GatewayRunner
 from hermes_constants import (
     get_hermes_home,
     reset_hermes_home_override,
@@ -20,7 +21,7 @@ class _RunningAgent:
         return None
 
 
-class _Runner:
+class _Runner(GatewayRunner):
     def __init__(self):
         self._state = SimpleNamespace(turn=SimpleNamespace(agent=_RunningAgent()))
 

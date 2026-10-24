@@ -9,7 +9,7 @@ from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_coll
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
-from gateway.wake import admit_internal_event, deliver_wake
+from gateway.wake import WakeNotAccepted, admit_internal_event, deliver_wake
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
@@ -25,6 +25,10 @@ def setup_route(raft=False):
     adapter.wire = []
     runner = object.__new__(GatewayRunner)
     runner._running_agents = {}
+    runner._running, runner._draining = True, False
+    from gateway.admission import initialize_gateway_admission
+    initialize_gateway_admission(runner)
+    adapter.gateway_runner = runner
     runner.adapters = {adapter.platform: adapter}
     runner._delivery_adapter_for = lambda source: adapter
     runner._kanban_dispatcher_lock_handle = object()
@@ -71,8 +75,9 @@ async def test_push_receipt_requires_real_admission_without_displacing_user(raft
             await deliver_wake(adapter, text="at-cap", source=source)
         assert adapter._pending_messages[key].text == "human"
         runner._BUSY_QUEUE_MAX_PENDING = 3
-        await deliver_wake(adapter, text="busy", source=source)
-        assert runner._queue_depth(key, adapter=adapter) == 2
+        with pytest.raises(WakeNotAccepted):
+            await deliver_wake(adapter, text="busy", source=source)
+        assert runner._queue_depth(key, adapter=adapter) == 1
         rejected = MessageEvent(text="wrong-key", source=source, internal=True,
                                 metadata={"gateway_session_key": "agent:wrong"})
         with pytest.raises(RuntimeError, match="not accepted"):
@@ -80,7 +85,7 @@ async def test_push_receipt_requires_real_admission_without_displacing_user(raft
         assert rejected._gateway_accepted is False
         release.set()
         await drain(adapter)
-        assert received == ["idle", "human", "busy"]
+        assert received == ["idle", "human"]
         adapter.set_message_handler(None)
         with pytest.raises(RuntimeError, match="not accepted"):
             await deliver_wake(adapter, text="no-handler", source=source)

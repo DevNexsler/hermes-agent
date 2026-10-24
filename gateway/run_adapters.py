@@ -19,6 +19,7 @@ import weakref as _weakref
 from agent.async_utils import consume_detached_task_result
 from contextvars import Context
 from datetime import datetime, timedelta, timezone
+from gateway.admission import admit_gateway_work, adopt_ingress_task, native_observer_context, native_session_offload
 from gateway.config import SHARED_LISTENER_MIRROR_PLATFORMS, Platform, platform_binds_port as _platform_binds_port
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, inbound_dedup_caches
@@ -416,7 +417,10 @@ class GatewayAdapterLifecycleMixin:
         # Spawn timestamp lets ``_done`` tell a rapid crash-loop from a healthy-run-then-crash.
         _started = time.monotonic()
         # No create_task kwargs (test doubles mock a narrow signature); Context().run isolates instead.
-        task = Context().run(lambda: asyncio.create_task(coro_factory()))
+        async def owned_observer():
+            with native_observer_context(self):
+                return await coro_factory()
+        task = Context().run(lambda: asyncio.create_task(owned_observer()))
         # PERMANENT watcher: the scale-to-zero idle check ignores it (else busy forever).
         task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
         self._retain_background_task(task)
@@ -500,7 +504,8 @@ class GatewayAdapterLifecycleMixin:
             finally:
                 inflight.pop(session_id, None)
 
-        async def _tick(profile_name: Optional[str] = None) -> None:
+        @admit_gateway_work
+        async def _tick(_runner, profile_name: Optional[str] = None) -> None:
             """One poll of the CURRENTLY-SCOPED store; ``profile_name`` (None = root) routes delivery
             to that profile's OWN adapter. A closure, not a method: tests bind ``_handoff_watcher`` onto
             a ``SimpleNamespace`` with only ``_session_db``/``_running``/``_process_handoff``."""
@@ -526,9 +531,9 @@ class GatewayAdapterLifecycleMixin:
                 # thread-local or module global, secondary- profile handoffs silently regress to
                 # primary-config delivery (the exact bug fixed in #91217) while still recording
                 # handoff_state='completed'.
-                inflight[session_id] = asyncio.ensure_future(
+                inflight[session_id] = adopt_ingress_task(self, asyncio.ensure_future(
                     _dispatch(row, session_id, session_db, profile_name)
-                )
+                ))
 
         # A row still 'running' at startup died mid-dispatch and blocks request_handoff until reclaimed.
         def _scope(profile_home):  # local: tests bind this watcher onto bare SimpleNamespace runners
@@ -537,7 +542,7 @@ class GatewayAdapterLifecycleMixin:
         for _pname, _phome in _handoff_watch_scopes(self):
             with _log_suppressed(logging.DEBUG, "Stale-handoff reclaim failed", exc_info=True):
                 async with _scope(_phome):
-                    await _reclaim_stale(self)
+                    await admit_gateway_work(_reclaim_stale)(self)
         try:
             while self._running:
                 try:
@@ -548,7 +553,7 @@ class GatewayAdapterLifecycleMixin:
                                 self, lambda home=profile_home: profile_has_pending_handoff(home)):
                             continue
                         async with _scope(profile_home):
-                            await _tick(profile_name)
+                            await _tick(self, profile_name)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -967,7 +972,7 @@ class GatewayAdapterLifecycleMixin:
         from gateway.config import load_gateway_config
         from hermes_cli.env_loader import hydrate_profile_secret_sources
         # Hydrate external secret sources off-loop ONCE: sync hydration would stall every heartbeat.
-        await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
+        await native_session_offload(self, hydrate_profile_secret_sources, profile_home)
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
             profile_runtime_cfg = _load_gateway_config()
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
@@ -1227,7 +1232,7 @@ class GatewayAdapterLifecycleMixin:
         from gateway.config import load_gateway_config
         profile_home = get_profile_dir(profile_name)
         # Hydrate external secret sources off-loop so they cannot starve heartbeats.
-        await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
+        await native_session_offload(self, hydrate_profile_secret_sources, profile_home)
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
             profile_config = load_gateway_config().platforms.get(platform)
             if profile_config is None or not profile_config.enabled:

@@ -316,3 +316,439 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 - [ACP Internals](./acp-internals.md)
 - [Agent Loop Internals](./agent-loop.md)
 - [Messaging Gateway (User Guide)](../user-guide/messaging/index.md)
+
+## Retryable extension admission and maintenance holds
+
+`gateway.admission` supplies a gateway-owned reservation for HTTP extensions which acknowledge
+work before a core session exists. After synchronous authentication, enter
+`with gateway_ingress(adapter.gateway_runner):` **before the first await or mutation**, including
+body parsing, deduplication, SQLite and journal setup. Keep the scope through response creation.
+Answer `GatewayDraining` with JSON HTTP 503 and `exc.headers` (`Retry-After: 1`). The exception
+alone grants no retry authority: positive pre-effect proof follows the narrower contract below.
+A closed-fence refusal happens before journals, dedup claims, delivery receipts
+or core dispatch. A missing or unready native capability also raises this exception. Test doubles must install an explicit
+admission fixture; a missing runner never means acceptance.
+
+Reservations acquired before fence closure finish naturally. The base adapter adopts the task it
+spawns before that task can run; its completion callback releases the reservation even if cancelled
+before its first step. Only the reserving handler and explicitly adopted task identities can pass
+the core external-drain gate. An unrelated task inheriting context cannot borrow admission.
+Extension-created tasks use `adopt_ingress_task(runner, task)` before the handler exits.
+
+Retryable ingress supports direct starts and actual steering. In-memory queue/FIFO/debounce
+fallback raises `GatewayDraining` before storage. Callers retain the original durable item;
+only positively proven pre-effect refusal permits their defined retry/refund policy. Cancellation
+or a generic error retains UNKNOWN. Native internal producers use the same reservation and require
+an explicit adapter admission receipt; ambiguous outcomes preserve durable ownership.
+Ordinary unleased human queues keep their
+existing behavior. Startup resume reserves its own event and preclaimed session through the native
+lifecycle path; it can finish restoration while HTTP readiness stays closed, but cannot bypass a
+maintenance hold or external drain. Leased arrivals with existing backlog refuse before Base
+acknowledges or mutates that backlog. A consumer must never record delivery after a refused steer
+or queue fallback.
+
+Native loop ticks, heartbeat decisions and CLI handoff claims reserve before their first durable
+mutation. Their lifecycle coroutine stays adopted if its watcher is cancelled; only a proven
+unaccepted tick may refund. Unknown outcomes retain durable ownership. During shutdown, an idle
+pre-fence reservation still enters and settles its core turn; a busy shutdown handoff refuses
+before acknowledgment or queue mutation.
+
+Use `await ingress_to_thread(fn, *args, **kwargs)` for work under this reservation. Cancellation
+raises `asyncio.CancelledError` promptly while the shielded executor future remains counted until
+the actual worker exits. This helper requires a live authenticated reservation and otherwise raises
+`GatewayDraining`. Background observers/startup housekeeping outside ingress keep their own tracked
+execution path; do not fabricate ingress or silently fall back from this helper. Admission is a
+transport receipt, not authorization, model completion or proof of an outbound business effect.
+
+Native thread boundaries use `native_to_thread`; session database/routing facades accept its
+offload policy without depending on the gateway package. Turn and housekeeping pools keep their
+existing separation. With a live lease, actual executor futures remain adopted across caller
+cancellation; outside ingress, native observers retain their existing execution policy. This
+internal policy does not weaken the strict `ingress_to_thread` extension contract.
+Accepted Base pending/debounce buffers and runner FIFO/command backlog also prevent strict
+quiescence, even when their original guard is orphaned. Inspection never consumes or refunds them.
+
+Independent human FIFO handoffs clear ambient ingress context. Failed Task adoption cancels and
+tracks the scheduled child before its first step. Ordinary native executor work also stays in the
+existing deferred-worker registry through physical completion after caller cancellation. Busy slash
+queue/rejected-steer refusal propagates to HTTP 503; an unexpected steering exception propagates as
+an error, with no accepted receipt. Such an error has an unknown effect outcome, never retry authority.
+
+Standing-goal continuation and kickoff/resume are separate native producers. Their enqueue
+reservation linearizes with closure and clears parent permission; transport fallback remains
+refused. If maintenance closes before continuation entry, including after FIFO enqueue or cancellation
+before its first step, `GoalManager.pause_for_maintenance` atomically compares unchanged active state
+and stores a maintenance pause plus a private `state_meta` receipt under
+`goal_maintenance_pause:<session_id>:<pause_id>`. Receipt retains owner/hold identity, exact goal
+checkpoint, continuation prompt and inputs, prior result, profile path and durable history identity.
+Existing user/foreign changes are preserved. Failed durable write/readback latches strict quiescence
+unknown; marker removal cannot clear that process-local uncertainty.
+
+Every accepted goal drain settles before its producer lease exits, including normal hook skip,
+authorization/preflight refusal, error and cancellation. No core entry means no goal post-turn
+evaluation; refusal text cannot spend a goal turn or replace its original checkpoint. A shared
+private witness records confirmed maintenance retention across supported event rewrites. Terminal
+callbacks cover cancellation before the first step and remain in the existing deferred registry
+until cleanup is registered or confirmed. Failed/cancelled settlement closes UNKNOWN and never
+starts another settlement attempt. An unexecuted accepted obligation refused while open also
+closes UNKNOWN before preserving its exact maintenance handoff; it is never silently replayed.
+Ordinary unleased human hook skips retain their existing behavior. Physical receipt writers stay
+owned after waiter cancellation. These controls provide no restart or business-completion proof.
+
+Every pre-entry and terminal preservation path shares one attempt witness on the accepted goal
+envelope, set before physical receipt storage starts. Cancellation cannot authorize a second
+writer, including cancellation of Base's first check, the post-`agent:start` check, or a later
+capacity refusal. Confirmed retention is idempotent; an unconfirmed started attempt stays UNKNOWN.
+Automatic loop/goal mixing checks inspect satisfied waits without clearing or saving cached goal
+state. User pause/clear remains authoritative; normal goal evaluation keeps its existing CAS.
+Native worker liveness keeps a positive PID-existence result when a secondary macOS `ps` query
+fails. A failed or empty query cannot authorize terminal-worker cleanup; a confirmed zombie or
+observed exit keeps the existing cleanup contract. Native macOS fault-path qualification remains
+required separately from Linux tests.
+
+Supervised gateway observers start in a fresh context that binds their runner's physical-I/O
+ownership without carrying parent ingress permission. Profile hydration via `native_to_thread`
+therefore retains its real executor future through cancellation, even before a poller's admitted
+business tick. Secondary configuration/reconnect hydration explicitly uses the same native
+offload ownership. These reads grant no admission permission or business-effect/completion proof.
+Startup warm-up likewise stays in the existing deferred registry after its bounded restore gate
+opens. Launch-scope hydration and the actual probe use tracked, shielded default-executor futures,
+so cancelling the warm-up waiter cannot conceal a still-running physical worker.
+That owner context does not intercept raw `asyncio.to_thread` or bare executor calls. Concrete
+completion-ledger/control readers, completion routing/DB work, hot-profile discovery, catalog
+refresh, notifier routing and suspend/metadata workers therefore use explicit tracked native
+offloads. Completion transcript delivery uses the existing context-aware native offloader.
+Default executor choice and profile context remain intact; cancellation does not prove physical exit.
+Reconnect channel-directory discovery and writes use that context-aware offloader too, including
+Slack fallbacks. The initial startup build binds its concrete runner explicitly. A finite
+directory refresh scheduled by the housekeeping thread also binds its runner;
+that refresh stays registered across its async adapter calls and any thread timeout.
+Loop-liveness starts under a fresh observer context; its heartbeat writer retains its physical future.
+Finite boot sends are registered before their first yield and remain owned after the bounded
+restore gate opens. Boot/reconnect ledger, retry-timer and startup metadata offloads bind their
+runner explicitly even when called without a supervisor. These counters are physical-work
+ownership, not delivery receipts or a proof that an old process can be stopped safely.
+Finite cache-release and turn/API reaper daemons register before starting and remain counted
+through physical thread exit. A failed start reply never authorizes replaying an already-started
+worker inline. Cache housekeeping reserves ordinary native admission before eviction; OS-thread
+chores register under the same fence lock before reading or mutating their stores. Idle waits
+remain excluded. Scoped async-bridge ownership retains a queued coroutine after its submitting
+chore times out; a tracking failure leaves readiness UNKNOWN and never cancels accepted work.
+These ownership callbacks grant no ingress permission and leave standalone bridge calls unchanged.
+The coalesced runtime-status writer lives in `gateway/status_writer.py`; `gateway/status.py`
+retains its existing publication/singleton API. Pending and writing snapshots count as work,
+failed or inconsistent persistence is UNKNOWN, and the idle writer thread does not count.
+Memory extraction, pool choice, profile binding, status coalescing and transport policy stay native.
+
+Maintenance pause/receipt writes verify both final rows inside their SQLite writer transaction
+before commit. Rejected or altered writes roll back the whole handoff, including any accidental
+foreign-goal mutation. Post-commit readback remains an additional confirmation, not atomicity.
+
+These pauses never resume automatically. Before fence release, the maintenance owner must inventory
+every profile's receipts and leave a named, actionable `/goal resume` handoff. A rollout must not
+resume user/foreign/changed pauses. No automatic maintenance-resume API is supplied here; source
+publication does not authorize goal commands. Existing history stays in the same profile database.
+
+`gateway_admission_status(runner)` returns `known`, `closed`, `ingress`, `adopted`, `active_work`,
+`quiescent`, `observers`, plus public `hold` identity when known. `adopted` includes background tasks and executor
+futures. Counters overlap intentionally: only zero matters. Unknown capability, hold or work counters
+return `known=False` and `quiescent=None`; never convert that to zero. Read this synchronously on the
+gateway loop. Before treating quiescence as an activation fence, hold the existing cron tick lock
+for **every** home returned by `_cron_tick_profile_homes`, verify no home was added, and separately
+exclude manual/external producers. Tick locks cover scan/advance/register/submit, not job lifetime:
+hold them before checking running-job counters. Snapshot zero or producer shutdown alone is insufficient.
+
+Extensions with work outside authenticated handlers implement optional synchronous
+`admission_observer_status() -> {known: True, active_tasks: int, active_threads: int}`. These
+nonnegative integer counts participate in strict readiness. Missing hooks mean no declared extra
+work; a present hook that raises, returns unknown, or supplies invalid counts means unknown
+readiness. The hook reads counters on the gateway loop without filesystem/secret/config I/O.
+Track actual executor completion through observer cancellation; a cancelled asyncio task alone
+does not prove its thread stopped. Lifecycle observers do not acquire HTTP admission permission.
+
+`gateway.admission_hold` supplies separate persistent maintenance control:
+
+- `acquire_admission_hold(owner=..., home=..., token=...)` returns `hold_id` and `token`. Persist a
+  random `secrets.token_urlsafe(32)` token privately **before** acquisition; retries with that token
+  and owner recover a lost response. A different acquisition raises `AdmissionHoldConflict`.
+- `inspect_admission_hold(home=...)` returns `known`, `active`, `hold_id`, `owner`; it exposes no token
+  or digest. Malformed/unreadable state means active with unknown identity.
+- `release_admission_hold(token=..., home=...)` compares under a shared cross-process lock, returns
+  false if already absent, and raises `AdmissionHoldConflict` for foreign/unknown state. Keep the
+  serialization lock inode; never unlink it or log tokens.
+
+Holds never expire because of age, owner death or machine epoch. NAS `.drain_request.json` remains a
+separate expiring control. New-source startup loads the owner hold before listeners, cron or restore
+and waits until explicit release; abort/cancellation leaves it intact. The owner must restore matched
+assets before release after a failed deployment. This feature cannot fence an older running binary:
+qualifying the initial upgrade and rollback to source without this capability requires a separate
+old-process quiescence/bootstrap proof. Source installation or a passing test is not that proof.
+
+
+Positive refusal is narrower than HTTP503 or the exception type. `GatewayDraining` exposes
+`pre_effect` (strict bool, default False) and stable `reason`. Admission/preflight/queue refusal
+before any invocation can attest True. The lease marks effects **before** core, notice and every
+parent/child steer invocation; mark never resets, including cancellation or a returned False.
+Nested/callee typed exceptions cannot upgrade proof after this mark. Attempted steering that
+fails or declines remains UNKNOWN; no inferred no-effect or automatic retry. Ordinary human
+fanout keeps its existing behavior. Busy leased control/media/interrupt fallbacks refuse before
+invocation; direct confirmed steer or fresh start remain the acceptance paths.
+Related nested reservations share one monotonic effect history, including adopted children that
+run after the nested scope exits. False/error/BaseException/cancellation never restores parent
+no-effect proof. Explicit independent human/goal/producer scopes retain separate admission and
+history; sharing effect history grants no additional permission.
+Preflight refuses pending clarify/update/slash-confirm/tool-approval prompts before Base can acknowledge
+background dispatch; core resolver guards cover direct callers too. Unleased human replies retain
+their existing control behavior.
+Idle leased dispatch also acquires the existing cross-process active-session registry lease before
+Base acknowledgement, pinned to the routed profile home. Exact event/ingress ownership transfers
+that lease to core; competing ingress cannot reacquire its writer. Last owner releases any
+untransferred slot, including cancellation before task start. Unreadable ownership blocks readiness.
+Core/hook entry marks effect history before invocation; later refusal cannot regain positive proof.
+
+An extension may offer version1 refusal receipts only with explicit True and an allowlisted
+reason, synchronously authenticated request version/DD headers, and exact body/DD binding when
+body was read. Generic503/500, malformed or missing proof, timeout and wrong identity are UNKNOWN.
+The external consumer owns its wire schema and durable intent; native source supplies no resend
+policy. Missing admission capability at first ingress refuses before body work.
+
+Kanban notification claims atomically store a scalar JSON string in existing subscription
+`delivery_metadata.notification_attention_v1` with schema version1, outcome UNKNOWN, exact
+attempt id, original/claimed cursor, complete task/result/event snapshots, original subscription,
+owner principal, profile/home/board/database realpath, time/reason and required operator action.
+Record and claim commit together before any ping/artifact/wake. Any present attention, including
+malformed/foreign state, blocks collector effects and stale-subscription GC. Generic errors,
+crash and cancellation never rewind, automatically retry or drop after a failure count. Existing
+`hermes kanban notify-list [task] --json` exposes the complete record; text listing marks UNKNOWN
+and shows owner/attempt/cursors. Private attention never travels in platform send metadata.
+Owner identifies the exact profile/subscriber principal; rollout must map this to a named
+accountable operator and preserve actionable handoff, not claim a human assignment was automatic.
+Claim compares the complete subscription generation under its writer lock. Concurrent ownership
+or routing changes defer the claim until a later collection resolves the new profile/home.
+
+Only an unchanged owned attention+cursor can settle successful delivery. Proven pre-effect
+refusal clears its exact attempt and rewinds only its owned cursor; independently committed ping
+receipts survive. Wake reserves a separate native leg after ping checkpoints. SQL/write/readback
+or ownership failures block strict readiness. Attention never expires or resolves automatically;
+no general manual resolution/resend command is introduced. Incapable older source can ignore
+these fields, so rollback safety still requires independent closure and retention proof.
+Ping checkpoints verify exact attention/cursor ownership and saved ping cursor in the same writer
+transaction. Ignored/restored updates or concurrent marker changes roll back and retain UNKNOWN.
+
+Owned notifier HTTP wake uses one POST attempt, including lost-response/timeout failures; generic
+errors and HTTP status alone never authorize replay. If an earlier diagnostic/result wake group
+was accepted, a later pre-effect refusal retains aggregate UNKNOWN rather than rewinding the
+whole cursor. Artifact exceptions and negative delivery results retain attention too. Native image
+batch success means at least one image landed, so owned notifications submit individual image
+uploads to verify every artifact before aggregate settlement.
+
+`claim_notify_delivery` returns cursors/events, subscription/attention and Task captured inside
+its SQLite claim transaction. Delivery never rereads a later task for text, destination or
+artifacts. A later foreign replacement cannot become the caller's ownership token. Existing
+cursor-only consumers keep `claim_unseen_events_for_sub` and its three-value result. Successful
+archive settlement checks exact owned attention/cursor and current archive status, then deletes
+in that same transaction. No postsettlement unconditional unsubscribe; a foreign or malformed
+attention installed after commit survives.
+
+Embedded dispatcher reserves its complete decomposition/claim/spawn tick before mutations.
+Repeated cancellation waits for admitted physical tick completion before releasing singleton lock.
+Strict status also reads machine-shared board claims and task/run worker records without schema
+initialization, reconciliation or signals: running/orphan claims, live terminal workers and
+unverifiable foreign-host workers prevent zero; unreadable stores mean unknown. Retained DBs under
+the supported `boards/_archived/` location stay in this read-only inventory after board removal.
+This inventory
+does not fence independent dispatcher processes. Coordinator must verify their exclusion and
+actual machine-shared dispatcher-lock ownership alongside every served home's cron tick lock.
+Existing task events retain a version1 `worker_spawn_pending` intent before physical launch:
+exact task/run/claim, profile owner principal, input/history identity, workspace/database and
+required operator action. Only matching verified `spawned` or proven native pre-Popen
+`spawn_failed` receipt resolves that launch. PID handoff verifies actual task/run readback;
+post-spawn failure retains claim and, when writable, appends `worker_spawn_unknown` with PID.
+Unresolved intents block strict readiness, automatic dispatch and native reclaim across restart.
+Generic callback exceptions remain UNKNOWN; signature inspection never retries an invoked callback.
+Owner principal still needs named-human handoff. No queue/schema/automatic resolution introduced;
+incapable rollback remains separately held.
+
+Queued goal checkpoints bind their owning profile before lookup/pause. Fresh reservation spans
+capacity acquisition through core entry. Shutdown preserves all checkpointed goal entries
+in existing slot/overflow as durable owned maintenance pauses before destructive dequeue, including
+empty or muted final responses. A later capacity refusal preserves accepted goal checkpoint as
+maintenance handoff rather than dropping or automatically spinning the FIFO.
+Both enqueue sites pin the originating goal state, including a new generation on set/resume.
+Before pause and immediately before agent entry, the queued obligation must still match that state.
+A replacement (even identical text at the same clock time), user pause, cleared or malformed state
+is never adopted. The existing receipt instead retains the original checkpoint and inputs with
+`pause_applied=false`, `outcome="UNKNOWN"`, `observed_goal`/`observed_goal_raw`, and `required_action`;
+the successor stays untouched and strict readiness latches unknown. A successful owned pause has
+`pause_applied=true`, `outcome="PAUSED"`, and its verified `paused_goal_sha256`. Both outcomes require
+explicit operator accounting, never automatic resume/refund/resend. The history remains in the same
+profile's existing database; no additional queue is created.
+
+Post-turn judge and quality-gate evaluation also pin the pre-evaluation goal generation and exact
+stored JSON. Automatic evaluation uses an isolated snapshot, then compares and reads back every
+save inside the existing SQLite writer transaction. A user pause, clear, replacement or resume
+committed while the judge waits wins; evaluation cannot resurrect its cached goal. A conflict
+retains the original goal, continuation prompt, delivered response and attempted evaluation in the
+same UNKNOWN receipt even with admission open. No continuation or misleading pause notice runs.
+Persistence/readback failure blocks readiness. The gateway adopts and tracks the complete
+evaluation-to-handoff task, so cancellation of its delivered-turn waiter cannot discard the
+physical executor result or durable handoff. Explicit user controls keep their existing contract;
+no writer lock spans a judge, gate or other await.
+
+The initial automatic goal lookup is strict too: confirmed missing row or inactive state can end
+the hook, while unavailable storage, failed reads, present SQL NULL, malformed/nonfinite state or
+unknown fields/status block readiness before its tracked task settles. This path preserves the
+stored goal and conversation history; an unreadable store cannot attest a completed durable
+handoff. The operator must inspect that session before proceeding. No automatic retry or resume
+resolves this uncertainty. Ordinary interactive goal reads retain their existing best-effort behavior.
+
+Strict decoding validates original nested gate/contract/subgoal containers and fields before the
+permissive legacy parser. Every supplied value must survive decoding; missing known legacy fields
+may default and equivalent JSON numbers compare by value, while booleans remain distinct. Discarded
+constraints, unknown nested fields or changed scalar values block readiness and preserve the raw row.
+Duplicate JSON keys at any depth are ambiguous and rejected before decoding.
+The gateway also adopts the whole post-turn task before its earlier routing lookup. Failure of both
+SQLite routing persistence and its JSON fallback latches UNKNOWN before that task settles; cancellation
+cannot abandon later goal/loop accounting. A surviving authoritative routing path keeps normal behavior.
+
+Automatic loop completion, tick claims and heartbeat claims/refunds also use confirmed metadata
+reads and exact-row compare-and-swap with writer-transaction readback. Failed reads, malformed
+state, rejected writes or unconfirmed readback close readiness as UNKNOWN; cached changes never
+attest persisted completion. A concurrent user pause or replacement keeps ownership. Heartbeat
+refund runs off-loop; its task and physical executor remain tracked. A refund cancelled before
+its first step closes UNKNOWN before registry removal. Strict readiness includes registered
+completed futures until their accounting callbacks finish. Interactive managers retain their
+existing best-effort defaults.
+
+Rotating compression passes its actual session database to validated goal, loop and heartbeat
+transfer. Each transfer copies the exact original JSON to the child and marks the parent cleared
+in one checked SQLite writer transaction. Unknown fields, duplicate keys, lossy normalization,
+foreign child state or storage/readback failure cannot silently discard the parent's checkpoint.
+The existing native execution context closes UNKNOWN before ownership settles, even when
+compression catches the transfer error. The child session may already exist; this does not
+attest rollback of the whole compression. Raw state and ancestor history remain inspectable.
+This uncertainty latch is process-local and supplies no restart or OLD-source bootstrap proof.
+
+Loop admission retains the exact raw claim and owning database through the actual Base task's
+termination. An adopted native monitor preserves its existing lease and executor accounting;
+it does not block scans of other loops. Normal post-turn completion must match that claim (or
+its verified compression child), enter core, and finish confirmed loop accounting. Preflight
+refusal, caught turn failure, generic error, or cancellation cannot silently reschedule the
+charged attempt. Original checkpoint/history remain actionable with readiness UNKNOWN; physical
+workers remain counted until actual settlement. A cancelled-before-start monitor also closes
+UNKNOWN before removal. Slash-command loops complete after actual command dispatch and Base
+termination, rather than merely receiving an admission boolean.
+
+Only a positively typed pre-effect admission refusal, with unchanged no-effect history and no
+accepted/spawned task, may rewind the exact owned claim. Missing admission receipt or an exception
+after effects is ambiguous; neither refunds the tick nor authorizes automatic replay. A misleading
+typed refusal after effects propagates generic uncertainty. This deliberately tightens the former
+untyped `WakeNotAccepted` refund. Compression transfer reads back both final rows after both writes,
+so a parent-clear trigger cannot invalidate an earlier child readback unnoticed.
+
+Heartbeat settlement likewise owns the actual Base task through termination. Missing core entry
+does not prove no effects: processing hooks, turn preparation or `agent:start` hooks may already
+have run. Their cancellation or failure retains the charged heartbeat and closes readiness UNKNOWN;
+reopening cannot replay that attempt. This intentionally replaces the old denial-text refund.
+Only a positively typed pre-effect refusal or a Base task cancelled with unchanged no-effect
+history refunds the exact claim. A confirmed no-effect refund's strict physical writer stays owned
+after observer cancellation and marks storage failures UNKNOWN. Cancelling the observer before
+that writer starts closes UNKNOWN. These are process-local controls, not restart/bootstrap proof.
+
+Worker PID publication verifies final task/run rows after the resolving `spawned` receipt write,
+inside the same SQLite transaction. A receipt trigger cannot erase a fast-completed live child's
+run PID and commit a false resolution; failed readback rolls back receipt and PID writes, leaving
+the original pending launch, result and history retained as UNKNOWN.
+
+Queued goals also bind the originating conversation to the resolved/current route before preparation
+and again before actual entry. Only a verified compression tip with the identical migrated goal may
+continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation
+as UNKNOWN with `ownership_conflict` (origin/resolved/current IDs, route, suspension and reason).
+No successor is paused or invoked, and rejected work runs no post-turn bookkeeping that could reset
+a suspended route. Kickoff/resume freeze original command message ID, channel prompt/context and raw
+payload as the same JSON-safe private snapshot for immediate, FIFO, cancellation and capacity handoff.
+These inputs remain preservation metadata; the synthetic execution envelope is unchanged.
+
+Unresolved physical launch evidence also protects the complete task history, worker logs and managed
+workspace, including ancestor handoff inputs. Event/log GC and workspace cleanup check this ownership
+under the existing SQLite writer transaction, serialized with launch intent commit. Archive/delete
+refuse unresolved task/ancestor ownership; completion may settle its result while preserving inputs.
+Verified matching launch settlement restores ordinary cleanup eligibility. No absence-of-PID or
+elapsed-time inference clears the launch, and no new settlement/resend interface is added.
+
+The final queued-goal check runs after the last await: a nonwaiting route lock and SQLite writer
+snapshot verify the prepared session, original goal generation and verified compression tip together,
+then mark execution entry before releasing either lock. Preparation-time compression can advance the
+prepared identity only along that verified lineage with identical goal state. Contention or unreadable
+ownership retains the exact original obligation as UNKNOWN; no lock spans an await.
+
+Unlink cannot remove an unresolved obligation's ancestor protection. Log retention covers both the current
+`<task>.log` and supported numbered rotations. Whole-board hard deletion checks the database inside
+the directory being removed, independently of a database override, and refuses active/unverifiable
+workers, unresolved launches or any notification attention. Before unlinking files, it commits and
+reads back a version1 `board_removal_pending` event in the existing task-events store, with empty
+task ID, operation identity, owner principal, database path and required operator action. Native writer
+transactions reject any present removal event. This also closes preopened WAL connections, which
+otherwise can keep claiming work after filesystem deletion. Failed/interrupted deletion leaves the
+surviving store closed and strict inventory UNKNOWN across restart; no automatic clearing/reopen.
+The matching private version1 record at `<kanban-home>/kanban/board-removals/<slug>.json` survives
+outside the deletion set. Stable nonwaiting file ownership serializes removal, while full byte CAS
+preserves any foreign/malformed replacement. Connect/create/writer checks refuse retained external
+ownership before automatic initialization. Only successful owned removal with absent target clears
+that exact outside record; failure after deleting the database or entire directory stays UNKNOWN.
+Our database descriptor closes after checked intent commit and before filesystem unlink; old WAL
+connections still refuse through their durable event. No lock inode is unlinked. Aliased directory/DB
+removal is refused because its physical ownership path cannot be retained by this contract.
+Explicit recreation after successful removal creates an independent database, while old connections remain closed. Existing
+archive behavior retains its database for inventory. These guards require the new source; old writers
+and incapable rollback still need separate exclusion. Owner principal does not assign a human.
+
+Inventory enumerates default/named/archived database realpaths plus any configured database override;
+an override cannot hide another board. Task deletion and archived-task purge retain running claims,
+live or unverifiable task/run PIDs, unresolved launch/notification attention and original ancestors.
+The same retained set protects events, current/rotated logs, attachment removal and workspace cleanup,
+including ancestor handoffs and the completion-before-physical-exit window. Unreadable process
+fingerprints retain ownership without authorizing signals or automatic reclaim. Log GC refuses a
+database override that differs from the log board, and never creates a missing ownership database.
+Both persisted and current composed worker fingerprints require complete boot-ID/PID1/start witnesses;
+partial epochs remain unknown. Log GC pins the effective board before selecting logs and database.
+Attachment reference checks and unlink share the writer transaction, including legacy path aliases;
+a registration queued behind deletion refuses a missing blob before recording metadata or history.
+Failed-upload, size-rejection and staged-copy cleanup use the same serialized reference check;
+unreadable ownership retains the file and original failure. Referenced workspace inputs defer removal.
+Shared retained workspace realpaths also defer enclosing, nested and alias cleanup, even without
+attachment rows; direct, parent and CLI cleanup hold the writer boundary through removal.
+The shared blob-unlink seam also preserves an input inside a retained workspace after its last
+attachment row is removed or upload registration fails. Nested writer savepoints validate board
+closure before yielding, leaving their caller's outer transaction owned by that caller.
+Attachment identity, input containment and retained workspace overlap share the existing NFC
+comparison policy after realpath resolution. Destructive I/O keeps the original stored path spelling;
+on normalization-sensitive filesystems equivalent comparison keys conservatively retain inputs.
+Resolved original paths stay separate from comparison keys; keys never become lookup paths.
+Actual filesystem identity and ancestor checks also retain case aliases. Unreadable identity
+refuses destructive cleanup; absent names alone do not imply business completion or retry authority.
+Native log rotation runs before claim under that same board's writer boundary. Prior physical,
+launch, notification or ancestor ownership preserves every generation, including zero-backup
+configuration. An injected database cannot authorize canonical log rotation; append-only spawn
+remains available. Read-only strict inventory uses tracked connections so concurrent header probes
+cannot discard SQLite snapshot locks.
+Rotation pins the effective board and log target before validation; concurrent board selection
+changes cannot redirect deletion into another board's retained generations.
+Legacy scalar process witnesses must be finite and positive; malformed witnesses retain ownership.
+Bounded media-history delivery may time out, but its deferred physical read remains registered until
+the actual daemon thread exits, including cancellation and post-read thread teardown.
+Any notification attention (including malformed/foreign)
+also keeps strict readiness UNKNOWN across restart. Normal completion/archive semantics remain;
+ordinary settled deletion/GC becomes eligible after physical ownership and attention both settle.
+
+Supported pre-dispatch text rewrites clone the event while retaining private native checkpoints.
+Only the current live reservation's exact event may transfer its reserved capacity/startup ownership
+to that clone; matching session keys or inherited context alone grant no permission. Original
+transport text stays unchanged. Real agent entry marks the original event too, so a cancellation
+callback cannot mistake an executing rewritten goal/heartbeat for work cancelled before entry.
+
+Already accepted in-core goal followups return to the existing Base
+FIFO for a separately reserved task. Native boot continuation retains verified same-session boot
+provenance in a fresh event/session reservation; HTTP cannot borrow it. Session facade callbacks
+retain unleased physical futures too. Base carries runner I/O identity independently of ingress
+permission; clearing human FIFO ingress never removes physical-worker ownership.

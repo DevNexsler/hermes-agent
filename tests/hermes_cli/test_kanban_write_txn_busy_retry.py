@@ -53,6 +53,8 @@ def _other():
 def _no_file_check(monkeypatch):
     # Isolate the boundary behaviour from the post-commit invariant.
     monkeypatch.setattr(kbc, "_check_file_length_invariant", lambda conn: None)
+    # Scripted boundary doubles have no board store; real closure tests use SQLite.
+    monkeypatch.setattr('hermes_cli.kanban_db_spawn.require_writable_board', lambda conn: None)
 
 
 def test_retry_sleep_respects_floor(monkeypatch):

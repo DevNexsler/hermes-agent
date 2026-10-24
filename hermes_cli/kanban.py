@@ -1193,6 +1193,13 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
             f"  user_id_alt={s['user_id_alt']}" if s.get("user_id_alt") else "",
             "" if dmode == "notify" else f"  mode={dmode}",
         ))
+        if 'notification_attention_v1' in (s.get('delivery_metadata') or {}):
+            try:
+                attention = json.loads(s['delivery_metadata']['notification_attention_v1'])
+                extras += f"  UNKNOWN owner={attention['owner']} attempt={attention['attempt_id']} cursor={attention['original_cursor']}->{attention['claimed_cursor']}"
+            except (TypeError, ValueError, KeyError):
+                extras += "  UNKNOWN unreadable attention"
+            extras += " — inspect --json; operator review required; no automatic resend"
         print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}  (since event {s['last_event_id']}){extras}")
     return 0
 

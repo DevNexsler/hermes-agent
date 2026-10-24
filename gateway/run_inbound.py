@@ -1,8 +1,6 @@
 """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner.
 
-Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
-``gateway.run`` internals are imported lazily inside method bodies (import cycle),
-so ``patch("gateway.run.X")`` keeps intercepting them at call time.
+Bound via GatewayRunner MRO; late facade imports preserve patch seams and avoid cycles.
 """
 
 from __future__ import annotations
@@ -10,8 +8,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
+from gateway.admission import native_to_thread, refuse_control_ingress, startup_resume_admitted, mark_ingress_effect, refuse_queued_ingress
 import concurrent.futures
-import dataclasses
+from gateway.admission_capacity import rewrite_dispatch_text
 import json
 import os
 import re
@@ -95,7 +94,7 @@ class GatewayInboundMixin:
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    event = dataclasses.replace(event, text=_new_text)
+                    event = rewrite_dispatch_text(self, event, _new_text)
                 break
             if _action == "allow":
                 break
@@ -201,7 +200,6 @@ class GatewayInboundMixin:
             with suppress(Exception):
                 _slack_adapter = self._intake_adapter_for(source)
         if (
-            # See #51899.
             not is_internal
             and getattr(source, "platform", None) == Platform.SLACK
             and _is_slack_ignored_channel(_config, _chat_id, _slack_adapter)
@@ -213,6 +211,7 @@ class GatewayInboundMixin:
             getattr(self, "_startup_restore_in_progress", False)
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not startup_resume_admitted(self, event, self._session_key_for_source(source))
         ):
             self._queue_startup_restore_event(event)
             return None
@@ -323,7 +322,7 @@ class GatewayInboundMixin:
         _up_state = self._peek_session_state(_quick_key)
         if _up_state is None or not _up_state.persistent.update_prompt_pending:
             return None
-        # Accept /approve and /deny as shorthand for yes/no
+        refuse_control_ingress(self)
         cmd = event.get_command()
         _recognized_cmd = None
         if cmd in {"approve", "yes"}:
@@ -365,8 +364,7 @@ class GatewayInboundMixin:
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Intercept a reply to a pending clarify prompt; None when the message falls through.
-        Free text answers open-ended/"Other" prompts; "2" answers a multi-choice one. Resolved/retained
-        replies return "" so adapters don't double-post — the agent produces the next user-facing message."""
+        Resolved/retained replies return "" so adapters don't double-post."""
         try:
             from tools import clarify_gateway as _clarify_mod
             _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key, include_choice_prompts=True)
@@ -374,6 +372,7 @@ class GatewayInboundMixin:
             return None
         if _pending_clarify is None:
             return None
+        refuse_control_ingress(self)
         _clarify_has_audio = bool(self._pending_event_audio_paths(event))
         _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
 
@@ -459,13 +458,13 @@ class GatewayInboundMixin:
         _pending_confirm = _slash_confirm_mod.get_pending(_quick_key)
         if not _pending_confirm:
             return None
+        refuse_control_ingress(self)
         with suppress(Exception):
             from tools.approval import has_blocking_approval
             if has_blocking_approval(_quick_key):
                 return None
         # Accept bang-prefixed replies (`!always`, `!cancel`) verbatim: Slack/Matrix show the `!`
-        # prefix (typed `/` is blocked in Slack threads) and adapters only rewrite
-        # `!<known-command>` — confirm keywords aren't commands, so the `!` survives to here.
+        # prefix; confirm keywords survive adapter command rewriting.
         _norm_reply = (event.text or "").strip().lstrip("!/").lower()
         _confirm_choice = (
             self._SLASH_CONFIRM_CMD_CHOICES.get(event.get_command())
@@ -567,6 +566,8 @@ class GatewayInboundMixin:
         self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
     ) -> None:
         """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
+        from gateway.admission import refuse_queued_ingress
+        refuse_queued_ingress(self)
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
@@ -633,18 +634,19 @@ class GatewayInboundMixin:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
     def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
-        """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
         steered = False
         if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
             try:
                 steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
             except Exception as exc:
+                from gateway.admission import ingress_admitted
+                if ingress_admitted(self):
+                    raise
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
         if steered:
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
-        logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
         self._queue_or_replace_pending_event(_quick_key, event)
 
     async def _hm_busy_interrupt(
@@ -652,8 +654,9 @@ class GatewayInboundMixin:
     ) -> None:
         """Interrupt path: redirect text-only corrections when supported, else ``agent.interrupt()``."""
         from gateway.run import _build_media_placeholder
-        # Text-only corrections redirect the live turn (preserving displayed context) when the
-        # runtime supports it; media/voice and older runtimes use the interrupt path below.
+        from gateway.admission import refuse_queued_ingress
+        refuse_queued_ingress(self)
+        # Unleased human corrections keep native redirect/interrupt behavior.
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
         if self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect"):
             if self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
@@ -696,6 +699,8 @@ class GatewayInboundMixin:
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
             return None
         if self._draining:
+            from gateway.admission import refuse_queued_ingress
+            refuse_queued_ingress(self)
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
             if queue_during_drain:
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -844,7 +849,7 @@ class GatewayInboundMixin:
         )
 
     async def _hm_cmd_new(self, event, source, _quick_key):
-        if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+        if await native_to_thread(self._is_telegram_topic_root_lobby, source):
             return True, self._telegram_topic_root_new_message()
         return await self._hm_confirm_destructive(
             event, "new", "This starts a fresh session and discards the current conversation history.",
@@ -1026,7 +1031,8 @@ class GatewayInboundMixin:
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
-        if self._draining:
+        from gateway.admission import ingress_admitted
+        if self._draining and not ingress_admitted(self):
             return True, f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now.", command
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -1245,14 +1251,12 @@ class GatewayInboundMixin:
         never promoted, e.g. a compression-demoted follow-up) silently orphaned those events. The
         oldest orphan runs as THIS turn and the incoming event is parked behind the chain. Skipped
         for control commands and internal events."""
+        from gateway.admission import ingress_admitted
+        if ingress_admitted(self):
+            return event, source, is_internal  # Never lend this arrival to previously accepted work.
         try:
             # ── FIFO orphan rescue (#99882) ──────────────────────────────── If this session went idle with
-            # a populated overflow (queued during a busy window whose post-turn drain never promoted — e.g.
-            # a compression-demoted follow-up after the compression window ended through an exit that
-            # skipped the promotion site), those events were silently orphaned. We are starting the next
-            # turn for this session NOW: re-stage the orphans in FIFO order and enqueue the incoming event
-            # behind them, so arrival order (#28503) holds: oldest orphan runs as this turn, the rest drain
-            # in order, the new message last.
+            # a populated overflow, re-stage FIFO: oldest first, incoming last (#28503).
             _orphan_adapter = self._delivery_adapter_for(source)
             if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
                 return event, source, is_internal
@@ -1275,23 +1279,16 @@ class GatewayInboundMixin:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        mark_ingress_effect(self)
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
-        # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
-        # not on the adapter's raw inbound: profile routing, the ignored-channel
-        # guard, plugin hooks and user authorization all reject events above,
-        # and a rejected event must not be able to clear a refusal belonging to
-        # an active turn. This is also the single entry point every lane shares
-        # — Discord interaction passthrough builds its own MessageEvent and
-        # calls handle_message directly, so a teardown on the relay's inbound
-        # handler left those turns muted.
-
+        # Terminal-decline teardown follows authorization: rejected input must not clear a
+        # running turn's refusal. Direct Discord interactions reach this same entry point.
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
             return _paused_notice
-
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
@@ -1301,37 +1298,40 @@ class GatewayInboundMixin:
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
-        if self._is_session_running(_quick_key):
+        from gateway.admission import startup_resume_admitted
+        if self._is_session_running(_quick_key) and not startup_resume_admitted(self, event, _quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
+            attempt = getattr(event, '_loop_admission_checkpoint', None)
+            if attempt is not None:
+                attempt['command_completed'] = True
             return _result
 
-        # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
-        # conversational "yes" would execute a dangerous command.
+        # Exec approvals require /approve or /deny; conversational yes must not execute commands.
         if not is_internal:
-            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+            if await native_to_thread(self._is_telegram_topic_root_lobby, source):
                 # Debounced so a user who forgets about topic mode doesn't get ten reminders.
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
-            # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
-            # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
-            # only fall to zero. Reversible.
-            if self._external_drain_active:
-                logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
-                return (
-                    "⏳ This agent is draining for a maintenance action and isn't "
-                    "accepting new turns right now. It'll be back in a moment — "
-                    "please resend shortly."
-                )
+        # All new turns, including internal producers, honor closure; pre-fence leases finish.
+        from gateway.admission import ingress_admitted
+        if self._external_drain_active and not ingress_admitted(self):
+            logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
+            return (
+                "⏳ This agent is draining for a maintenance action and isn't "
+                "accepting new turns right now. It'll be back in a moment — "
+                "please resend shortly."
+            )
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
+        _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source, event=event)
         if _limit_message is not None:
+            refuse_queued_ingress(self)
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             return _limit_message
 
@@ -1459,7 +1459,7 @@ class GatewayInboundMixin:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
         # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
         # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
-        _img_mode = await asyncio.to_thread(
+        _img_mode = await native_to_thread(
             self._decide_image_input_mode, source=source, session_key=session_key,
         )
         if _img_mode == "native":
@@ -1892,7 +1892,7 @@ class GatewayInboundMixin:
         if adapter is None:
             return False
 
-        await adapter.handle_message(MessageEvent(
+        event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
             allow_gateway_control=False,
             metadata={
@@ -1900,7 +1900,10 @@ class GatewayInboundMixin:
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
             },
-        ))
+        )
+        await adapter.handle_message(event)
+        if not event._gateway_accepted:
+            return False
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,
@@ -2016,9 +2019,9 @@ class GatewayInboundMixin:
 
     async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
         """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
-        result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
+        result = await native_to_thread(transcribe_audio, path, None, "gateway")
         if not result.get("success"):
-            fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
+            fallback = await native_to_thread(transcribe_audio_local_fallback, path)
             if fallback.get("success"):
                 logger.info("Configured STT failed for %s; recovered with local STT", path)
                 result = fallback

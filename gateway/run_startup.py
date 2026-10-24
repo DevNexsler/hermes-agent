@@ -8,6 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+from gateway.admission import native_observer_context, native_session_offload
 import dataclasses
 import faulthandler
 import logging
@@ -15,10 +16,12 @@ import os
 import signal
 import time
 from contextlib import nullcontext, suppress
-from contextvars import copy_context
+from contextvars import Context
+from functools import partial
 from datetime import datetime
 from pathlib import Path
 from gateway.config import Platform
+from gateway.admission import admit_gateway_work
 from gateway.delivery import looks_like_telegram_private_chat_id
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
@@ -64,12 +67,16 @@ class GatewayStartupMixin:
         """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
         until it finishes, else a user message can race it)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.admission import GatewayDraining, startup_resume_ingress
         try:
-            await adapter.handle_message(event)
+            with startup_resume_ingress(self, event, session_key):
+                await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
             if task is not None:
                 await asyncio.shield(task)
+        except GatewayDraining:
+            return  # Durable resume_pending survives closure; no accepted receipt.
         finally:
             # Release the pre-claimed slot if handle_message raised before _handle_message took ownership.
             _pre_state = self._peek_session_state(session_key)
@@ -132,6 +139,7 @@ class GatewayStartupMixin:
             self._startup_warmup_task = None
             return
         self._startup_warmup_task = asyncio.ensure_future(self._warm_turn_prerequisites())
+        self._track_deferred_agent_worker(self._startup_warmup_task, None)
 
     async def _run_boot_probe_in_launch_scope(self, fn):
         """Run a boot-time probe on the default executor under the LAUNCH profile's scope when
@@ -139,19 +147,19 @@ class GatewayStartupMixin:
         free-tier bootstrap) read profile-scoped secrets; an unscoped read under multiplex fails
         closed, so routing overrides resolve as absent and default routing applies. ``copy_context``
         carries the contextvars across the executor hop; single-profile keeps environ semantics."""
-        loop = asyncio.get_running_loop()
+        offload = partial(native_session_offload, self)
         if getattr(self.config, "multiplex_profiles", False):
             from gateway.run import _async_profile_runtime_scope
             from hermes_constants import get_hermes_home
             try:
-                async with _async_profile_runtime_scope(get_hermes_home()):
-                    return await loop.run_in_executor(None, copy_context().run, fn)
+                async with _async_profile_runtime_scope(get_hermes_home(), offload=offload):
+                    return await offload(fn)
             except Exception:
                 # Same fallback as load_gateway_config_for_runner: a scope that cannot be built must not
                 # abort startup; the probe runs unscoped as it did before.
                 logger.debug("multiplex launch-scope entry failed for boot probe %s; running unscoped",
                              getattr(fn, "__name__", fn), exc_info=True)
-        return await loop.run_in_executor(None, copy_context().run, fn)
+        return await offload(fn)
 
     async def _run_free_tier_bootstrap(self) -> None:
         """The free-tier bootstrap mints the Portal identity through the same profile-scoped routing
@@ -204,7 +212,7 @@ class GatewayStartupMixin:
         done, pending = await asyncio.wait(tasks, timeout=timeout)
         if pending:
             args = (timeout, len(pending)) if warn_fmt.count("%") > 1 else (timeout,)
-            await asyncio.to_thread(logger.warning, warn_fmt, *args)
+            await native_session_offload(self, logger.warning, warn_fmt, *args)
             late = self._late_failure_callback(late_msg, level=level)
             for task in pending:
                 task.add_done_callback(late)
@@ -272,12 +280,14 @@ class GatewayStartupMixin:
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:
-            await self._send_restart_notification()
-            if planned_restart_notification_pending:
-                await self._replay_pending_planned_restart_notification()
-            await self._redeliver_claimed_obligations(claimed)
+            with native_observer_context(self):
+                await self._send_restart_notification()
+                if planned_restart_notification_pending:
+                    await self._replay_pending_planned_restart_notification()
+                await self._redeliver_claimed_obligations(claimed)
 
-        boot_task = asyncio.create_task(_boot_sends())
+        boot_task = Context().run(lambda: asyncio.create_task(_boot_sends()))
+        self._track_deferred_agent_worker(boot_task, None)
         timeout = _startup_restore_drain_timeout_secs()
         if timeout <= 0:
             await boot_task  # unbounded: a failing send surfaces here (unlike the gate path)
@@ -325,7 +335,7 @@ class GatewayStartupMixin:
         """
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_recoverable
-            if not await asyncio.to_thread(ledger_enabled):
+            if not await native_session_offload(self, ledger_enabled):
                 return []
             # Claim only rows whose exact transport owner is connected: platform-only filtering would spend
             # a disconnected bot's retry budget because another bot on that platform is online.
@@ -337,8 +347,8 @@ class GatewayStartupMixin:
                 _deliverable_targets.update((_pval(p), None) for p in self.adapters)
             for _profile, _adapters in _profile_adapters.items():
                 _deliverable_targets.update((_pval(p), _profile) for p in _adapters)
-            claimed = await asyncio.to_thread(
-                sweep_recoverable, None,
+            claimed = await native_session_offload(
+                self, sweep_recoverable, None,
                 deliverable_platforms={platform for platform, _ in _deliverable_targets},
                 deliverable_targets=_deliverable_targets,
             )
@@ -353,8 +363,7 @@ class GatewayStartupMixin:
         await self._clear_resume_pending_for_claimed_obligations(claimed)
         return claimed
 
-    @staticmethod
-    async def _release_runtime_claim_quiet(obligation_id, log_fmt: str, error: str = "send_path_degraded") -> None:
+    async def _release_runtime_claim_quiet(self, obligation_id, log_fmt: str, error: str = "send_path_degraded") -> None:
         """Release an unsent runtime delivery-ledger claim; log-only on failure. ``error`` is what the row
         goes back to ``failed`` with: the claim's own pre-claim error when the caller knows it, so a
         flood-refused row keeps its ``flood_control:<seconds>`` and stays on the flood timer's list (the
@@ -362,7 +371,7 @@ class GatewayStartupMixin:
         ``send_path_degraded``."""
         from gateway.delivery_ledger import release_runtime_claim
         try:
-            await asyncio.to_thread(release_runtime_claim, obligation_id, error)
+            await native_session_offload(self, release_runtime_claim, obligation_id, error)
         except Exception:
             logger.debug(log_fmt, obligation_id, exc_info=True)
 
@@ -387,7 +396,7 @@ class GatewayStartupMixin:
             try:
                 while getattr(self, "_running", False):
                     wake.clear()
-                    waiting = await asyncio.to_thread(pending_retries)
+                    waiting = await native_session_offload(self, pending_retries)
                     deadlines = [r["not_before"] for r in waiting
                                  if (r["platform"], r["profile"]) == key]
                     if not deadlines:
@@ -416,7 +425,7 @@ class GatewayStartupMixin:
     async def _arm_flood_timers_for_waiting_rows(self) -> None:
         """Recover adopted, newly refused/rejected and unsent released rows without blocking the loop."""
         from gateway.delivery_ledger import pending_retries
-        for row in await asyncio.to_thread(pending_retries):
+        for row in await native_session_offload(self, pending_retries):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
@@ -450,15 +459,15 @@ class GatewayStartupMixin:
                 result = None
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    await native_session_offload(self, mark_delivered, row["obligation_id"])
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                    await native_session_offload(
+                        self, mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
@@ -507,9 +516,9 @@ class GatewayStartupMixin:
         the next restart. Best-effort; reuses the startup redelivery contract."""
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
-            if not await asyncio.to_thread(ledger_enabled):
+            if not await native_session_offload(self, ledger_enabled):
                 return 0
-            claimed = await asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
+            claimed = await native_session_offload(self, sweep_failed_for_runtime, platform.value, profile=profile)
         except Exception:
             logger.debug(
                 "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
@@ -607,7 +616,6 @@ class GatewayStartupMixin:
             _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
             _resume_state.turn.started_ts = time.time()
             self._persist_active_agents()
-            # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
@@ -728,7 +736,7 @@ class GatewayStartupMixin:
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
-        ledger_on = await asyncio.to_thread(ledger_enabled)
+        ledger_on = await native_session_offload(self, ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
             self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -748,8 +756,8 @@ class GatewayStartupMixin:
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
-                await asyncio.to_thread(
-                    record_crash_left_reply,
+                await native_session_offload(
+                    self, record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
                     thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
@@ -804,7 +812,7 @@ class GatewayStartupMixin:
         return service
 
     async def _ensure_hosted_room_worker(self):
-        return await asyncio.to_thread(self._start_hosted_room_worker_sync)
+        return await native_session_offload(self, self._start_hosted_room_worker_sync)
 
     async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
         """Keep the room worker alive for the messaging gateway lifetime."""
@@ -815,7 +823,7 @@ class GatewayStartupMixin:
     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
         """Pause room execution durably without interrupting accepted turns."""
         from tui_gateway import methods_groups
-        return await asyncio.to_thread(methods_groups.stop_hosted_room_service, timeout=timeout)
+        return await native_session_offload(self, methods_groups.stop_hosted_room_service, timeout=timeout)
 
     def _start_loop_heartbeat_task(self) -> None:
         """Start the loop-liveness heartbeat task (idempotent, best-effort). An asyncio task so a
@@ -827,17 +835,12 @@ class GatewayStartupMixin:
             _existing_hb = getattr(self, "_loop_heartbeat_task", None)
             if _existing_hb is not None and not _existing_hb.done():
                 return
-            task = self._loop_heartbeat_task = asyncio.create_task(
-                loop_heartbeat_forever(
+            self._loop_heartbeat_task = self._spawn_supervised(
+                lambda: loop_heartbeat_forever(
                     interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
                     start_time=getattr(self, "_gateway_started_at", 0.0),
-                )
+                ), "loop_liveness_heartbeat", restart=False,
             )
-            # PERMANENT watcher tag so the scale-to-zero idle check doesn't count it as busy forever.
-            task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
-            _bg = getattr(self, "_background_tasks", None)
-            if _bg is not None:
-                self._track_task_in(_bg, task)
 
     def _open_faulthandler_log(self):
         """Open (append) ``<log_dir>/gateway_faulthandler.log``, creating the directory."""
@@ -906,7 +909,8 @@ class GatewayStartupMixin:
                 logger.info("Active profile: %s", _profile)
         try:
             from gateway.status import write_runtime_status
-            persisted = await asyncio.to_thread(
+            persisted = await native_session_offload(
+                self,
                 write_runtime_status,
                 gateway_state="starting",
                 exit_reason=None,
@@ -1433,7 +1437,8 @@ class GatewayStartupMixin:
         # Initial channel directory for send_message name resolution
         with _log_suppressed(logging.WARNING, "Channel directory build failed: %s"):
             from gateway.channel_directory import build_channel_directory
-            directory = await build_channel_directory(self.adapters)
+            with native_observer_context(self):
+                directory = await build_channel_directory(self.adapters)
             ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
             logger.info("Channel directory built: %d target(s)", ch_count)
         # Restarting after a /update still in progress: keep watching so we notify when it finishes.
@@ -1455,10 +1460,7 @@ class GatewayStartupMixin:
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():
             self._booted_from_restart = True
-        # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
-        # control sleep here once froze every platform).
-        # Restart notification, home-channel startup notice, and obligation redelivery all call
-        # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
+        # Bound lifecycle sends: a Telegram flood sleep must not freeze restore (#91969).
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
@@ -1545,6 +1547,9 @@ class GatewayStartupMixin:
             await self._start_flush_runtime_status()
 
     async def _start_impl(self) -> bool:
+        from gateway.admission import wait_for_admission_hold
+        if not await wait_for_admission_hold(self):
+            return True
         logger.info("Starting Hermes Gateway...")
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
@@ -1553,11 +1558,8 @@ class GatewayStartupMixin:
         if self._start_check_access_policy():
             return True
         await self._start_recover_previous_run()
-        # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
-        # demand-time site (provider resolution, /login, the connector token) is a read that needs the
-        # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
-        # first DM from arriving with nothing to resolve. With the launch gate unset this is a local
-        # inventory and no network.
+        # Bootstrap identity before adapters connect, so a fast first DM can resolve it.
+        # With launch gate unset this remains local inventory, without network.
         await self._run_free_tier_bootstrap()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
@@ -1753,6 +1755,7 @@ class GatewayStartupMixin:
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
 
+    @admit_gateway_work
     async def _process_handoff(self, row: Dict[str, Any], profile_name: Optional[str] = None) -> None:
         """Execute one handoff row; raises on failure (caller marks failed). ``profile_name`` (None =
         root) is the profile whose store queued it — load-bearing under multiplex: secondaries live in

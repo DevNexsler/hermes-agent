@@ -84,8 +84,11 @@ def test_recycled_pid_and_legacy_row_are_never_signalled(conn):
     legacy = _sleeper()
     try:
         tid, run_id = _completed_card_with_worker(conn, stranger)
-        # PID reuse: the recorded fingerprint belongs to a process that no longer exists.
-        conn.execute("UPDATE task_runs SET worker_started_at = worker_started_at - 1000000 WHERE id=?", (run_id,))
+        from gateway.status import get_process_start_time
+        current = get_process_start_time(stranger.pid)
+        # Use a valid positive legacy witness, not SQL arithmetic on composed UUID text.
+        recorded = max(1, current - 1000000) if current is not None else kbd.UNVERIFIED_WORKER_FINGERPRINT
+        conn.execute('UPDATE task_runs SET worker_started_at=? WHERE id=?', (recorded, run_id))
         _, legacy_run = _completed_card_with_worker(conn, legacy)
         conn.execute("UPDATE task_runs SET worker_started_at = NULL WHERE id=?", (legacy_run,))
 
@@ -93,7 +96,8 @@ def test_recycled_pid_and_legacy_row_are_never_signalled(conn):
 
         assert stranger.poll() is None and legacy.poll() is None
         # Stale evidence is dropped so the row is not rescanned; the legacy row is left alone.
-        assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()["worker_pid"] is None
+        expected = None if current is not None else stranger.pid
+        assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()["worker_pid"] == expected
         assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (legacy_run,)).fetchone()["worker_pid"] == legacy.pid
     finally:
         for p in (stranger, legacy):

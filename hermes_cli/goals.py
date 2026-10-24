@@ -9,6 +9,8 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +18,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -428,6 +431,7 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    generation_id: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -440,6 +444,7 @@ class GoalState:
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
+            generation_id=data.get('generation_id'),
             status=data.get("status", "active"),
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
@@ -610,8 +615,58 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
+def _validate_goal_nested_state(data: dict) -> None:
+    """Automatic ownership must not rely on legacy coercions that discard constraints."""
+    subgoals = data.get('subgoals', [])
+    contract = data.get('contract', {})
+    gates = data.get('gates', [])
+    if not isinstance(subgoals, list) or any(not isinstance(s, str) or not s.strip() for s in subgoals):
+        raise ValueError('goal subgoal structure unconfirmed')
+    if (not isinstance(contract, dict) or contract.keys() - GoalContract.__dataclass_fields__.keys()
+            or any(not isinstance(v, str) for v in contract.values())):
+        raise ValueError('goal contract structure unconfirmed')
+    if not isinstance(gates, list):
+        raise ValueError('goal gate structure unconfirmed')
+    for gate in gates:
+        if (not isinstance(gate, dict) or gate.keys() - GoalGate.__dataclass_fields__.keys()
+                or not isinstance(gate.get('command'), str) or not gate['command'].strip()):
+            raise ValueError('goal gate identity or fields unconfirmed')
+    for key in ('last_verdict', 'last_reason', 'paused_reason', 'waiting_reason', 'waiting_on_session', 'generation_id'):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            raise ValueError('goal optional text identity unconfirmed')
+
+
+def _confirmed_goal_state(raw: str) -> GoalState:
+    """Decode an automatic ownership witness without discarding unknown state."""
+    from hermes_cli.session_state_io import parse_confirmed_json, values_preserved
+    data = parse_confirmed_json(raw)
+    if not isinstance(data, dict) or data.keys() - GoalState.__dataclass_fields__.keys():
+        raise ValueError('goal checkpoint contains unknown fields or structure')
+    _validate_goal_nested_state(data)
+    state = GoalState.from_json(raw)
+    json.dumps(asdict(state), allow_nan=False)
+    if not values_preserved(data, asdict(state)):
+        raise ValueError('goal checkpoint normalization would discard or change stored inputs')
+    if (state.status not in ('active', 'paused', 'done', 'cleared') or not isinstance(state.goal, str)
+            or (state.status in ('active', 'paused') and not state.goal.strip())):
+        raise ValueError('goal checkpoint identity or status unconfirmed')
+    return state
+
+
+def _load_confirmed_goal(session_id: str) -> Optional[GoalState]:
+    db = _get_session_db()
+    if db is None or not session_id:
+        raise RuntimeError('automatic goal lookup unavailable')
+    # get_meta conflates an absent row with a present SQL NULL value.
+    with db._lock:
+        row = db._conn.execute('SELECT value FROM state_meta WHERE key=?', (_meta_key(session_id),)).fetchone()
+    return None if row is None else _confirmed_goal_state(row[0])
+
+
+def load_goal(session_id: str, *, strict: bool = False) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
+    if strict:
+        return _load_confirmed_goal(session_id)
     if not session_id:
         return None
     db = _get_session_db()
@@ -654,33 +709,12 @@ def clear_goal(session_id: str) -> None:
     save_goal(session_id, state)
 
 
-def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /goal from a parent session to its continuation. Best-effort, never raises
-    (a failure here must not block compression). Returns True when a goal was migrated.
-
-    Context compression rotates ``session_id`` to a fresh child session, but ``load_goal`` does a flat
-    ``goal:<session_id>`` lookup with no parent-lineage walk — so an active goal silently dies at the
-    compaction boundary (#33618). Copy the goal onto the new session and archive the old row as ``cleared``
-    so exactly one active goal row exists per logical conversation (avoids the "two active goals" hazard of
-    a pure copy).
-    """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
-        return False
-    try:
-        state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
-            return False
-        # Don't clobber a goal already set on the child (e.g. a resumed lineage).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug("GoalManager: migrated goal %s -> %s (%s)", old_session_id, new_session_id, reason or "rotation")
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("GoalManager: goal migration failed: %s", exc)
-        return False
+def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "",
+                            db=None, strict: bool = False) -> bool:
+    """Transfer validated state atomically; automatic compression requires confirmed failure closure."""
+    from hermes_cli.session_state_io import migrate_confirmed_state
+    return migrate_confirmed_state('goal:', old_session_id, new_session_id, _confirmed_goal_state,
+                                    db=db, strict=strict)
 
 
 # ── Judge ─────────────────────────────────────────────────────────────
@@ -1063,6 +1097,10 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+class _GoalEvaluationConflict(RuntimeError):
+    """A user or another producer changed the goal while automatic work was running."""
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1071,10 +1109,10 @@ class GoalManager:
     canonical user-role message to feed back into ``run_conversation``.
     """
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
+    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS, strict: bool = False):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._state: Optional[GoalState] = load_goal(session_id, strict=strict)
 
     # --- introspection ------------------------------------------------
 
@@ -1120,8 +1158,23 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
+        if hasattr(self, '_evaluation_expected_raw'):
+            self._save_evaluation_state()
+        else:
+            save_goal(self.session_id, self._state)
         return self._state
+
+    def _save_evaluation_state(self) -> None:
+        db, key, raw = self._evaluation_db, _meta_key(self.session_id), self._state.to_json()
+        def commit(conn):
+            row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+            if row is None or row[0] != self._evaluation_expected_raw:
+                raise _GoalEvaluationConflict('goal changed during automatic evaluation')
+            db.set_meta(key, raw, cursor=conn)
+            if conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()[0] != raw:
+                raise RuntimeError('automatic goal persistence readback unconfirmed')
+        db._execute_write(commit)
+        self._evaluation_expected_raw = raw
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1148,6 +1201,7 @@ class GoalManager:
             raise ValueError("goal text is empty")
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            generation_id=uuid.uuid4().hex,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
         )
@@ -1168,10 +1222,83 @@ class GoalManager:
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
 
+    def pause_for_maintenance(self, *, owner, hold_id, continuation_prompt, final_response, source,
+                              input_context=None, expected_goal=None, ownership_conflict=None):
+        """Atomically pause unchanged active state and retain exact continuation inputs for its owner.
+
+        Unlike best-effort user commands, maintenance needs verified durable readback before a
+        process can quiesce. An intervening user/foreign mutation is never overwritten.
+        """
+        if not self.is_active() and expected_goal is None:
+            return None
+        if not owner or not continuation_prompt:
+            raise ValueError('maintenance pause requires owner and continuation inputs')
+        from hermes_constants import get_hermes_home
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError('maintenance goal checkpoint store unavailable')
+        expected = _confirmed_goal_state(expected_goal).to_json() if expected_goal is not None else self._state.to_json()
+        paused = GoalState.from_json(expected)
+        if paused.status != 'active':
+            raise ValueError('maintenance continuation must identify an active originating goal')
+        pause_id = uuid.uuid4().hex
+        paused.status = 'paused'
+        paused.paused_reason = f'maintenance-deferred; owner={owner}; pause={pause_id}; /goal resume'
+        raw = paused.to_json()
+        receipt = {'version': 1, 'pause_id': pause_id, 'owner': owner, 'hold_id': hold_id,
+                   'pause_applied': True, 'outcome': 'PAUSED',
+                   'required_action': 'Assign accountable operator; verify unchanged owned pause before /goal resume. No automatic resume.',
+                   'session_id': self.session_id, 'profile_home': str(get_hermes_home().resolve()),
+                   'checkpoint': json.loads(expected), 'paused_goal_sha256': hashlib.sha256(raw.encode()).hexdigest(),
+                   'continuation_prompt': continuation_prompt, 'final_response': final_response,
+                   'source': source, 'input_context': input_context, 'created_at': time.time()}
+        key = f'goal_maintenance_pause:{self.session_id}:{pause_id}'
+        def commit(conn):
+            row = conn.execute('SELECT value FROM state_meta WHERE key = ?', (_meta_key(self.session_id),)).fetchone()
+            try:
+                current = _confirmed_goal_state(row[0]).to_json() if row is not None else None
+            except (ValueError, TypeError, AttributeError):
+                current = None
+            if current != expected or ownership_conflict:
+                if expected_goal is None:
+                    raise RuntimeError('goal changed before maintenance pause; existing owner preserved')
+                receipt.update(pause_applied=False, outcome='UNKNOWN', paused_goal_sha256=None,
+                    reason='originating goal or conversation changed; successor untouched',
+                    ownership_conflict=ownership_conflict,
+                    observed_goal=json.loads(current) if current is not None else None,
+                    observed_goal_raw=row[0] if row is not None else None,
+                    required_action='Assign accountable operator; inspect exact old continuation and replacement goal. Do not resume/refund/resend automatically.')
+            history = [dict(row) for row in conn.execute(
+                'SELECT * FROM messages WHERE session_id = ? ORDER BY id', (self.session_id,))]
+            receipt['history_checkpoint'] = {'session_id': self.session_id,
+                'message_ids': [row['id'] for row in history],
+                'sha256': hashlib.sha256(json.dumps(history, sort_keys=True, default=str).encode()).hexdigest()}
+            payload = json.dumps(receipt, sort_keys=True, default=str)
+            db.set_meta(key, payload, cursor=conn)
+            if receipt['pause_applied']:
+                db.set_meta(_meta_key(self.session_id), raw, cursor=conn)
+            expected_rows = {key: payload}
+            if receipt['pause_applied']:
+                expected_rows[_meta_key(self.session_id)] = raw
+            elif row is not None:
+                expected_rows[_meta_key(self.session_id)] = row[0]
+            written = dict(conn.execute('SELECT key, value FROM state_meta WHERE key IN (?, ?)',
+                                        (key, _meta_key(self.session_id))))
+            if written != expected_rows:
+                raise RuntimeError('maintenance goal checkpoint rejected or changed before commit')
+            return payload
+        payload = db._execute_write(commit)
+        if db.get_meta(key) != payload or (receipt['pause_applied'] and db.get_meta(_meta_key(self.session_id)) != raw):
+            raise RuntimeError('maintenance goal checkpoint readback changed or unavailable')
+        if receipt['pause_applied']:
+            self._state = paused
+        return json.loads(payload)
+
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
         self._state.status = "active"
+        self._state.generation_id = uuid.uuid4().hex
         self._state.paused_reason = None
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
@@ -1376,12 +1503,13 @@ class GoalManager:
         self._save()
         return True
 
-    def is_waiting(self) -> bool:
+    def is_waiting(self, *, clear_satisfied: bool = True) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
         (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
         also expires after ``_MAX_BARRIER_WAIT_S``: a watcher or poller that never exits would
         otherwise park the goal indefinitely (one run sat 3 h 22 min on a poller that outlived
-        the work it was polling)."""
+        the work it was polling). Observers pass ``clear_satisfied=False`` so a
+        cached snapshot cannot overwrite concurrent user control."""
         s = self._state
         if s is None:
             return False
@@ -1402,7 +1530,7 @@ class GoalManager:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
             still = False
-        if not still:
+        if not still and clear_satisfied:
             self.stop_waiting()
         return still
 
@@ -1448,6 +1576,41 @@ class GoalManager:
         )
 
     def evaluate_after_turn(
+        self, last_response: str, *, user_initiated: bool = True,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
+        active_delegations: int = 0,
+    ) -> Dict[str, Any]:
+        """Evaluate an isolated snapshot; automatic saves cannot erase intervening user state."""
+        if not self.is_active():
+            return _decision(self._state.status if self._state else None, False, None, 'inactive', 'no active goal', '')
+        origin, prompt = self._state.to_json(), self.next_continuation_prompt()
+        worker = copy.copy(self)
+        worker._state = GoalState.from_json(origin)
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError('automatic goal checkpoint store unavailable')
+        try:
+            raw = db.get_meta(_meta_key(self.session_id))
+            try:
+                matches = _confirmed_goal_state(raw).to_json() == origin
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                matches = False
+            if not matches:
+                raise _GoalEvaluationConflict('goal changed before automatic evaluation')
+            worker._evaluation_db, worker._evaluation_expected_raw = db, raw
+            decision = worker._evaluate_after_turn(last_response, user_initiated=user_initiated,
+                background_processes=background_processes, active_delegations=active_delegations)
+        except _GoalEvaluationConflict as exc:
+            self._state = load_goal(self.session_id)
+            decision = _decision(None, False, None, 'changed', str(exc), '')
+            decision.update(goal_evaluation_origin=origin, interrupted_continuation_prompt=prompt,
+                evaluated_goal_state=worker._state.to_json(),
+                goal_state_conflict={'stage': 'post-turn-goal-evaluation', 'reason': str(exc)})
+            return decision
+        self._state = worker._state
+        return decision
+
+    def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,

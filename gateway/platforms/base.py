@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
+from gateway.admission import admit_gateway_message, native_to_thread, mark_ingress_effect
 
 logger = logging.getLogger(__name__)
 
@@ -626,7 +627,7 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
 
 async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
     """Cache image bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_image_from_bytes, data, ext)
+    return await native_to_thread(cache_image_from_bytes, data, ext)
 
 
 async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type: str, accept: str,
@@ -646,7 +647,7 @@ async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type:
                 async with client.stream("GET", url, headers=headers) as response:
                     response.raise_for_status()
                     content = await _read_httpx_body_with_limit(response, media_type=media_type)
-                return await asyncio.to_thread(cache_fn, content, ext)
+                return await native_to_thread(cache_fn, content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
                     raise
@@ -694,7 +695,7 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
 
 async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg") -> str:
     """Cache audio bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_audio_from_bytes, data, ext)
+    return await native_to_thread(cache_audio_from_bytes, data, ext)
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:
@@ -722,7 +723,7 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
 
 async def cache_video_from_bytes_async(data: bytes, ext: str = ".mp4") -> str:
     """Cache video bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_video_from_bytes, data, ext)
+    return await native_to_thread(cache_video_from_bytes, data, ext)
 
 
 # Document / screenshot cache utilities (same pattern; referenced by local path).
@@ -1482,7 +1483,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
 
 async def cache_document_from_bytes_async(data: bytes, filename: str) -> str:
     """Cache document bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_document_from_bytes, data, filename)
+    return await native_to_thread(cache_document_from_bytes, data, filename)
 
 
 # Unified media caching: classify attachment bytes by ext/MIME, route to cache_*_from_bytes.
@@ -1554,7 +1555,7 @@ async def cache_media_bytes_async(
     default_kind: Optional[str] = None,
 ) -> Optional[CachedMedia]:
     """Classify and cache attachment bytes without blocking the event loop."""
-    return await asyncio.to_thread(
+    return await native_to_thread(
         cache_media_bytes,
         data,
         filename=filename,
@@ -2606,50 +2607,8 @@ class BasePlatformAdapter(ABC):
         return _collect_history_media_paths(history)
 
     async def _bounded_history_media_paths_for_session(self, session_key: str) -> Optional[set]:
-        """Run best-effort history lookup in a bounded isolated daemon thread."""
-        def _fail_open(reason: str, *, exc_info: bool = False) -> None:
-            logger.warning(
-                "[%s] " + reason + " %s; delivering bare local file path(s) without history dedup",
-                self.name, session_key, exc_info=exc_info)
-        admission = _HISTORY_MEDIA_LOOKUP_ADMISSION
-        if not admission.acquire(blocking=False):
-            _fail_open("Media-delivery history lookup capacity exhausted for")
-            return None
-        loop = asyncio.get_running_loop()
-        result_future = loop.create_future()
-
-        def _publish_result(result=None, error=None):
-            if not result_future.done():
-                (result_future.set_exception(error) if error is not None
-                 else result_future.set_result(result))
-
-        def _worker():
-            result, error = None, None
-            try:
-                result = self._history_media_paths_for_session(session_key)
-            except BaseException as exc:
-                error = exc
-            try:
-                with contextlib.suppress(RuntimeError):  # loop already closed (gateway shutdown)
-                    loop.call_soon_threadsafe(_publish_result, result, error)
-            finally:
-                admission.release()
-        try:
-            threading.Thread(target=_worker, name="media-history-lookup", daemon=True).start()
-        except Exception:
-            # start() failed (thread exhaustion): the worker never ran, so release the permit here.
-            admission.release()
-            _fail_open("Could not start media-delivery history lookup worker for", exc_info=True)
-            return None
-        try:
-            return await asyncio.wait_for(result_future, timeout=_HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            _fail_open("Timed out loading media-delivery history for")
-            return None
-        except Exception:
-            # Best-effort/fail-open: never let a lookup failure kill media delivery.
-            _fail_open("Media-delivery history lookup failed for", exc_info=True)
-            return None
+        from gateway.platforms.base_history import bounded_history_media_paths
+        return await bounded_history_media_paths(self, session_key)
 
     @abstractmethod
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -3514,8 +3473,10 @@ class BasePlatformAdapter(ABC):
         return response.text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
-        """Call the handler and send its reply inline, with retry, threading and
-        ephemeral deletion — no session lifecycle (active-session bypass paths)."""
+        """Dispatch bypass replies without a competing session lifecycle."""
+        from gateway.admission import mark_ingress_effect
+        if event.get_command() not in ('queue', 'steer', None):
+            mark_ingress_effect(self.gateway_runner)
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
@@ -3524,6 +3485,7 @@ class BasePlatformAdapter(ABC):
         if log_cmd is not None:
             logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                         len(text), event.source.chat_id)
+        mark_ingress_effect(self.gateway_runner)
         result = await self._send_with_retry(
             chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
             metadata=_mark_notify_metadata(thread_meta))
@@ -3531,8 +3493,7 @@ class BasePlatformAdapter(ABC):
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
-        """Routed home + terminal policy for post-handler text, media and error delivery;
-        a no-op without a runner or outside multiplexing."""
+        """Bind routed home and terminal policy during delivery."""
         resolve = getattr(self.gateway_runner, "_media_delivery_scope_for_source", None)
         if not callable(resolve) or source is None:
             return contextlib.nullcontext()
@@ -3861,12 +3822,11 @@ class BasePlatformAdapter(ABC):
 
     def _start_session_processing(self, event: MessageEvent, session_key: str, *,
                                   interrupt_event: Optional[asyncio.Event] = None) -> bool:
-        """Spawn a background processing task under the session guard; True on success. If
-        ``create_task`` is stubbed with a non-Task sentinel (tests), the guard is rolled back
-        (False)."""
+        """Spawn under the session guard; roll back non-Task test sentinels."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        from gateway.admission import adopt_ingress_task
+        task = adopt_ingress_task(self.gateway_runner, asyncio.create_task(self._process_message_background(event, session_key)))
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
@@ -3947,13 +3907,13 @@ class BasePlatformAdapter(ABC):
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    @admit_gateway_message
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
         if not self._message_handler:
-            # No handler = every inbound silently discarded on an adapter that still polls and sends;
-            # say so once per adapter (#102260).
+            # A connected adapter without a handler silently discards inbound (#102260).
             if not getattr(self, "_no_message_handler_logged", False):
                 self._no_message_handler_logged = True
                 logger.error(
@@ -3970,19 +3930,20 @@ class BasePlatformAdapter(ABC):
         if self._drop_unresolved(event):
             return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
-        # Explicitly routed events already name their destination; recovering a
-        # different topic would redirect them and yield before the session claim.
+        # Routed events already name their destination; topic recovery would redirect it.
         if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
-            await asyncio.to_thread(self._apply_topic_recovery, event)
+            await native_to_thread(self._apply_topic_recovery, event)
         session_key = self._event_session_key(event)
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
-        # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
+        from gateway.admission import prepare_ingress_dispatch
+        if await prepare_ingress_dispatch(self, event, session_key):
+            return
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
             return
@@ -3990,15 +3951,9 @@ class BasePlatformAdapter(ABC):
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
-        """Route a message that arrived while ``session_key`` is busy: bypass
-        commands / clarify replies dispatch inline, everything else is queued."""
-        # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
-        # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
-        # calling the message handler directly and sending the response.  Do NOT use
-        # _process_message_background — it manages session lifecycle and its cleanup
-        # races with the running task (split-brain, see PR #4926).
-        # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
-        # runner. Without this, they are queued as pending messages and either: See #4926.
+        """Route busy control replies inline and ordinary human followups to their queue."""
+        # Inline bypass avoids approval deadlocks and competing lifecycle ownership.
+        from gateway.admission import GatewayDraining, ingress_admitted, refuse_control_ingress, refuse_queued_ingress
         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
@@ -4013,14 +3968,11 @@ class BasePlatformAdapter(ABC):
                                  self.name, cmd, session_key)
                     await self._dispatch_inline_reply(event)
             except Exception as e:
+                if isinstance(e, GatewayDraining) or ingress_admitted(self.gateway_runner):
+                    raise
                 logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
             return
-        # Clarify bypass: while blocked on clarify_tool the next message must reach the
-        # text-intercept so numeric/exact/"Other" answers resolve it and unblock the agent.
-        # Otherwise it lands in _pending_messages as a follow-up turn and the answer is
-        # discarded.  Same shape as the /approve deadlock fix (PR #4926): agent thread
-        # blocked on Event.wait, message must reach the resolver before being a new turn.
-        # See #4926.
+        # Clarify answers must reach their resolver before queueing, or the waiting agent deadlocks (#4926).
         if not cmd and event.allow_gateway_control:
             try:
                 from tools import clarify_gateway as _clarify_mod
@@ -4029,18 +3981,26 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 _has_text_clarify = False
             if _has_text_clarify:
+                refuse_control_ingress(self.gateway_runner)
                 logger.debug("[%s] Routing message to clarify text-intercept for %s", self.name, session_key)
                 try:
                     await self._dispatch_inline_reply(event)
                 except Exception as e:
+                    if isinstance(e, GatewayDraining) or ingress_admitted(self.gateway_runner):
+                        raise
                     logger.error("[%s] Clarify text-intercept dispatch failed: %s", self.name, e, exc_info=True)
                 return
         if self._busy_session_handler is not None:
             try:
                 if await self._busy_session_handler(event, session_key):
                     return
+            except GatewayDraining:
+                raise
             except Exception as e:
+                if ingress_admitted(self.gateway_runner):
+                    raise
                 logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+        refuse_queued_ingress(self.gateway_runner)
         # Without a runner FIFO, do not merge a wake into an occupied human slot
         # (or collapse distinct wakes into one turn). Its caller can retry admission.
         if event.internal and session_key in self._pending_messages:
@@ -4086,7 +4046,7 @@ class BasePlatformAdapter(ABC):
                 if not speech_text:
                     raise ValueError("Empty text after markdown cleanup")
                 requested_path = build_auto_tts_output_path(self.platform)
-                tts_data = _json.loads(await asyncio.to_thread(
+                tts_data = _json.loads(await native_to_thread(
                     text_to_speech_tool, text=speech_text, output_path=requested_path))
                 if tts_data.get("success", True):
                     raw_tts_paths = tts_data.get("file_paths") or [tts_data.get("file_path")]
@@ -4130,7 +4090,7 @@ class BasePlatformAdapter(ABC):
         try:
             from gateway.delivery_ledger import (
                 compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
-            if not await asyncio.to_thread(ledger_enabled):
+            if not await native_to_thread(ledger_enabled):
                 return None
             source = event.source
             # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
@@ -4140,13 +4100,13 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
-            await asyncio.to_thread(
+            await native_to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
+            await native_to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
@@ -4164,10 +4124,10 @@ class BasePlatformAdapter(ABC):
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
+                await native_to_thread(mark_delivered, obligation_id)
                 return
             error = str(getattr(result, "error", "") or "")
-            await asyncio.to_thread(mark_failed, obligation_id, error)
+            await native_to_thread(mark_failed, obligation_id, error)
             if is_reconnect_only(error):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
@@ -4438,7 +4398,6 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
-
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
@@ -4450,6 +4409,10 @@ class BasePlatformAdapter(ABC):
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
+            if (getattr(event, '_goal_admission_checkpoint', None) is not None
+                    and await self.gateway_runner._defer_queued_goal_for_maintenance(event)):
+                return
+            mark_ingress_effect(self.gateway_runner)
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
@@ -4491,15 +4454,8 @@ class BasePlatformAdapter(ABC):
                 if not _tts_paths and _tts_requested_path is not None:
                     with contextlib.suppress(OSError):
                         os.remove(_tts_requested_path)
-                # Suspend the typing refresh before the first delivery attempt, not just in
-                # the turn's finally (#117300): if the final send stalls (platform accepted it
-                # but the HTTP ack never returns), control never reaches the finally, and
-                # _keep_typing keeps refreshing sendChatAction forever while the agent is
-                # already idle and the user can read the answer. Reuse the existing
-                # _typing_paused mechanism: _keep_typing skips paused chats each tick and
-                # _stop_typing_refresh's finally discards it, so it cannot leak into the next
-                # turn. No new await on the delivery path (a fire-and-forget stop task was
-                # measured to have no effect).
+                # Stop typing before delivery: a lost send ack must not refresh it forever (#117300).
+                # Reuse _typing_paused so turn cleanup releases suppression.
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
@@ -4520,8 +4476,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
-            # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
-            # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
+            # Flush debounce before the handoff; keep the guard live across stop-typing.
             await self._flush_text_debounce_now(session_key)
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
@@ -4558,13 +4513,16 @@ class BasePlatformAdapter(ABC):
             self._finish_session_task(session_key, interrupt_event)
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
-        """Hand the session to a fresh task for a queued follow-up — never recurse (chained
-        follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
-        live for concurrent inbound; ownership moves so stale-lock detection works."""
+        """Fresh independent queued turn; never recurse (C-stack overflow) or borrow ingress."""
+        from gateway.admission import without_gateway_ingress
         self._clear_session_guard(session_key)
-        self._track_session_task(
-            session_key,
-            asyncio.create_task(self._process_message_background(pending_event, session_key)))
+        with without_gateway_ingress():
+            task = asyncio.create_task(self.gateway_runner._run_goal_fifo_drain(self, pending_event, session_key)
+                if getattr(pending_event, '_goal_admission_checkpoint', None) is not None
+                else self._process_message_background(pending_event, session_key))
+            self._track_session_task(session_key, task)
+            if getattr(pending_event, '_goal_admission_checkpoint', None) is not None:
+                self.gateway_runner._track_goal_drain_checkpoint(self, pending_event, session_key, task)
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""

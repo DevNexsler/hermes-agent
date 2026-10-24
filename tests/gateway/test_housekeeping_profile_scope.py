@@ -86,7 +86,13 @@ def _record_credential_chores(monkeypatch):
 
 
 def _run_60_ticks(runner):
-    gateway_run._start_gateway_housekeeping(_Ticks(60), interval=0, runner=runner)
+    from gateway.admission import initialize_gateway_admission
+    from hermes_constants import get_hermes_home
+    native = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    native.__dict__.update(vars(runner))
+    native._running, native._draining, native._external_drain_active = True, False, False
+    initialize_gateway_admission(native, home=get_hermes_home())
+    gateway_run._start_gateway_housekeeping(_Ticks(60), interval=0, runner=native)
 
 
 def test_multiplexed_sync_ticks_run_once_per_profile_in_its_own_scope(two_homes, monkeypatch, caplog):

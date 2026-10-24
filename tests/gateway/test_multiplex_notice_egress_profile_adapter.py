@@ -13,6 +13,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
+from gateway.admission import initialize_gateway_admission
 from gateway.session import SessionSource
 from gateway.slash_commands import _restart_notify_payload
 
@@ -27,6 +28,7 @@ class _Adapter:
 
     async def handle_message(self, event):
         self.handled.append(event.text)
+        event._gateway_accepted = True
 
 
 def _runner():
@@ -40,6 +42,8 @@ def _runner():
     r._running_agents = {}
     r._restart_requested = False
     r._restart_command_source = None
+    r._running, r._draining = True, False
+    initialize_gateway_admission(r)
     return r
 
 

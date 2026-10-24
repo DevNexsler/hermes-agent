@@ -53,7 +53,7 @@ def make_restart_source(
 
 
 def make_restart_runner(
-    adapter: BasePlatformAdapter | None = None,
+    adapter: BasePlatformAdapter | None = None, *, admission_home=None,
 ) -> tuple[GatewayRunner, BasePlatformAdapter]:
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -168,4 +168,56 @@ def make_restart_runner(
     platform_adapter.set_message_handler(AsyncMock(return_value=None))
     platform_adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
     runner.adapters = {Platform.TELEGRAM: platform_adapter}
+    from gateway.admission import initialize_gateway_admission
+    initialize_gateway_admission(runner, home=admission_home)
+    platform_adapter.gateway_runner = runner
     return runner, platform_adapter
+
+
+def install_watcher_admission(runner, monkeypatch, *, ticks=1):
+    """Explicit native capability; terminate legacy watcher fixtures by poll cycles, not flag reads."""
+    from gateway.admission import initialize_gateway_admission
+    runner._running, runner._draining = True, False
+    initialize_gateway_admission(runner)
+    original_sleep = asyncio.sleep
+    owner, remaining = None, ticks
+
+    async def bounded_sleep(delay):
+        nonlocal owner, remaining
+        if delay == 5 and owner is None:
+            owner = asyncio.current_task()
+        if delay == 0 and asyncio.current_task() is owner:
+            remaining -= 1
+            if remaining <= 0:
+                runner._running = False
+        return await original_sleep(delay)
+
+    monkeypatch.setattr('gateway.run_adapters.asyncio.sleep', bounded_sleep)
+
+
+def install_native_admission(runner, *, home=None):
+    """Explicit capability for standalone native-producer fixtures built without __init__."""
+    from gateway.admission import initialize_gateway_admission
+    runner._running, runner._draining, runner._external_drain_active = True, False, False
+    initialize_gateway_admission(runner, home=home)
+
+
+async def run_one_notifier_tick(runner, monkeypatch):
+    """Explicit capability; stop AFTER full notifier tick, never during a worker yield."""
+    if getattr(runner, '_ingress_barrier', None) is None:
+        install_native_admission(runner)
+    runner._running = True
+    owner = asyncio.current_task()
+    original_sleep = asyncio.sleep
+
+    async def initial_delay(delay):
+        if delay == 5 and asyncio.current_task() is owner:
+            return
+        await original_sleep(delay)
+
+    async def stop_after_tick(interval):
+        runner._running = False
+
+    monkeypatch.setattr(asyncio, 'sleep', initial_delay)
+    monkeypatch.setattr(runner, '_sleep_between_ticks', stop_after_tick)
+    await runner._kanban_notifier_watcher(interval=1)

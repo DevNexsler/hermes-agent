@@ -10,6 +10,16 @@ from hermes_cli import kanban_db_notify as kbn
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+def _notifier_runner(home):
+    """Explicit admission capability for partial watcher doubles; real safety fixtures live in gateway tests."""
+    from gateway.admission import initialize_gateway_admission
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner._draining = False
+    initialize_gateway_admission(runner, home=home)
+    return runner
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -200,7 +210,6 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     conn = kbc.connect()
@@ -217,7 +226,7 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     finally:
         conn.close()
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}
@@ -266,7 +275,6 @@ async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_hom
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     conn = kbc.connect()
@@ -282,7 +290,7 @@ async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_hom
     finally:
         conn.close()
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}
@@ -320,7 +328,6 @@ async def test_notifier_notify_wake_does_not_wake_on_status_event(kanban_home):
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     conn = kbc.connect()
@@ -334,7 +341,7 @@ async def test_notifier_notify_wake_does_not_wake_on_status_event(kanban_home):
     finally:
         conn.close()
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}
@@ -372,7 +379,6 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     conn = kbc.connect()
@@ -387,7 +393,7 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
     finally:
         conn.close()
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}
@@ -429,7 +435,6 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     conn = kbc.connect()
@@ -443,7 +448,7 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
     finally:
         conn.close()
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}
@@ -503,7 +508,6 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     conn = kbc.connect()
@@ -515,7 +519,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     finally:
         conn.close()
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}
@@ -566,7 +570,6 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 @pytest.mark.asyncio
 async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_home):
     from gateway.config import Platform
-    from gateway.run import GatewayRunner
 
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="review handoff", assignee="builder")
@@ -586,7 +589,7 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
             expected_run_id=task.current_run_id,
         )
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._running = True
     runner._kanban_sub_fail_counts = {}
     # This legacy subscription has no notifier-profile stamp. Current gateway
@@ -634,7 +637,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
     kb.create_board("projx")
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     source = SimpleNamespace(
         platform=Platform.TELEGRAM,
@@ -710,7 +713,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
     from gateway.config import Platform
     from gateway.session import SessionSource, build_session_key
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     # user_id != user_id_alt is the whole point: the alt id is the canonical
     # participant, so dropping it silently corrupts the session key.
@@ -779,7 +782,6 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
     from tools import kanban_tools as kt
 
@@ -812,7 +814,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}
@@ -861,7 +863,6 @@ async def test_notifier_uploads_review_handoff_artifacts(kanban_home, tmp_path, 
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
     from hermes_cli import kanban_db_workspace as kbw
-    from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
@@ -890,7 +891,7 @@ async def test_notifier_uploads_review_handoff_artifacts(kanban_home, tmp_path, 
     assert scratch.exists(), "scratch original survives until the reviewer completes"
     assert staged_path == attachments[0].stored_path
 
-    runner = object.__new__(GatewayRunner)
+    runner = _notifier_runner(kanban_home)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._running = True
     runner._kanban_sub_fail_counts = {}

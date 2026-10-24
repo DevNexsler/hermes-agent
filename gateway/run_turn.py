@@ -1,6 +1,5 @@
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
-background tasks, MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
-are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
+background tasks, MCP reload. Late facade imports preserve patch seams and avoid cycles.
 """
 
 from __future__ import annotations
@@ -8,6 +7,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
+from gateway.admission import adopt_ingress_task, native_thread, native_to_thread
+from gateway.run_loop_acceptance import mark_loop_failure
 import dataclasses
 import inspect
 import json
@@ -19,7 +20,7 @@ from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
-from contextvars import copy_context
+from contextvars import Context, copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
@@ -402,11 +403,10 @@ class GatewayTurnMixin:
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
         the event."""
-        # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
-        # cross-topic Reply doesn't fragment the conversation.
+        # Recover topic routing before checking native conversation ownership.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
-        recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+        recovered = (await native_to_thread(self._recover_telegram_topic_thread_id, source)
                      if not expected_session_key else None)
         if recovered is not None:
             logger.info(
@@ -449,10 +449,11 @@ class GatewayTurnMixin:
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        if await native_to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
-        if not await resolve_heartbeat_owner(self, event, session_entry):
+        if (not await resolve_heartbeat_owner(self, event, session_entry)
+                or await self._defer_queued_goal_for_maintenance(event, resolved_session_id=session_entry.session_id)):
             return
         return source, session_entry, session_key
 
@@ -470,7 +471,7 @@ class GatewayTurnMixin:
             logger.debug("Failed to read Telegram topic binding", exc_info=True)
         if not binding:
             try:
-                await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
+                await native_to_thread(self._record_telegram_topic_binding, source, session_entry)
             except Exception:
                 logger.debug("Failed to record Telegram topic binding", exc_info=True)
             return session_entry
@@ -500,7 +501,7 @@ class GatewayTurnMixin:
                 session_entry = switched
         if bound_session_id and bound_session_id != stored_session_id:
             # The stored binding pointed at a parent: rewrite it to the canonical descendant.
-            await asyncio.to_thread(
+            await native_to_thread(
                 self._sync_telegram_topic_binding, source, session_entry, reason="compression-tip-walk",
             )
         return session_entry
@@ -564,7 +565,7 @@ class GatewayTurnMixin:
                     f"Use /resume to browse and restore a previous session.\n"
                 )
                 with suppress(Exception):
-                    session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
+                    session_info = await native_to_thread(self._reset_notice_session_info, source)
                     if session_info:
                         notice = f"{notice}\n\n{session_info}"
                 await adapter.send(source.chat_id, notice, metadata=self._thread_metadata_for_source(source))
@@ -885,7 +886,7 @@ class GatewayTurnMixin:
                 return None
             else:
                 break
-        _compressed, _ = await attempt.future
+        _compressed, _ = await asyncio.shield(attempt.future)
         return _compressed
 
     def _hmwa_hygiene_defer_cleanup(self, attempt, context):
@@ -914,7 +915,7 @@ class GatewayTurnMixin:
         from gateway.run import _hygiene_cooldown_for_failure, _record_hygiene_cooldown
         if hs.failure_cooldown_seconds < 0:
             return
-        _hyg_cooldown = await asyncio.to_thread(
+        _hyg_cooldown = await native_to_thread(
             _hygiene_cooldown_for_failure, self, session_key, hs.failure_cooldown_seconds,
         )
         _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
@@ -1085,10 +1086,8 @@ class GatewayTurnMixin:
         """Adopt a finished compression (rotation / in-place / refused); publishes the transcript to
         continue with on ``attempt.history``. Returns ``(rotated, in_place, new_count, new_tokens)``.
 
-        Rewrite only on rotation (NEW session id): in-place compaction already soft-archived the
-        old rows and rewrite_transcript() would DELETE them; neither rotation nor in-place signals
-        FAILURE and an unconditional rewrite would leave only the summary. Write-before-repoint:
-        a repoint-then-failed-rewrite would point the live entry at an empty session."""
+        Rewrite only on rotation, before repointing. In-place/failed compaction must retain old rows;
+        a failed rewrite must never leave the live entry pointing at an empty session."""
         from agent.model_metadata import estimate_messages_tokens_rough
         _hyg_agent = attempt.agent
         # _compress_context rotates to a NEW session_id so the old transcript stays intact/searchable.
@@ -1135,7 +1134,7 @@ class GatewayTurnMixin:
                 # The held turn lease follows the rotation (alias keys still serialize on this turn).
                 self._rebind_turn_lease(_quick_key, run_generation, _hyg_new_sid)
                 await self.async_session_store._save()
-                await asyncio.to_thread(
+                await native_to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="hygiene-compression",
                 )
 
@@ -1191,7 +1190,7 @@ class GatewayTurnMixin:
             msg_count=plan.msg_count, new_count=_new_count, approx_tokens=plan.approx_tokens,
             new_tokens=_new_tokens,
         ):
-            await asyncio.to_thread(_reset_hygiene_failure_streak, self, session_key)
+            await native_to_thread(_reset_hygiene_failure_streak, self, session_key)
         if _hyg_aborted:
             await self._hmwa_hygiene_record_failure_cooldown(
                 hs, session_key, session_entry.session_id,
@@ -1309,11 +1308,7 @@ class GatewayTurnMixin:
             attempt.commit_fence = _hyg_commit_fence
             attempt.future = loop.run_in_executor(
                 None,
-                # But it MUST run inside the caller's contextvars: under multiplex_profiles the profile
-                # secret scope / HERMES_HOME override live in ContextVars, and a bare run_in_executor worker
-                # starts with an empty Context — the summary model's get_secret(<PROVIDER>_API_KEY) then
-                # fails closed (UnscopedSecretError) and every hygiene compaction silently degrades to a
-                # lossy truncation (#100849 bundle).
+                # Multiplex secret/home context must reach the summary worker (#100849).
                 copy_context().run,
                 # task_id = the live turn's dedup bucket (session row id), never "" (= reset every task).
                 lambda: _hyg_agent._compress_context(
@@ -1321,6 +1316,7 @@ class GatewayTurnMixin:
                     task_id=session_entry.session_id or "default",
                 ),
             )
+            adopt_ingress_task(self, attempt.future)
             attempt.wait_started = time.monotonic()
             try:
                 _compressed = await self._hmwa_hygiene_wait_for_summary(attempt, hs, session_entry)
@@ -1583,7 +1579,7 @@ class GatewayTurnMixin:
                 await self.async_session_store._record_gateway_session_peer(
                     session_entry.session_id, session_key, source,
                 )
-                await asyncio.to_thread(
+                await native_to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="agent-result-compression",
                 )
             else:
@@ -1795,7 +1791,7 @@ class GatewayTurnMixin:
                 # oversized transcript, and re-triggers compression exhaustion forever (#35809 — regression
                 # of the #9893/#10063 auto-reset).
                 session_entry = new_entry
-                await asyncio.to_thread(
+                await native_to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
                 )
             response = (response or "") + (
@@ -1976,7 +1972,7 @@ class GatewayTurnMixin:
     async def _hmwa_agent_error_reply(self, e, event, source, session_entry, session_key, prepared):
         """``except Exception`` body of the agent turn: stop typing, log, persist the inbound user
         turn once and close it, and build the sanitized user-facing error reply."""
-        # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
+        mark_loop_failure(event)
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
         status_code = getattr(e, "status_code", None)
@@ -2165,6 +2161,7 @@ class GatewayTurnMixin:
         if not isinstance(prepared, self._PreparedTurn):
             return prepared
         history, message_text = prepared.history, prepared.message_text
+        prepared_session_id = prepared.persistence_session_id or session_entry.session_id
 
         try:
             hook_ctx = {
@@ -2178,16 +2175,18 @@ class GatewayTurnMixin:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
-            # Capture the launch session id so post-run compression publication is identity-guarded
-            # (a /new may move session_entry.session_id while the old run is still unwinding).
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
-            _run_start_session_id = session_entry.session_id
+            if await self._defer_queued_goal_for_maintenance(event, resolved_session_id=prepared_session_id):
+                return
+            if not self._claim_goal_entry(event, prepared_session_id):
+                await self._defer_queued_goal_for_maintenance(event)
+                return
+            _run_start_session_id = getattr(event, '_goal_resolved_session_id', None) or session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            # Admission/typing is not execution. All routing, authorization and
-            # turn preparation gates have passed when the agent runner is entered.
-            event._heartbeat_execution_started = True
+            from gateway.admission_capacity import mark_event_execution_started
+            mark_event_execution_started(event)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2202,12 +2201,10 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
+            mark_loop_failure(event, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # A queued (/queue) chain answered the LAST message of the chain, so the outer final
-            # send (bracketed by the adapter against this event) must be ledgered under that
-            # message's id or it collides with an earlier turn's row carrying the same text. Reply
-            # routing is untouched: the anchor still comes from this event.
+            # Ledger the queued chain's LAST message id; reply anchors stay with this event.
             if isinstance(agent_result, dict):
                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
                 if _terminal_inbound:
@@ -3455,25 +3452,24 @@ class GatewayTurnMixin:
                 # `.turn.agent` on the session state is only reset to _AGENT_PENDING_SENTINEL when the
                 # *next* turn is claimed (see _session_state(...).turn.agent = ... at claim time), so a
                 # stale reference to this exact agent instance stays reachable from
-                # _interrupt_and_clear_session() until then. See #76115.
                 _finished_agent = agent_holder[0] if agent_holder else None
                 if _finished_agent is not None:
                     _finished_agent._gateway_turn_process_task_id = ""
                     _finished_agent._gateway_turn_process_baseline = frozenset()
 
         if _agent_timeout is not None:
-            threading.Thread(
-                target=_watch_gateway_turn_inactivity,
-                kwargs={
-                    "agent_holder": agent_holder, "timeout": _agent_timeout, "poll_interval": 5.0,
-                    **self._reaper_kwargs(worker),
-                },
+            native_thread(
+                self, _watch_gateway_turn_inactivity,
+                agent_holder=agent_holder, timeout=_agent_timeout, poll_interval=5.0,
+                **self._reaper_kwargs(worker),
                 name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
-                daemon=True,
-            ).start()
-        worker.executor_task = asyncio.ensure_future(
+                start=True, thread_context=Context(),
+            )
+        from gateway.admission import mark_ingress_effect
+        mark_ingress_effect(self)
+        worker.executor_task = adopt_ingress_task(self, asyncio.ensure_future(
             self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
-        )
+        ))
         return worker
 
     @staticmethod
@@ -3583,11 +3579,11 @@ class GatewayTurnMixin:
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
                 if _idle_secs >= worker.agent_timeout:
-                    threading.Thread(
-                        target=_abandon_timed_out_gateway_turn,
-                        kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
-                        name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
-                    ).start()
+                    native_thread(
+                        self, _abandon_timed_out_gateway_turn, agent_holder=agent_holder,
+                        **self._reaper_kwargs(worker), name=f"gateway-turn-reaper-{worker.task_id[:12]}",
+                        start=True, thread_context=Context(),
+                    )
                     break
             await self._run_agent_backup_interrupt_check(turn_ctx, _interrupt_detected, interrupt_monitor)
         return self._run_agent_timeout_result(worker, turn_ctx)
@@ -3644,6 +3640,7 @@ class GatewayTurnMixin:
         )
         pending_event = None
         pending = None
+        await self._preserve_maintenance_goal_fifo(adapter, session_key)
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
@@ -3671,7 +3668,6 @@ class GatewayTurnMixin:
                     pending = _pending_text or _build_media_placeholder(pending_event)
                 if pending:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
-
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         if result and not pending and not pending_event and result.get("pending_steer"):
             pending = result.get("pending_steer")
@@ -3780,6 +3776,9 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
+        if getattr(pending_event, '_goal_admission_checkpoint', None) is not None:
+            self._retain_goal_fifo_followup(adapter, pending_event, turn_ctx.session_key)
+            return response
         from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
@@ -3795,8 +3794,7 @@ class GatewayTurnMixin:
         if _active and session_key and session_key in _active:
             _active[session_key].clear()
 
-        # Cap recursion depth (user keeps sending while the agent keeps failing).
-        # (#816)
+        # Bound recursive human follow-ups (#816).
         if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
             logger.warning(
                 "Interrupt recursion depth %d reached for session %s — "
