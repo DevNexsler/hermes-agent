@@ -21,6 +21,7 @@ from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from gateway.admission import native_session_offload
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -589,7 +590,7 @@ class GatewayShutdownMixin:
         )
         try:
             if self_suspend_available():
-                accepted = await asyncio.to_thread(suspend_self)
+                accepted = await native_session_offload(self, suspend_self)
                 lever = "self-suspend"
                 if accepted:
                     # flaps answers seconds BEFORE the kernel freezes, so the fence has to span
@@ -611,7 +612,7 @@ class GatewayShutdownMixin:
                     )
                     return
                 # The watcher already holds the supervisor across this call.
-                accepted = await asyncio.to_thread(request_brokered_suspend, url)
+                accepted = await native_session_offload(self, request_brokered_suspend, url)
                 lever = "brokered suspend"
                 if not accepted:
                     self._scale_to_zero_abandon_suspend()
@@ -721,7 +722,7 @@ class GatewayShutdownMixin:
                 # Off-thread: a synchronous marker read at 1s cadence can stall 30s+ under host I/O
                 # pressure and take every platform heartbeat down.
                 barrier = getattr(self, '_ingress_barrier', None)
-                controls = await asyncio.to_thread(read_admission_controls, barrier.home)
+                controls = await native_session_offload(self, read_admission_controls, barrier.home)
                 reconcile_admission_controls(self, controls)
                 if controls['drain']:
                     # API and cron work live outside messaging's _running_agents map; refresh the
@@ -1368,7 +1369,7 @@ class GatewayShutdownMixin:
             if session_key in counts:
                 del counts[session_key]
                 if counts:
-                    await asyncio.to_thread(atomic_json_write, path, counts, indent=None)
+                    await native_session_offload(self, atomic_json_write, path, counts, indent=None)
                 else:
                     path.unlink(missing_ok=True)
         except Exception:

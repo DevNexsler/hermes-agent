@@ -12,6 +12,7 @@ on transient errors) so callers can rewind cursors / retry instead of silently l
 from __future__ import annotations
 
 import asyncio
+from gateway.admission import native_to_thread
 import logging
 from typing import Any, Optional
 
@@ -159,7 +160,7 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
     ensure = getattr(adapter, "_ensure_session_db", None)
-    db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
+    db: Any = await native_to_thread(ensure) if callable(ensure) else None
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")
@@ -172,12 +173,12 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     resolver = getattr(db, "resolve_resume_session_id", None)
     if callable(resolver):
         try:
-            resolved = await asyncio.to_thread(resolver, session_id)
+            resolved = await native_to_thread(resolver, session_id)
             if resolved:
                 session_id = str(resolved)
         except Exception:
             logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
-    await asyncio.to_thread(
+    await native_to_thread(
         db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
     logger.info(

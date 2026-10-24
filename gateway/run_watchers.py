@@ -13,6 +13,7 @@ import time
 from collections import Counter
 from typing import Any, Dict, Optional
 
+from gateway.admission import native_session_offload
 from gateway.session_stall import (
     format_session_stall_notification,
     resolve_session_idle_seconds_from_activity,
@@ -218,7 +219,7 @@ class GatewaySessionWatchersMixin:
         await asyncio.sleep(30)  # let startup settle
         while self._running:
             try:
-                await asyncio.to_thread(refresh_catalogs)
+                await native_session_offload(self, refresh_catalogs)
             except Exception as exc:
                 logger.debug("Model catalog refresh failed: %s", exc)
             try:

@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from gateway.admission import native_session_offload
 from gateway.run_shutdown import _log_suppressed
 from utils import file_signature
 
@@ -198,16 +199,14 @@ class GatewayProfileReconcileMixin:
     async def _after_profiles_added(self, profile_homes) -> None:
         """Per-profile startup side effects for hot-added profiles: log routing + scoped MCP discovery."""
         from gateway.run import _enable_multiplex_log_routing, _profile_runtime_scope
-        from contextvars import copy_context
         with _log_suppressed(logging.DEBUG, "log routing refresh failed", exc_info=True):
             _enable_multiplex_log_routing(self.config)
         from tools.mcp_oauth import suppress_interactive_oauth
-        loop = asyncio.get_running_loop()
         for profile_name, profile_home in profile_homes:
             try:
                 from tools.mcp_tool_discovery import discover_mcp_tools
                 with _profile_runtime_scope(Path(profile_home)), suppress_interactive_oauth():
-                    await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+                    await native_session_offload(self, discover_mcp_tools)
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 

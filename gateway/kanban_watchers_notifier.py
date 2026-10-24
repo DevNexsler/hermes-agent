@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 
+from gateway.admission import native_session_offload
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 from gateway.wake import session_owned_by_profile
 
@@ -767,8 +768,8 @@ class _KanbanNotification:
         # Recheck the exact route after claiming: config/adapters can change between ticks. The
         # recheck reads the served profile's session store for a stateless destination, so it runs
         # off the event loop (the claim path already collects in a worker thread).
-        adapter = await asyncio.to_thread(
-            _adapter_for_subscription, self.runner, self.plat, self.sub, self.sub_profile or None)
+        adapter = await native_session_offload(
+            self.runner, _adapter_for_subscription, self.runner, self.plat, self.sub, self.sub_profile or None)
         if adapter is None:
             logger.debug("kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                          self.platform_str, self.task_id)

@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
+from gateway.admission import native_session_offload
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
@@ -1213,7 +1214,7 @@ class GatewayNotificationsMixin:
             fail = "Watch notification self-post wake failed for session %s: %s"
             from agent.notification_presentation import diagnostic_process_event
             try:
-                served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
+                served = await native_session_offload(self, self._served_api_server_wake_profile, evt, raw_sid)
             except LookupError as e:
                 logger.warning(fail, raw_sid, e)
                 return False
@@ -1289,7 +1290,7 @@ class GatewayNotificationsMixin:
         gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        source = await native_session_offload(self, self._build_process_event_source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
             raw_sid = _raw_process_event_session_id(evt)
@@ -1459,7 +1460,7 @@ class GatewayNotificationsMixin:
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
                 return verdict == "terminal"
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        source = await native_session_offload(self, self._build_process_event_source, evt)
         if source is not None:
             platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
             adapter = self._resolve_injection_adapter(platform, source)
@@ -1473,7 +1474,7 @@ class GatewayNotificationsMixin:
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
             try:
-                if not callable(ensure) or await asyncio.to_thread(ensure) is None:
+                if not callable(ensure) or await native_session_offload(self, ensure) is None:
                     return False
             except Exception:
                 logger.debug("Async-completion delivery DB unavailable", exc_info=True)
@@ -1887,7 +1888,7 @@ class GatewayNotificationsMixin:
                 # Completions whose owner process died while this gateway runs (#97202).
                 if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
                     last_orphan_sweep = time.monotonic()
-                    await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
+                    await native_session_offload(self, self._sweep_orphaned_completion_ledgers)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.
@@ -1946,13 +1947,13 @@ class GatewayNotificationsMixin:
         session_key = str(watcher.get("session_key") or "").strip()
         if not session_key:
             return False
-        source = await asyncio.to_thread(self._build_process_event_source, watcher)
+        source = await native_session_offload(self, self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
     async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
         from gateway.run import _non_conversational_metadata
-        source = await asyncio.to_thread(self._build_process_event_source, watcher)
+        source = await native_session_offload(self, self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if adapter and chat_id:
             with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):

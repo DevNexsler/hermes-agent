@@ -414,6 +414,15 @@ offload ownership. These reads grant no admission permission or business-effect/
 Startup warm-up likewise stays in the existing deferred registry after its bounded restore gate
 opens. Launch-scope hydration and the actual probe use tracked, shielded default-executor futures,
 so cancelling the warm-up waiter cannot conceal a still-running physical worker.
+That owner context does not intercept raw `asyncio.to_thread` or bare executor calls. Concrete
+completion-ledger/control readers, completion routing/DB work, hot-profile discovery, catalog
+refresh, notifier routing and suspend/metadata workers therefore use explicit tracked native
+offloads. Completion transcript delivery uses the existing context-aware native offloader.
+Default executor choice and profile context remain intact; cancellation does not prove physical exit.
+
+Maintenance pause/receipt writes verify both final rows inside their SQLite writer transaction
+before commit. Rejected or altered writes roll back the whole handoff, including any accidental
+foreign-goal mutation. Post-commit readback remains an additional confirmation, not atomicity.
 
 These pauses never resume automatically. Before fence release, the maintenance owner must inventory
 every profile's receipts and leave a named, actionable `/goal resume` handoff. A rollout must not

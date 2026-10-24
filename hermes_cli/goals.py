@@ -1277,6 +1277,15 @@ class GoalManager:
             db.set_meta(key, payload, cursor=conn)
             if receipt['pause_applied']:
                 db.set_meta(_meta_key(self.session_id), raw, cursor=conn)
+            expected_rows = {key: payload}
+            if receipt['pause_applied']:
+                expected_rows[_meta_key(self.session_id)] = raw
+            elif row is not None:
+                expected_rows[_meta_key(self.session_id)] = row[0]
+            written = dict(conn.execute('SELECT key, value FROM state_meta WHERE key IN (?, ?)',
+                                        (key, _meta_key(self.session_id))))
+            if written != expected_rows:
+                raise RuntimeError('maintenance goal checkpoint rejected or changed before commit')
             return payload
         payload = db._execute_write(commit)
         if db.get_meta(key) != payload or (receipt['pause_applied'] and db.get_meta(_meta_key(self.session_id)) != raw):
