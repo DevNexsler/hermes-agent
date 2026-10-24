@@ -288,10 +288,18 @@ class GatewayGoalsMixin:
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
-            return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
+            return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns, strict=True)
 
-        mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
-        if mgr is None or not mgr.is_active():
+        try:
+            mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
+            if mgr is None:
+                raise RuntimeError('automatic goal lookup unavailable')
+        except Exception:
+            self._ingress_barrier.fail_quiescence()
+            logger.error('Goal lookup unconfirmed for session %s; inspect retained goal/history before release',
+                         getattr(session_entry, 'session_id', None), exc_info=True)
+            raise
+        if not mgr.is_active():
             return
         if await self._defer_goal_for_maintenance(mgr, source, mgr.next_continuation_prompt(), final_response):
             return
@@ -394,7 +402,7 @@ class GatewayGoalsMixin:
         from pathlib import Path
         from gateway.run import _profile_runtime_scope
         from gateway.admission_capacity import mark_event_execution_started
-        from hermes_cli.goals import GoalState
+        from hermes_cli.goals import _confirmed_goal_state
         from hermes_cli.sqlite_safe_read import connect_tracked
         store = self.session_store
         key = self._session_key_for_source(event.source)
@@ -417,7 +425,7 @@ class GatewayGoalsMixin:
                             tip = db.get_compression_tip(checkpoint['session_id'], conn=conn)
                             if (current is not None and not current.suspended
                                     and current.session_id == prepared_session_id == tip and row is not None
-                                    and GoalState.from_json(row[0]).to_json() == checkpoint['goal_state']):
+                                    and _confirmed_goal_state(row[0]).to_json() == checkpoint['goal_state']):
                                 mark_event_execution_started(event)
                                 return True
                             conflict.update(current_session_id=current.session_id if current else None)

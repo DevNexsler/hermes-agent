@@ -535,6 +535,13 @@ evaluation-to-handoff task, so cancellation of its delivered-turn waiter cannot 
 physical executor result or durable handoff. Explicit user controls keep their existing contract;
 no writer lock spans a judge, gate or other await.
 
+The initial automatic goal lookup is strict too: confirmed missing row or inactive state can end
+the hook, while unavailable storage, failed reads, present SQL NULL, malformed/nonfinite state or
+unknown fields/status block readiness before its tracked task settles. This path preserves the
+stored goal and conversation history; an unreadable store cannot attest a completed durable
+handoff. The operator must inspect that session before proceeding. No automatic retry or resume
+resolves this uncertainty. Ordinary interactive goal reads retain their existing best-effort behavior.
+
 Queued goals also bind the originating conversation to the resolved/current route before preparation
 and again before actual entry. Only a verified compression tip with the identical migrated goal may
 continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation

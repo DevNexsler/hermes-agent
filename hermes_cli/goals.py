@@ -615,8 +615,33 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
+def _confirmed_goal_state(raw: str) -> GoalState:
+    """Decode an automatic ownership witness without discarding unknown state."""
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.keys() - GoalState.__dataclass_fields__.keys():
+        raise ValueError('goal checkpoint contains unknown fields or structure')
+    state = GoalState.from_json(raw)
+    json.dumps(asdict(state), allow_nan=False)
+    if (state.status not in ('active', 'paused', 'done', 'cleared') or not isinstance(state.goal, str)
+            or (state.status in ('active', 'paused') and not state.goal.strip())):
+        raise ValueError('goal checkpoint identity or status unconfirmed')
+    return state
+
+
+def _load_confirmed_goal(session_id: str) -> Optional[GoalState]:
+    db = _get_session_db()
+    if db is None or not session_id:
+        raise RuntimeError('automatic goal lookup unavailable')
+    # get_meta conflates an absent row with a present SQL NULL value.
+    with db._lock:
+        row = db._conn.execute('SELECT value FROM state_meta WHERE key=?', (_meta_key(session_id),)).fetchone()
+    return None if row is None else _confirmed_goal_state(row[0])
+
+
+def load_goal(session_id: str, *, strict: bool = False) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
+    if strict:
+        return _load_confirmed_goal(session_id)
     if not session_id:
         return None
     db = _get_session_db()
@@ -1080,10 +1105,10 @@ class GoalManager:
     canonical user-role message to feed back into ``run_conversation``.
     """
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
+    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS, strict: bool = False):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._state: Optional[GoalState] = load_goal(session_id, strict=strict)
 
     # --- introspection ------------------------------------------------
 
@@ -1208,7 +1233,7 @@ class GoalManager:
         db = _get_session_db()
         if db is None:
             raise RuntimeError('maintenance goal checkpoint store unavailable')
-        expected = GoalState.from_json(expected_goal).to_json() if expected_goal is not None else self._state.to_json()
+        expected = _confirmed_goal_state(expected_goal).to_json() if expected_goal is not None else self._state.to_json()
         paused = GoalState.from_json(expected)
         if paused.status != 'active':
             raise ValueError('maintenance continuation must identify an active originating goal')
@@ -1227,7 +1252,7 @@ class GoalManager:
         def commit(conn):
             row = conn.execute('SELECT value FROM state_meta WHERE key = ?', (_meta_key(self.session_id),)).fetchone()
             try:
-                current = GoalState.from_json(row[0]).to_json() if row is not None else None
+                current = _confirmed_goal_state(row[0]).to_json() if row is not None else None
             except (ValueError, TypeError, AttributeError):
                 current = None
             if current != expected or ownership_conflict:
@@ -1553,10 +1578,7 @@ class GoalManager:
         try:
             raw = db.get_meta(_meta_key(self.session_id))
             try:
-                data = json.loads(raw) if raw else None
-                json.dumps(data, allow_nan=False)
-                matches = (isinstance(data, dict) and not (data.keys() - asdict(self._state).keys())
-                           and GoalState.from_json(raw).to_json() == origin)
+                matches = _confirmed_goal_state(raw).to_json() == origin
             except (ValueError, TypeError, AttributeError, OverflowError):
                 matches = False
             if not matches:
