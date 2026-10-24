@@ -1201,6 +1201,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     since those side effects would fire while the outer txn can still roll back.
     """
     _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+    from hermes_cli.kanban_db_spawn import require_writable_board
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
@@ -1212,6 +1213,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
         try:
+            require_writable_board(conn)
             yield conn
         except Exception:
             with contextlib.suppress(sqlite3.OperationalError):
@@ -1224,7 +1226,6 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
-        from hermes_cli.kanban_db_spawn import require_writable_board
         require_writable_board(conn)
         yield conn
     except Exception:

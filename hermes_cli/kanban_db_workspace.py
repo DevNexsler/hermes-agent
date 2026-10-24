@@ -29,7 +29,8 @@ _REMOVABLE_KINDS = ("scratch", "worktree")
 def _unlink_unreferenced_attachment_blob(conn, path):
     path = Path(path)
     realpath = path.resolve()
-    if any(Path(row[0]).resolve() == realpath for row in conn.execute('SELECT stored_path FROM task_attachments')):
+    if (_has_retained_workspace(conn, realpath)
+            or any(Path(row[0]).resolve() == realpath for row in conn.execute('SELECT stored_path FROM task_attachments'))):
         return
     with contextlib.suppress(OSError):
         if path.is_file():

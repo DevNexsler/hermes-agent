@@ -208,6 +208,8 @@ def gc_settled_worker_logs(log_dir, cutoff, board):
 def rotate_settled_worker_log(conn, task_id, board):
     """Rotate before this claim exists, serialized against every retained owner."""
     from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
+    board = kb._normalize_board_slug(board) or kb.get_current_board()
+    log_path = kb.worker_log_path(task_id, board=board)
     database = kb._board_path(None, board, ('kanban.db',), 'kanban.db').resolve()
     actual = Path(conn.execute('PRAGMA database_list').fetchone()[2]).resolve()
     if actual != database or kb.kanban_db_path(board).resolve() != database:
@@ -215,7 +217,7 @@ def rotate_settled_worker_log(conn, task_id, board):
     with kb.write_txn(conn):
         if task_id not in retained_task_ids(conn):
             rotate_bytes, backups = dispatch.worker_log_rotation_config()
-            dispatch._rotate_worker_log(kb.worker_log_path(task_id, board=board), rotate_bytes, backups)
+            dispatch._rotate_worker_log(log_path, rotate_bytes, backups)
 
 
 def worker_ownership_count(conn):
