@@ -67,3 +67,28 @@ def release_untransferred_capacity(barrier, owner):
         except Exception:
             barrier.fail_quiescence()
             logger.exception('Untransferred active session release unconfirmed; readiness blocked')
+
+
+def rewrite_dispatch_text(runner, event, text):
+    """Clone hook text without dropping the native event's process-local ownership."""
+    from copy import copy
+    from gateway.admission import _ingress, ingress_admitted
+    rewritten = copy(event)
+    rewritten.text = text
+    rewritten._gateway_original_event = getattr(event, '_gateway_original_event', event)
+    if ingress_admitted(runner):
+        owner = _ingress.get()
+        with owner.barrier._lock:
+            for key, (lease, reserved, slot) in owner.barrier._capacity.items():
+                if lease is owner and reserved is event:
+                    owner.barrier._capacity[key] = (owner, rewritten, slot)
+                    break
+            if owner.startup is not None and owner.startup[0] is event:
+                owner.startup = (rewritten, owner.startup[1])
+    return rewritten
+
+
+def mark_event_execution_started(event):
+    """The transport event's cancellation callback must see rewritten core entry too."""
+    event._heartbeat_execution_started = True
+    getattr(event, '_gateway_original_event', event)._heartbeat_execution_started = True

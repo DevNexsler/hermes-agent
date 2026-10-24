@@ -430,6 +430,7 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    generation_id: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -442,6 +443,7 @@ class GoalState:
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
+            generation_id=data.get('generation_id'),
             status=data.get("status", "active"),
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
@@ -1150,6 +1152,7 @@ class GoalManager:
             raise ValueError("goal text is empty")
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            generation_id=uuid.uuid4().hex,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
         )
@@ -1170,13 +1173,14 @@ class GoalManager:
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
 
-    def pause_for_maintenance(self, *, owner, hold_id, continuation_prompt, final_response, source, input_context=None):
+    def pause_for_maintenance(self, *, owner, hold_id, continuation_prompt, final_response, source,
+                              input_context=None, expected_goal=None):
         """Atomically pause unchanged active state and retain exact continuation inputs for its owner.
 
         Unlike best-effort user commands, maintenance needs verified durable readback before a
         process can quiesce. An intervening user/foreign mutation is never overwritten.
         """
-        if not self.is_active():
+        if not self.is_active() and expected_goal is None:
             return None
         if not owner or not continuation_prompt:
             raise ValueError('maintenance pause requires owner and continuation inputs')
@@ -1184,13 +1188,17 @@ class GoalManager:
         db = _get_session_db()
         if db is None:
             raise RuntimeError('maintenance goal checkpoint store unavailable')
-        expected = self._state.to_json()
+        expected = GoalState.from_json(expected_goal).to_json() if expected_goal is not None else self._state.to_json()
         paused = GoalState.from_json(expected)
+        if paused.status != 'active':
+            raise ValueError('maintenance continuation must identify an active originating goal')
         pause_id = uuid.uuid4().hex
         paused.status = 'paused'
         paused.paused_reason = f'maintenance-deferred; owner={owner}; pause={pause_id}; /goal resume'
         raw = paused.to_json()
         receipt = {'version': 1, 'pause_id': pause_id, 'owner': owner, 'hold_id': hold_id,
+                   'pause_applied': True, 'outcome': 'PAUSED',
+                   'required_action': 'Assign accountable operator; verify unchanged owned pause before /goal resume. No automatic resume.',
                    'session_id': self.session_id, 'profile_home': str(get_hermes_home().resolve()),
                    'checkpoint': json.loads(expected), 'paused_goal_sha256': hashlib.sha256(raw.encode()).hexdigest(),
                    'continuation_prompt': continuation_prompt, 'final_response': final_response,
@@ -1198,8 +1206,18 @@ class GoalManager:
         key = f'goal_maintenance_pause:{self.session_id}:{pause_id}'
         def commit(conn):
             row = conn.execute('SELECT value FROM state_meta WHERE key = ?', (_meta_key(self.session_id),)).fetchone()
-            if row is None or GoalState.from_json(row[0]).to_json() != expected:
-                raise RuntimeError('goal changed before maintenance pause; existing owner preserved')
+            try:
+                current = GoalState.from_json(row[0]).to_json() if row is not None else None
+            except (ValueError, TypeError, AttributeError):
+                current = None
+            if current != expected:
+                if expected_goal is None:
+                    raise RuntimeError('goal changed before maintenance pause; existing owner preserved')
+                receipt.update(pause_applied=False, outcome='UNKNOWN', paused_goal_sha256=None,
+                    reason='originating goal changed; successor untouched',
+                    observed_goal=json.loads(current) if current is not None else None,
+                    observed_goal_raw=row[0] if row is not None else None,
+                    required_action='Assign accountable operator; inspect exact old continuation and replacement goal. Do not resume/refund/resend automatically.')
             history = [dict(row) for row in conn.execute(
                 'SELECT * FROM messages WHERE session_id = ? ORDER BY id', (self.session_id,))]
             receipt['history_checkpoint'] = {'session_id': self.session_id,
@@ -1207,18 +1225,21 @@ class GoalManager:
                 'sha256': hashlib.sha256(json.dumps(history, sort_keys=True, default=str).encode()).hexdigest()}
             payload = json.dumps(receipt, sort_keys=True, default=str)
             db.set_meta(key, payload, cursor=conn)
-            db.set_meta(_meta_key(self.session_id), raw, cursor=conn)
+            if receipt['pause_applied']:
+                db.set_meta(_meta_key(self.session_id), raw, cursor=conn)
             return payload
         payload = db._execute_write(commit)
-        if db.get_meta(key) != payload or db.get_meta(_meta_key(self.session_id)) != raw:
+        if db.get_meta(key) != payload or (receipt['pause_applied'] and db.get_meta(_meta_key(self.session_id)) != raw):
             raise RuntimeError('maintenance goal checkpoint readback changed or unavailable')
-        self._state = paused
+        if receipt['pause_applied']:
+            self._state = paused
         return json.loads(payload)
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
         self._state.status = "active"
+        self._state.generation_id = uuid.uuid4().hex
         self._state.paused_reason = None
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:

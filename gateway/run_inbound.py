@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import asyncio
 from gateway.admission import native_to_thread, refuse_control_ingress, startup_resume_admitted, mark_ingress_effect, refuse_queued_ingress
 import concurrent.futures
-import dataclasses
+from gateway.admission_capacity import rewrite_dispatch_text
 import json
 import os
 import re
@@ -94,7 +94,7 @@ class GatewayInboundMixin:
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    event = dataclasses.replace(event, text=_new_text)
+                    event = rewrite_dispatch_text(self, event, _new_text)
                 break
             if _action == "allow":
                 break

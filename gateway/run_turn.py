@@ -2175,16 +2175,16 @@ class GatewayTurnMixin:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
-            # Capture the launch session id so post-run compression publication is identity-guarded
-            # (a /new may move session_entry.session_id while the old run is still unwinding).
+            # Compression publication keeps the launch session identity.
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
+            if await self._defer_queued_goal_for_maintenance(event):
+                return
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            # Admission/typing is not execution. All routing, authorization and
-            # turn preparation gates have passed when the agent runner is entered.
-            event._heartbeat_execution_started = True
+            from gateway.admission_capacity import mark_event_execution_started
+            mark_event_execution_started(event)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,

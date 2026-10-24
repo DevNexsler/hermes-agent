@@ -323,8 +323,9 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 work before a core session exists. After synchronous authentication, enter
 `with gateway_ingress(adapter.gateway_runner):` **before the first await or mutation**, including
 body parsing, deduplication, SQLite and journal setup. Keep the scope through response creation.
-`GatewayDraining` means no transport turn was accepted: answer JSON HTTP 503 with `exc.headers`
-(`Retry-After: 1`). A closed-fence refusal happens before journals, dedup claims, delivery receipts
+Answer `GatewayDraining` with JSON HTTP 503 and `exc.headers` (`Retry-After: 1`). The exception
+alone grants no retry authority: positive pre-effect proof follows the narrower contract below.
+A closed-fence refusal happens before journals, dedup claims, delivery receipts
 or core dispatch. A missing or unready native capability also raises this exception. Test doubles must install an explicit
 admission fixture; a missing runner never means acceptance.
 
@@ -335,10 +336,11 @@ the core external-drain gate. An unrelated task inheriting context cannot borrow
 Extension-created tasks use `adopt_ingress_task(runner, task)` before the handler exits.
 
 Retryable ingress supports direct starts and actual steering. In-memory queue/FIFO/debounce
-fallback raises `GatewayDraining` before storage, so callers retain the original durable item
-and retry; refund provisional dedup claims on every unaccepted exit, including cancellation.
-Native internal producers use the same reservation; their refused receipt becomes
-`WakeNotAccepted`, preserving refund/retry semantics. Ordinary unleased human queues keep their
+fallback raises `GatewayDraining` before storage. Callers retain the original durable item;
+only positively proven pre-effect refusal permits their defined retry/refund policy. Cancellation
+or a generic error retains UNKNOWN. Native internal producers use the same reservation and require
+an explicit adapter admission receipt; ambiguous outcomes preserve durable ownership.
+Ordinary unleased human queues keep their
 existing behavior. Startup resume reserves its own event and preclaimed session through the native
 lifecycle path; it can finish restoration while HTTP readiness stays closed, but cannot bypass a
 maintenance hold or external drain. Leased arrivals with existing backlog refuse before Base
@@ -512,6 +514,22 @@ capacity acquisition through core entry. Shutdown preserves all checkpointed goa
 in existing slot/overflow as durable owned maintenance pauses before destructive dequeue, including
 empty or muted final responses. A later capacity refusal preserves accepted goal checkpoint as
 maintenance handoff rather than dropping or automatically spinning the FIFO.
+Both enqueue sites pin the originating goal state, including a new generation on set/resume.
+Before pause and immediately before agent entry, the queued obligation must still match that state.
+A replacement (even identical text at the same clock time), user pause, cleared or malformed state
+is never adopted. The existing receipt instead retains the original checkpoint and inputs with
+`pause_applied=false`, `outcome="UNKNOWN"`, `observed_goal`/`observed_goal_raw`, and `required_action`;
+the successor stays untouched and strict readiness latches unknown. A successful owned pause has
+`pause_applied=true`, `outcome="PAUSED"`, and its verified `paused_goal_sha256`. Both outcomes require
+explicit operator accounting, never automatic resume/refund/resend. The history remains in the same
+profile's existing database; no additional queue is created.
+
+Supported pre-dispatch text rewrites clone the event while retaining private native checkpoints.
+Only the current live reservation's exact event may transfer its reserved capacity/startup ownership
+to that clone; matching session keys or inherited context alone grant no permission. Original
+transport text stays unchanged. Real agent entry marks the original event too, so a cancellation
+callback cannot mistake an executing rewritten goal/heartbeat for work cancelled before entry.
+
 Already accepted in-core goal followups return to the existing Base
 FIFO for a separately reserved task. Native boot continuation retains verified same-session boot
 provenance in a fresh event/session reservation; HTTP cannot borrow it. Session facade callbacks

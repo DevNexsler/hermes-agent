@@ -11,7 +11,7 @@ import asyncio
 import dataclasses
 import logging
 import time
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
@@ -321,6 +321,7 @@ class GatewayGoalsMixin:
                 from gateway.admission import native_producer_ingress, startup_session_admitted, without_gateway_ingress
                 continuation = self._synthetic_prompt_event(source, prompt)
                 continuation._goal_admission_checkpoint = {'session_id': mgr.session_id,
+                                                            'goal_state': mgr.state.to_json(),
                                                             'final_response': final_response,
                                                             'startup_restore': startup_session_admitted(self, _quick_key)}
                 with native_producer_ingress(self), without_gateway_ingress():
@@ -342,13 +343,14 @@ class GatewayGoalsMixin:
         async with _async_profile_runtime_scope(home, offload=self._run_in_executor_with_context):
             from hermes_cli.goals import GoalManager
             mgr = await self._run_in_executor_with_context(lambda: GoalManager(checkpoint['session_id']))
-            if mgr.state is None:
+            expected = checkpoint.get('goal_state')
+            if not isinstance(expected, str):
                 self._ingress_barrier.fail_quiescence()
-                raise RuntimeError('queued goal checkpoint unavailable')
-            if not mgr.is_active():
-                return True  # User/foreign pause or completion wins; never restart its queued continuation.
+                raise RuntimeError('queued goal originating identity unavailable')
+            if mgr.state is None or mgr.state.to_json() != expected:
+                self._ingress_barrier.fail_quiescence()
             return await self._defer_goal_for_maintenance(
-                mgr, event.source, event.text, checkpoint['final_response'], input_context={
+                mgr, event.source, event.text, checkpoint['final_response'], expected_goal=expected, input_context={
                     'message_id': event.message_id, 'channel_prompt': event.channel_prompt,
                     'channel_context': event.channel_context, 'raw_message': event.raw_message})
 
@@ -432,12 +434,12 @@ class GatewayGoalsMixin:
             cleanup.add_done_callback(verified)
         task.add_done_callback(finished)
 
-    async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None):
+    async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None, expected_goal=None):
         """Retain a not-yet-started continuation as an owned, actionable maintenance checkpoint."""
         barrier = getattr(self, '_ingress_barrier', None)
         closed = (getattr(self, '_draining', False) or getattr(self, '_external_drain_active', False)
                   or (barrier is not None and barrier._closed))
-        if not closed or not prompt or source is None or not mgr.is_active():
+        if not closed or not prompt or source is None or (not mgr.is_active() and expected_goal is None):
             return False
         hold = barrier.hold if barrier is not None else {}
         owner = hold.get('owner') or 'gateway-maintenance-operator'
@@ -445,14 +447,20 @@ class GatewayGoalsMixin:
             try:
                 return mgr.pause_for_maintenance(
                     owner=owner, hold_id=hold.get('hold_id'), continuation_prompt=prompt,
-                    final_response=final_response, source=dataclasses.asdict(source), input_context=input_context)
+                    final_response=final_response, source=dataclasses.asdict(source), input_context=input_context,
+                    expected_goal=expected_goal)
             except Exception:
                 if barrier is not None:
                     barrier.fail_quiescence()
                 logger.error('Goal maintenance checkpoint unconfirmed for %s; quiescence blocked',
                              mgr.session_id, exc_info=True)
                 raise
-        await self._run_in_executor_with_context(pause)
+        receipt = await self._run_in_executor_with_context(pause)
+        if not receipt['pause_applied']:
+            if barrier is not None:
+                barrier.fail_quiescence()
+            logger.error('Old goal continuation retained UNKNOWN for %s; replacement untouched; owner=%s', mgr.session_id, owner)
+            return True
         await self._defer_goal_status_notice_after_delivery(
             source, f'Goal paused for gateway maintenance; owner={owner}. Use /goal resume after handoff.')
         return True

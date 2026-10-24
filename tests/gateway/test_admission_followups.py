@@ -298,9 +298,10 @@ async def test_queued_goal_binds_route_before_checkpoint_lookup(native, monkeypa
         GoalManager(sid).set('A goal must remain active')
     with _profile_runtime_scope(b):
         GoalManager(sid).set('B routed goal must pause')
+        expected_b = GoalManager(sid).state.to_json()
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='123456', profile='b')
     event = MessageEvent(text='exact B continuation', source=source)
-    event._goal_admission_checkpoint = {'session_id': sid, 'final_response': 'B prior result'}
+    event._goal_admission_checkpoint = {'session_id': sid, 'goal_state': expected_b, 'final_response': 'B prior result'}
     assert native.runner._resolve_profile_home_for_source(source).resolve() == b.resolve()
     set_multiplex_active(True)
     try:
