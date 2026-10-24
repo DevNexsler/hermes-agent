@@ -11,7 +11,8 @@ home, child = retention.home, retention.child
 
 
 @pytest.mark.parametrize('operation', ['delete', 'failed_upload'])
-@pytest.mark.parametrize('owner', ['live', 'pending', 'alias', 'unbound', 'settled'])
+@pytest.mark.parametrize('owner', ['live', 'pending',
+    pytest.param('alias', marks=pytest.mark.require_symlinks), 'unbound', 'settled'])
 def test_blob_unlink_keeps_unrelated_retained_workspace_input(home, child, monkeypatch, operation, owner):
     kb.create_board('owned')
     with kbc.connect_closing(board='owned') as conn:

@@ -18,7 +18,8 @@ home, child = retention.home, retention.child
 
 
 @pytest.mark.parametrize('operation', ['workspace', 'parent', 'gc'])
-@pytest.mark.parametrize('overlap', ['same', 'inside', 'outside', 'alias', 'settled'])
+@pytest.mark.parametrize('overlap', ['same', 'inside', 'outside',
+    pytest.param('alias', marks=pytest.mark.require_symlinks), 'settled'])
 def test_unrelated_retained_workspace_survives_native_cleanup(home, child, operation, overlap):
     kb.create_board('owned')
     kb.set_current_board('owned')

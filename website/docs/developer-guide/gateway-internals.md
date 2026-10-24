@@ -585,6 +585,9 @@ attachment rows; direct, parent and CLI cleanup hold the writer boundary through
 The shared blob-unlink seam also preserves an input inside a retained workspace after its last
 attachment row is removed or upload registration fails. Nested writer savepoints validate board
 closure before yielding, leaving their caller's outer transaction owned by that caller.
+Attachment identity, input containment and retained workspace overlap share the existing NFC
+comparison policy after realpath resolution. Destructive I/O keeps the original stored path spelling;
+on normalization-sensitive filesystems equivalent comparison keys conservatively retain inputs.
 Native log rotation runs before claim under that same board's writer boundary. Prior physical,
 launch, notification or ancestor ownership preserves every generation, including zero-backup
 configuration. An injected database cannot authorize canonical log rotation; append-only spawn

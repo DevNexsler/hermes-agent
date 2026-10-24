@@ -28,9 +28,9 @@ _REMOVABLE_KINDS = ("scratch", "worktree")
 
 def _unlink_unreferenced_attachment_blob(conn, path):
     path = Path(path)
-    realpath = path.resolve()
+    realpath = _input_path_identity(path)
     if (_has_retained_workspace(conn, realpath)
-            or any(Path(row[0]).resolve() == realpath for row in conn.execute('SELECT stored_path FROM task_attachments'))):
+            or any(_input_path_identity(row[0]) == realpath for row in conn.execute('SELECT stored_path FROM task_attachments'))):
         return
     with contextlib.suppress(OSError):
         if path.is_file():
@@ -48,22 +48,22 @@ def cleanup_failed_attachment_blob(conn, path):
 
 
 def _has_attachment_files(conn, directory):
-    root = Path(directory).resolve()
-    return any(Path(row[0]).resolve().is_relative_to(root)
+    root = _input_path_identity(directory)
+    return any(_input_path_identity(row[0]).is_relative_to(root)
                for row in conn.execute('SELECT stored_path FROM task_attachments'))
 
 
 def _has_retained_workspace(conn, directory):
     """Shared native workspace ownership protects both enclosing and nested inputs."""
     from hermes_cli.kanban_db_spawn import retained_task_ids
-    root = Path(directory).expanduser().resolve()
+    root = _input_path_identity(directory)
     protected = retained_task_ids(conn)
     for task_id, path in conn.execute('SELECT id, workspace_path FROM tasks'):
         if task_id not in protected:
             continue
         if not path:
             return True  # An unbound retained workspace cannot authorize removal.
-        owner = Path(path).expanduser().resolve()
+        owner = _input_path_identity(path)
         if owner.is_relative_to(root) or root.is_relative_to(owner):
             return True
     return False
@@ -94,6 +94,11 @@ def _path_key(path: Path | str | None) -> str:
     check here goes through this key.
     """
     return unicodedata.normalize("NFC", str(path)) if path is not None else ""
+
+
+def _input_path_identity(path) -> Path:
+    """Comparison only: preserve original spelling for I/O, normalize resolved input keys."""
+    return Path(_path_key(Path(path).expanduser().resolve()))
 
 # Statuses after which a child no longer needs its parent's workspace artifacts.
 _ACTIVE_CHILDREN_SQL = (
