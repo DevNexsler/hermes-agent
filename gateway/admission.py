@@ -31,10 +31,15 @@ class GatewayDraining(RuntimeError):
         self.reason = reason
 
 
+class _EffectHistory:
+    def __init__(self):
+        self.started = False
+
+
 class _IngressLease:
     def __init__(self, barrier, owner, startup=None):
         self.startup = startup
-        self.effect_started = False
+        self.effects = _EffectHistory()
         self.barrier = barrier
         self.owners = {owner}
 
@@ -179,14 +184,16 @@ def _reserve_ingress(runner, *, startup=None):
     try:
         lease = barrier.reserve(owner, startup=startup)
     except GatewayDraining as exc:
-        if previous is not None and previous.effect_started:
+        if previous is not None and previous.effects.started:
             exc.pre_effect = False
         raise
+    if previous is not None and previous.barrier.held(previous, owner):
+        lease.effects = previous.effects
     token = _ingress.set(lease)
     try:
         yield
     except GatewayDraining as exc:
-        if lease.effect_started:
+        if lease.effects.started:
             exc.pre_effect = False
         raise
     finally:
@@ -226,11 +233,11 @@ async def prepare_ingress_dispatch(adapter, event, session_key):
     if busy and (event.get_command() not in (None, 'steer') or event.media_urls or event.media_types
                  or event.message_type.value != 'text'):
         raise GatewayDraining('retryable busy ingress requires plain text steer',
-                              pre_effect=not _ingress.get().effect_started, reason='busy_unsupported')
+                              pre_effect=not _ingress.get().effects.started, reason='busy_unsupported')
     if runner._draining and busy:
-        raise GatewayDraining('shutdown cannot accept a busy handoff', pre_effect=not _ingress.get().effect_started, reason='busy_shutdown')
+        raise GatewayDraining('shutdown cannot accept a busy handoff', pre_effect=not _ingress.get().effects.started, reason='busy_shutdown')
     if adapter._pending_messages.get(session_key) or runner._overflow_queue(session_key):
-        raise GatewayDraining('accepted session backlog must finish before retryable ingress', pre_effect=not _ingress.get().effect_started, reason='busy_backlog')
+        raise GatewayDraining('accepted session backlog must finish before retryable ingress', pre_effect=not _ingress.get().effects.started, reason='busy_backlog')
     if runner._is_session_running(session_key) and session_key not in adapter._active_sessions:
         await adapter._handle_message_while_active(event, session_key)
         return True
@@ -248,7 +255,7 @@ def ingress_admitted(runner):
 def mark_ingress_effect(runner):
     """Once notice/core/steer effects begin, later 503 cannot attest no effect."""
     if ingress_admitted(runner):
-        _ingress.get().effect_started = True
+        _ingress.get().effects.started = True
 
 
 def adopt_ingress_task(runner, task):
@@ -293,14 +300,14 @@ def refuse_queued_ingress(runner):
     """Retryable ingress starts/steers directly; its caller retains work instead of a memory queue."""
     if ingress_admitted(runner):
         raise GatewayDraining('retryable ingress cannot enter an in-memory follow-up queue',
-                              pre_effect=not _ingress.get().effect_started, reason='busy_queue_refused')
+                              pre_effect=not _ingress.get().effects.started, reason='busy_queue_refused')
 
 
 def refuse_control_ingress(runner):
     """Retryable wakes cannot resolve or cancel somebody else's interactive prompt."""
     if ingress_admitted(runner):
         raise GatewayDraining('retryable wake cannot answer a human control prompt',
-                              pre_effect=not _ingress.get().effect_started, reason='busy_unsupported')
+                              pre_effect=not _ingress.get().effects.started, reason='busy_unsupported')
 
 
 

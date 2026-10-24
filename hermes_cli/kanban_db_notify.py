@@ -20,7 +20,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from hermes_cli.kanban_db import Event
+    from hermes_cli.kanban_db import Event, Task
 
 
 # Notifier reaction to a terminal event: "notify" = passive adapter.send only
@@ -364,8 +364,10 @@ def claim_unseen_events_for_sub(
                                thread_id=thread_id, kinds=kinds, attention_context=attention_context)[:3]
 
 
-def claim_notify_delivery(conn: sqlite3.Connection, *, attention_context: dict, **identity) -> tuple:
-    """Claim with exact subscription/attention captured inside the same write transaction."""
+def claim_notify_delivery(
+    conn: sqlite3.Connection, *, attention_context: dict, **identity,
+) -> tuple[int, int, list[Event], Optional[dict], Optional[Task]]:
+    """Return cursor/events plus exact subscription and Task captured in claim transaction."""
     return _claim_notify_events(conn, attention_context=attention_context, **identity)
 
 
@@ -378,15 +380,11 @@ def _claim_notify_events(
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
     attention_context: Optional[dict] = None,
-) -> tuple[int, int, list[Event], Optional[dict]]:
-    """Atomically claim unseen events for one subscription.
+) -> tuple[int, int, list[Event], Optional[dict], Optional[Task]]:
+    """Claim cursor/events plus subscription/task snapshots under one writer lock.
 
-    Returns ``(old_cursor, new_cursor, events)``; when events are returned the
-    row's ``last_event_id`` has already been advanced inside ``BEGIN IMMEDIATE``,
-    so concurrent gateway watchers on the same board DB serialize on SQLite's
-    writer lock and only the first claims a given event range. Callers send the
-    events, then leave the cursor or call :func:`rewind_notify_cursor` on
-    delivery failure.
+    Legacy cursor consumers use the first three fields. Owned delivery keeps its
+    committed attention until exact settlement, independently of later task edits.
     """
     with _kb.write_txn(conn):
         key = _sub_key(task_id, platform, chat_id, thread_id)
@@ -396,21 +394,23 @@ def _claim_notify_events(
             raise ValueError('notification metadata unreadable')
         old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
         if 'notification_attention_v1' in metadata:
-            return old_cursor or 0, old_cursor or 0, [], None
+            return old_cursor or 0, old_cursor or 0, [], None, None
         if old_cursor is None:
-            return 0, 0, [], None
+            return 0, 0, [], None, None
         new_cursor, events = unseen_events_for_sub(
             conn, task_id=task_id, platform=platform, chat_id=chat_id,
             thread_id=thread_id, kinds=kinds,
         )
         if not events:
-            return old_cursor, old_cursor, [], None
+            return old_cursor, old_cursor, [], None, None
+        task = None
         if attention_context is not None:
+            task = _kb.get_task(conn, task_id)
             record = dict(attention_context, version=1, outcome='UNKNOWN', attempt_id=uuid.uuid4().hex,
                 reason='notification claimed; effect outcome unconfirmed', created_at=time.time(),
                 database_realpath=str(Path(conn.execute('PRAGMA database_list').fetchone()[2]).resolve()),
                 required_action='Inspect exact attempt/events and transport effects; assign accountable operator. No automatic retry/refund/completion.',
-                task=asdict(_kb.get_task(conn, task_id)), subscription=dict(row),
+                task=asdict(task), subscription=dict(row),
                 original_cursor=old_cursor, claimed_cursor=new_cursor, events=[asdict(event) for event in events])
             metadata['notification_attention_v1'] = json.dumps(record, sort_keys=True)
             conn.execute('UPDATE kanban_notify_subs SET delivery_metadata = ? ' + _SUB_KEY_WHERE,
@@ -421,15 +421,16 @@ def _claim_notify_events(
             if saved['last_event_id'] != new_cursor or json.loads(saved['delivery_metadata']) != metadata:
                 raise RuntimeError('notification intent readback unconfirmed')
         snapshot = dict(row, last_event_id=new_cursor, delivery_metadata=metadata)
-        return old_cursor, new_cursor, events, snapshot
+        return old_cursor, new_cursor, events, snapshot, task
 
 
 def checkpoint_notify_delivery(
     conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
     thread_id: Optional[str] = None, expected_attention: str, outcome: str,
+    remove_archived: bool = False,
 ) -> None:
     """Inspect/settle only this exact durable attempt; uncertainty never calls settlement."""
-    if outcome not in {'inspect', 'accepted', 'refused'}:
+    if outcome not in {'inspect', 'accepted', 'refused'} or (remove_archived and outcome != 'accepted'):
         raise ValueError('invalid notification checkpoint outcome')
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
@@ -442,6 +443,8 @@ def checkpoint_notify_delivery(
             raise RuntimeError('notification cursor ownership changed')
         if outcome == 'inspect':
             return
+        if remove_archived and _remove_settled_archived_sub(conn, key, row):
+            return
         del metadata['notification_attention_v1']
         cursor = record['claimed_cursor'] if outcome == 'accepted' else record['original_cursor']
         conn.execute('UPDATE kanban_notify_subs SET delivery_metadata = ?, last_event_id = ? ' + _SUB_KEY_WHERE,
@@ -449,6 +452,20 @@ def checkpoint_notify_delivery(
         saved = conn.execute('SELECT delivery_metadata, last_event_id FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
         if saved['last_event_id'] != cursor or json.loads(saved['delivery_metadata']) != metadata:
             raise RuntimeError('notification settlement readback unconfirmed')
+
+
+def _remove_settled_archived_sub(conn, key, row) -> bool:
+    """Successful archive settlement and exact owned deletion share one writer transaction."""
+    task = conn.execute('SELECT status FROM tasks WHERE id=?', (key[0],)).fetchone()
+    if task is None or task['status'] != 'archived':
+        return False
+    deleted = conn.execute('DELETE FROM kanban_notify_subs ' + _SUB_KEY_WHERE
+                           + ' AND last_event_id=? AND delivery_metadata=?',
+                           (*key, row['last_event_id'], row['delivery_metadata']))
+    saved = conn.execute('SELECT 1 FROM kanban_notify_subs ' + _SUB_KEY_WHERE, key).fetchone()
+    if deleted.rowcount != 1 or saved is not None:
+        raise RuntimeError('notification archive settlement readback unconfirmed')
+    return True
 
 
 def _cas_cursor(conn: sqlite3.Connection, key: tuple, new_cursor: int, expected: int) -> sqlite3.Cursor:

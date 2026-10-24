@@ -431,6 +431,10 @@ Nested/callee typed exceptions cannot upgrade proof after this mark. Attempted s
 fails or declines remains UNKNOWN; no inferred no-effect or automatic retry. Ordinary human
 fanout keeps its existing behavior. Busy leased control/media/interrupt fallbacks refuse before
 invocation; direct confirmed steer or fresh start remain the acceptance paths.
+Related nested reservations share one monotonic effect history, including adopted children that
+run after the nested scope exits. False/error/BaseException/cancellation never restores parent
+no-effect proof. Explicit independent human/goal/producer scopes retain separate admission and
+history; sharing effect history grants no additional permission.
 Preflight refuses pending clarify/update/slash-confirm prompts before Base can acknowledge
 background dispatch; core resolver guards cover direct callers too. Unleased human replies retain
 their existing control behavior.
@@ -467,12 +471,16 @@ whole cursor. Artifact exceptions and negative delivery results retain attention
 batch success means at least one image landed, so owned notifications submit individual image
 uploads to verify every artifact before aggregate settlement.
 
-`claim_notify_delivery` returns subscription and attention captured inside its SQLite claim
-transaction. A later foreign replacement cannot become the caller's ownership token. Existing
-cursor-only consumers keep `claim_unseen_events_for_sub` and its three-value result.
+`claim_notify_delivery` returns cursors/events, subscription/attention and Task captured inside
+its SQLite claim transaction. Delivery never rereads a later task for text, destination or
+artifacts. A later foreign replacement cannot become the caller's ownership token. Existing
+cursor-only consumers keep `claim_unseen_events_for_sub` and its three-value result. Successful
+archive settlement checks exact owned attention/cursor and current archive status, then deletes
+in that same transaction. No postsettlement unconditional unsubscribe; a foreign or malformed
+attention installed after commit survives.
 
 Embedded dispatcher reserves its complete decomposition/claim/spawn tick before mutations.
-Cancellation waits for admitted physical tick completion before releasing its singleton lock.
+Repeated cancellation waits for admitted physical tick completion before releasing singleton lock.
 Strict status also reads machine-shared board claims and task/run worker records without schema
 initialization, reconciliation or signals: running/orphan claims, live terminal workers and
 unverifiable foreign-host workers prevent zero; unreadable stores mean unknown. This inventory

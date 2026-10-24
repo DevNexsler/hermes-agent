@@ -141,9 +141,6 @@ class GatewayKanbanWatchersMixin:
     def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
 
-    def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
-        self._kanban_sub_op(board, "remove_notify_sub", sub)
-
     def _kanban_rewind(self, sub: dict, claimed_cursor: int, old_cursor: int, board: Optional[str] = None) -> None:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
@@ -305,8 +302,12 @@ class GatewayKanbanWatchersMixin:
                 try:
                     results, ready_pending = await asyncio.shield(tick)
                 except asyncio.CancelledError:
-                    # Keep the singleton lock until admitted physical spawn/DB work settles.
-                    await asyncio.shield(asyncio.gather(tick, return_exceptions=True))
+                    # Repeated cancellation cannot release the singleton beside physical work.
+                    while not tick.done():
+                        try:
+                            await asyncio.shield(asyncio.gather(tick, return_exceptions=True))
+                        except asyncio.CancelledError:
+                            continue
                     raise
                 any_spawned = _log_spawn_results(results)
                 bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0

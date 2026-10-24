@@ -3993,10 +3993,9 @@ class BasePlatformAdapter(ABC):
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
-        """Route a message that arrived while ``session_key`` is busy: bypass
-        commands / clarify replies dispatch inline, everything else is queued."""
+        """Route busy control replies inline and ordinary human followups to their queue."""
         # Inline bypass avoids approval deadlocks and competing lifecycle ownership.
-        from gateway.admission import GatewayDraining, refuse_queued_ingress
+        from gateway.admission import GatewayDraining, ingress_admitted, refuse_control_ingress, refuse_queued_ingress
         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
@@ -4011,7 +4010,6 @@ class BasePlatformAdapter(ABC):
                                  self.name, cmd, session_key)
                     await self._dispatch_inline_reply(event)
             except Exception as e:
-                from gateway.admission import GatewayDraining, ingress_admitted
                 if isinstance(e, GatewayDraining) or ingress_admitted(self.gateway_runner):
                     raise
                 logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
@@ -4025,10 +4023,13 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 _has_text_clarify = False
             if _has_text_clarify:
+                refuse_control_ingress(self.gateway_runner)
                 logger.debug("[%s] Routing message to clarify text-intercept for %s", self.name, session_key)
                 try:
                     await self._dispatch_inline_reply(event)
                 except Exception as e:
+                    if isinstance(e, GatewayDraining) or ingress_admitted(self.gateway_runner):
+                        raise
                     logger.error("[%s] Clarify text-intercept dispatch failed: %s", self.name, e, exc_info=True)
                 return
         if self._busy_session_handler is not None:
@@ -4038,7 +4039,6 @@ class BasePlatformAdapter(ABC):
             except GatewayDraining:
                 raise
             except Exception as e:
-                from gateway.admission import ingress_admitted
                 if ingress_admitted(self.gateway_runner):
                     raise
                 logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)

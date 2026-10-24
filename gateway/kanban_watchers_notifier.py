@@ -292,7 +292,7 @@ class _Collector:
         profile = owner_profile or self.notifier_profile or 'default'
         source = SessionSource(platform=Platform(platform), chat_id=sub['chat_id'], profile=owner_profile)
         profile_home = self.runner._resolve_profile_home_for_source(source).resolve()
-        old_cursor, cursor, events, claimed_sub = _kbn().claim_notify_delivery(
+        old_cursor, cursor, events, claimed_sub, task = _kbn().claim_notify_delivery(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
             attention_context={'owner': f"profile:{profile}/{platform}:subscriber:{sub.get('user_id') or sub['chat_id']}",
@@ -301,7 +301,6 @@ class _Collector:
         if not events:
             return None
         sub = claimed_sub
-        task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
@@ -525,7 +524,8 @@ class _KanbanNotification:
         def checkpoint():
             try:
                 self.runner._kanban_sub_op(self.board_slug, 'checkpoint_notify_delivery', self.sub,
-                    expected_attention=self.attention, outcome=outcome)
+                    expected_attention=self.attention, outcome=outcome,
+                    remove_archived=(outcome == 'accepted' and self.task is not None and self.task.status == 'archived'))
             except Exception:
                 barrier = getattr(self.runner, '_ingress_barrier', None)
                 if barrier is not None:
@@ -538,9 +538,6 @@ class _KanbanNotification:
 
     async def advance(self) -> None:
         await self._checkpoint('accepted')
-
-    async def unsub(self) -> None:
-        await _to_thread_process_service(self.runner._kanban_unsub, self.sub, self.board_slug)
 
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
@@ -832,6 +829,3 @@ class _KanbanNotification:
         await self.advance()
         if not is_push:
             self.clear_failures()
-        # Unsubscribe only on archive; ``done`` is reversible.
-        if self.task and self.task.status == "archived":
-            await self.unsub()
