@@ -379,39 +379,38 @@ def _process_fingerprint(pid: int) -> Optional[str]:
 
 
 def _worker_alive(pid: Optional[int], started_at) -> bool:
-    """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
-    recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
-    the number, so bare existence is never enough to extend a claim or to signal. A legacy row without
-    a fingerprint keeps the existence answer: killing it is the pre-fingerprint behaviour and the row is
-    rewritten with a fingerprint on its next spawn. An UNVERIFIED spawn also keeps the existence answer
-    (a claim is never released beside a possibly-live worker) but ``_terminate_reclaimed_worker``
-    refuses to signal it."""
+    """Retain a live PID until exit or fingerprint replacement is positively observed.
+
+    An unreadable fingerprint holds ownership without authorizing signals. Legacy NULL
+    fingerprints keep their pre-fingerprint existence/signalling behavior.
+    """
     if not _kb._pid_alive(pid):
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
-    return not _pid_recycled(pid, started_at)
+    return _pid_recycled(pid, started_at) is not True
 
 
-def _pid_recycled(pid: Optional[int], started_at) -> bool:
-    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
-    longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+def _pid_recycled(pid: Optional[int], started_at) -> Optional[bool]:
+    """True = proven replacement, False = same/legacy, None = identity unreadable.
+
+    Unknown identity retains ownership but never authorizes a signal.
+    """
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        return True
+        return None
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        current = _process_fingerprint(int(pid))
+        return None if current is None else current != started_at
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
-        return True
+        return None
     try:
         return not _start_times_agree(current, started_at)
     except (TypeError, ValueError):
-        return True
+        return None
 
 
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
@@ -430,8 +429,10 @@ def _poll_worker_exit(pid: int, started_at: Optional[int] = None) -> bool:
     return False
 
 
-def _sigkill(kill, pid: int) -> bool:
+def _sigkill(kill, pid: int, started_at=None) -> bool:
     """Best-effort SIGKILL; True when the signal was delivered."""
+    if _pid_recycled(pid, started_at) is not False:
+        return False
     try:
         # signal.SIGKILL doesn't exist on Windows; SIGTERM maps to TerminateProcess.
         kill(int(pid), getattr(signal, "SIGKILL", signal.SIGTERM))
@@ -450,7 +451,7 @@ def _terminate_reclaimed_worker(
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
     signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
-    UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
+    unreadable identity that is still live is never signalled either, but
     it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
     spawning a duplicate beside it."""
     info: dict[str, Any] = {
@@ -467,16 +468,17 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     kill = _kill_fn(signal_fn)
+    if not _kb._pid_alive(pid):
+        info['terminated'] = True
+        return info
     if kill is None:
+        info['signal_refused'] = True
         return info
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
-        info["signal_refused"] = True
-        info["terminated"] = not _kb._pid_alive(pid)
-        return info
-    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
-        info["terminated"] = True
-        info["pid_recycled"] = True
+    recycled = _pid_recycled(pid, started_at)
+    if recycled is not False:
+        info["signal_refused"] = recycled is None
+        info["terminated"] = recycled is True
+        info["pid_recycled"] = recycled is True
         return info
 
     info["termination_attempted"] = True
@@ -494,7 +496,7 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     if _worker_alive(pid, started_at):
-        if not _sigkill(kill, pid):
+        if not _sigkill(kill, pid, started_at):
             return info
         info["sigkill"] = True
     info["terminated"] = not _worker_alive(pid, started_at)
@@ -681,24 +683,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
-        if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
-            # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
-            # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
-            _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
-                             "identity; not signalled", tid, pid)
+        termination = _terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn, started_at=started_at)
+        if _worker_survived_termination(termination):
             continue
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
-                killed = _sigkill(kill, pid)
+        killed = termination['sigkill']
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):

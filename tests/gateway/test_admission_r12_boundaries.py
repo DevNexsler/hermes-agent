@@ -144,7 +144,7 @@ def test_unlink_cannot_discard_original_unknown_ancestor_inputs(tmp_path, monkey
 def test_gc_keeps_actual_rotated_log_generations_for_unknown_launch(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as kbd
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
-    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'kanban.db'))
     monkeypatch.setattr(kbd, '_profile_exists_fn', lambda: lambda _: True)
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title='EXACT unknown log owner', assignee='owner',

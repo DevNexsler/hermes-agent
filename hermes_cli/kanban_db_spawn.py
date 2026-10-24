@@ -182,9 +182,17 @@ def gc_settled_events(conn, cutoff):
 def gc_settled_worker_logs(log_dir, cutoff, board):
     """Serialize retention against launch intent commit; uncertain logs stay actionable."""
     import contextlib
-    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    import sqlite3
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.sqlite_safe_read import connect_tracked
     removed = 0
-    with kbc.connect_closing(board=board) as conn, kb.write_txn(conn):
+    # Logs follow the canonical board, independently of an injected worker DB override.
+    database = kb._board_path(None, board, ('kanban.db',), 'kanban.db').resolve()
+    if kb.kanban_db_path(board).resolve() != database:
+        raise RuntimeError('worker log ownership ambiguous: database override differs from log board')
+    with contextlib.closing(connect_tracked(database.as_uri() + '?mode=rw', uri=True,
+                                          isolation_level=None)) as conn, kb.write_txn(conn):
+        conn.row_factory = sqlite3.Row
         protected = retained_task_ids(conn)
         for path in log_dir.iterdir():
             owner = re.fullmatch(r'(.+)\.log(?:\.\d+)?', path.name)

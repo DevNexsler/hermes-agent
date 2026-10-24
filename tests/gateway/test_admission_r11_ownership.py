@@ -131,7 +131,7 @@ async def test_gc_preserves_fast_terminal_unresolved_launch_and_history_across_r
     from hermes_cli.kanban_db_spawn import pending_worker_launch
     from gateway.kanban_quiescence import kanban_worker_work_count
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
-    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'kanban.db'))
     monkeypatch.setattr(kbd, '_profile_exists_fn', lambda: lambda _: True)
     workers = []
     with kbc.connect() as conn:

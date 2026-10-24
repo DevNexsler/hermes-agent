@@ -570,8 +570,11 @@ and incapable rollback still need separate exclusion. Owner principal does not a
 Inventory enumerates default/named/archived database realpaths plus any configured database override;
 an override cannot hide another board. Task deletion and archived-task purge retain running claims,
 live or unverifiable task/run PIDs, unresolved launch/notification attention and original ancestors.
-The same retained set protects events, current/rotated logs and workspace cleanup, including the
-completion-before-physical-exit window. Any notification attention (including malformed/foreign)
+The same retained set protects events, current/rotated logs, attachment removal and workspace cleanup,
+including ancestor handoffs and the completion-before-physical-exit window. Unreadable process
+fingerprints retain ownership without authorizing signals or automatic reclaim. Log GC refuses a
+database override that differs from the log board, and never creates a missing ownership database.
+Any notification attention (including malformed/foreign)
 also keeps strict readiness UNKNOWN across restart. Normal completion/archive semantics remain;
 ordinary settled deletion/GC becomes eligible after physical ownership and attention both settle.
 

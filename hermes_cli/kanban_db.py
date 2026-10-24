@@ -1908,22 +1908,8 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
 
 def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
     """Delete the row (source of truth) and best-effort its blob; None when no row matched."""
-    with write_txn(conn):
-        att = get_attachment(conn, attachment_id)
-        if att is None:
-            return None
-        conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
-        has_remaining_blob_reference = conn.execute(
-            "SELECT 1 FROM task_attachments WHERE stored_path = ? LIMIT 1",
-            (att.stored_path,),
-        ).fetchone() is not None
-        _append_event(conn, att.task_id, "attachment_removed", {"filename": att.filename})
-    if not has_remaining_blob_reference:
-        with contextlib.suppress(OSError):
-            p = Path(att.stored_path)
-            if p.is_file():
-                p.unlink()
-    return att
+    from hermes_cli.kanban_db_workspace import delete_attachment
+    return delete_attachment(conn, attachment_id)
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:

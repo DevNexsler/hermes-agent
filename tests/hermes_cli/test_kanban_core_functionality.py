@@ -263,10 +263,10 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
+    # Model the observed exit AFTER SIGTERM; an already dead PID grants no signal authority.
     import hermes_cli.kanban_db as _kb
     original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    _kb._pid_alive = lambda pid: not killed  # pretend SIGTERM worked immediately
 
     try:
         conn = kbc.connect()

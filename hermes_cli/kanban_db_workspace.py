@@ -26,6 +26,26 @@ if TYPE_CHECKING:
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
 
+def delete_attachment(conn, attachment_id):
+    """Retained worker/notification inputs and ancestor handoffs stay attached."""
+    from hermes_cli.kanban_db_spawn import require_settled_task_ownership
+    with _kb.write_txn(conn):
+        att = _kb.get_attachment(conn, attachment_id)
+        if att is None:
+            return None
+        require_settled_task_ownership(conn, att.task_id)
+        conn.execute('DELETE FROM task_attachments WHERE id=?', (attachment_id,))
+        has_reference = conn.execute('SELECT 1 FROM task_attachments WHERE stored_path=? LIMIT 1',
+                                     (att.stored_path,)).fetchone() is not None
+        _kb._append_event(conn, att.task_id, 'attachment_removed', {'filename': att.filename})
+    if not has_reference:
+        with contextlib.suppress(OSError):
+            path = Path(att.stored_path)
+            if path.is_file():
+                path.unlink()
+    return att
+
+
 def _path_key(path: Path | str | None) -> str:
     """Unicode-form-insensitive identity for a filesystem path.
 
