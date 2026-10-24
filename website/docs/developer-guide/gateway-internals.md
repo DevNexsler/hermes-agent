@@ -419,6 +419,15 @@ completion-ledger/control readers, completion routing/DB work, hot-profile disco
 refresh, notifier routing and suspend/metadata workers therefore use explicit tracked native
 offloads. Completion transcript delivery uses the existing context-aware native offloader.
 Default executor choice and profile context remain intact; cancellation does not prove physical exit.
+Reconnect channel-directory discovery and writes use that context-aware offloader too, including
+Slack fallbacks. The initial startup build binds its concrete runner explicitly. A finite
+directory refresh scheduled by the housekeeping thread also binds its runner;
+that refresh stays registered across its async adapter calls and any thread timeout.
+Loop-liveness starts under a fresh observer context; its heartbeat writer retains its physical future.
+Finite boot sends are registered before their first yield and remain owned after the bounded
+restore gate opens. Boot/reconnect ledger, retry-timer and startup metadata offloads bind their
+runner explicitly even when called without a supervisor. These counters are physical-work
+ownership, not delivery receipts or a proof that an old process can be stopped safely.
 
 Maintenance pause/receipt writes verify both final rows inside their SQLite writer transaction
 before commit. Rejected or altered writes roll back the whole handoff, including any accidental

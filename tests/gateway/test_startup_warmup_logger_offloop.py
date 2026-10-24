@@ -13,11 +13,11 @@ import time
 
 import pytest
 
-from gateway.run_startup import GatewayStartupMixin
+from gateway.run import GatewayRunner
 
 
-def _runner() -> GatewayStartupMixin:
-    return object.__new__(GatewayStartupMixin)
+def _runner() -> GatewayRunner:
+    return object.__new__(GatewayRunner)
 
 
 @pytest.mark.asyncio
