@@ -151,20 +151,25 @@ def persist_worker_pid(conn, task_id, pid, *, expected_run_id=None, launch_id=No
         if current == run_id:
             conn.execute('UPDATE tasks SET worker_pid=?, worker_started_at=? WHERE id=?',
                          (pid, started_at, task_id))
-            row = conn.execute('SELECT worker_pid, worker_started_at FROM tasks WHERE id=?', (task_id,)).fetchone()
-            if row is None or tuple(row) != (pid, started_at):
-                raise RuntimeError('worker task PID readback unconfirmed')
         if run_id is not None:
             conn.execute('UPDATE task_runs SET worker_pid=?, worker_started_at=? WHERE id=? AND task_id=?',
                          (pid, started_at, run_id, task_id))
-            row = conn.execute('SELECT worker_pid, worker_started_at FROM task_runs WHERE id=? AND task_id=?',
-                               (run_id, task_id)).fetchone()
-            if row is None or tuple(row) != (pid, started_at):
-                raise RuntimeError('worker run PID readback unconfirmed')
         payload = {'pid': pid, 'started_at': started_at}
         if launch_id is not None:
             payload['launch_id'] = launch_id
         _append_checked_event(conn, task_id, 'spawned', payload, run_id)
+        # Resolving receipt triggers may invalidate earlier writes in this transaction.
+        if kb._current_run_id(conn, task_id) != current:
+            raise RuntimeError('worker task run readback unconfirmed')
+        if current == run_id:
+            row = conn.execute('SELECT worker_pid, worker_started_at FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None or tuple(row) != (pid, started_at):
+                raise RuntimeError('worker task PID readback unconfirmed')
+        if run_id is not None:
+            row = conn.execute('SELECT worker_pid, worker_started_at FROM task_runs WHERE id=? AND task_id=?',
+                               (run_id, task_id)).fetchone()
+            if row is None or tuple(row) != (pid, started_at):
+                raise RuntimeError('worker run PID readback unconfirmed')
 
 
 def gc_settled_events(conn, cutoff):

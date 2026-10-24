@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.admission import (GatewayAdmission, gateway_admission_status, gateway_ingress,
-                               mark_native_work_uncertain)
+                               mark_native_work_uncertain, _ingress)
 from gateway.run import GatewayRunner
 from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
 from hermes_cli import goals, heartbeat, loops
@@ -61,7 +61,10 @@ async def test_cancelled_heartbeat_refund_keeps_physical_writer_owned(native, mo
     monkeypatch.setattr(native.db, 'set_meta', held)
     storage_fault(native.db, key, fault)
     try:
-        settle_heartbeat_attempt(native.runner, SimpleNamespace(_heartbeat_execution_started=False), mgr)
+        with gateway_ingress(native.runner):
+            # Explicit no-effect admission-refusal fixture; false core entry alone proves nothing.
+            settle_heartbeat_attempt(native.runner, SimpleNamespace(_heartbeat_execution_started=False), mgr,
+                                     effects=_ingress.get().effects, refund_proven=True)
         task = next(iter(native.runner._deferred_agent_workers))
         await asyncio.wait_for(entered.wait(), 5)
         native.runner._ingress_barrier.close()
@@ -100,7 +103,9 @@ async def test_heartbeat_refund_cancelled_before_first_step_retains_claim_unknow
     mgr = heartbeat.HeartbeatManager(sid, strict=True)
     assert mgr.due_prompt()
     charged = native.db.get_meta(key)
-    settle_heartbeat_attempt(native.runner, SimpleNamespace(_heartbeat_execution_started=False), mgr)
+    with gateway_ingress(native.runner):
+        settle_heartbeat_attempt(native.runner, SimpleNamespace(_heartbeat_execution_started=False), mgr,
+                                 effects=_ingress.get().effects, refund_proven=True)
     task = next(iter(native.runner._deferred_agent_workers))
     native.runner._ingress_barrier.close()
     task.cancel()

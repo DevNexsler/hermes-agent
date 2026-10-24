@@ -76,7 +76,8 @@ async def test_cancelled_admission_is_refunded_but_started_execution_is_not():
 
 
 @pytest.mark.asyncio
-async def test_runner_rejection_does_not_consume_tick_or_overwrite_replacement():
+@pytest.mark.parametrize('replacement', [False, True])
+async def test_missing_entry_retains_tick_unknown_without_overwriting_replacement(replacement):
     runner = object.__new__(GatewayRunner)
     runner._running, runner._draining = True, False
     initialize_gateway_admission(runner)
@@ -92,6 +93,8 @@ async def test_runner_rejection_does_not_consume_tick_or_overwrite_replacement()
     await runner._warm_goals_session_db('test')
 
     async def denied(event):
+        if replacement:
+            HeartbeatManager('rejected-test').set('replacement', 120)
         return 'not authorized'
 
     adapter.set_message_handler(denied)
@@ -99,15 +102,7 @@ async def test_runner_rejection_does_not_consume_tick_or_overwrite_replacement()
     await runner._heartbeat_poll_once(watch)
     await asyncio.gather(*adapter._background_tasks)
     await settle_storage(runner)
-    assert HeartbeatManager('rejected-test').state.fire_count == 0
-
-    async def replaced(event):
-        HeartbeatManager('rejected-test').set('replacement', 120)
-        return None
-
-    adapter.set_message_handler(replaced)
-    await runner._heartbeat_poll_once(watch)
-    await asyncio.gather(*adapter._background_tasks)
-    await settle_storage(runner)
     state = HeartbeatManager('rejected-test').state
-    assert state.prompt == 'replacement' and state.fire_count == 0
+    assert state.prompt == ('replacement' if replacement else 'check')
+    assert state.fire_count == (0 if replacement else 1)
+    assert runner._ingress_barrier._uncertain_work

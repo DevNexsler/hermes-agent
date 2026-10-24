@@ -586,6 +586,20 @@ typed refusal after effects propagates generic uncertainty. This deliberately ti
 untyped `WakeNotAccepted` refund. Compression transfer reads back both final rows after both writes,
 so a parent-clear trigger cannot invalidate an earlier child readback unnoticed.
 
+Heartbeat settlement likewise owns the actual Base task through termination. Missing core entry
+does not prove no effects: processing hooks, turn preparation or `agent:start` hooks may already
+have run. Their cancellation or failure retains the charged heartbeat and closes readiness UNKNOWN;
+reopening cannot replay that attempt. This intentionally replaces the old denial-text refund.
+Only a positively typed pre-effect refusal or a Base task cancelled with unchanged no-effect
+history refunds the exact claim. A confirmed no-effect refund's strict physical writer stays owned
+after observer cancellation and marks storage failures UNKNOWN. Cancelling the observer before
+that writer starts closes UNKNOWN. These are process-local controls, not restart/bootstrap proof.
+
+Worker PID publication verifies final task/run rows after the resolving `spawned` receipt write,
+inside the same SQLite transaction. A receipt trigger cannot erase a fast-completed live child's
+run PID and commit a false resolution; failed readback rolls back receipt and PID writes, leaving
+the original pending launch, result and history retained as UNKNOWN.
+
 Queued goals also bind the originating conversation to the resolved/current route before preparation
 and again before actual entry. Only a verified compression tip with the identical migrated goal may
 continue along that lineage; reset, switch, suspension or unreadable lineage retains the old obligation

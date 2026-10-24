@@ -171,15 +171,8 @@ class GatewayGoalsMixin:
         # non-internal so authorization and the emergency stop still apply.
         event._heartbeat_session_id = session_id
         # Recheck above after the off-thread durable claim; a human keeps the idle boundary.
-        try:
-            await adapter.handle_message(event)
-        finally:
-            task = getattr(adapter, "_session_tasks", {}).get(quick_key)
-            if task is not None:
-                from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
-                task.add_done_callback(lambda done: settle_heartbeat_attempt(self, event, mgr))
-            elif quick_key not in adapter._active_sessions:
-                await self._run_in_executor_with_context(mgr.abandon_fire)
+        from gateway.run_heartbeat_acceptance import dispatch_heartbeat_attempt
+        await dispatch_heartbeat_attempt(self, event, mgr, adapter, quick_key)
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
