@@ -1494,12 +1494,13 @@ class GoalManager:
         self._save()
         return True
 
-    def is_waiting(self) -> bool:
+    def is_waiting(self, *, clear_satisfied: bool = True) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
         (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
         also expires after ``_MAX_BARRIER_WAIT_S``: a watcher or poller that never exits would
         otherwise park the goal indefinitely (one run sat 3 h 22 min on a poller that outlived
-        the work it was polling)."""
+        the work it was polling). Observers pass ``clear_satisfied=False`` so a
+        cached snapshot cannot overwrite concurrent user control."""
         s = self._state
         if s is None:
             return False
@@ -1520,7 +1521,7 @@ class GoalManager:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
             still = False
-        if not still:
+        if not still and clear_satisfied:
             self.stop_waiting()
         return still
 

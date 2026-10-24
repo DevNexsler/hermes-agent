@@ -442,6 +442,11 @@ class GatewayGoalsMixin:
         checkpoint = getattr(event, '_goal_admission_checkpoint', None)
         if checkpoint is None:
             return False
+        if checkpoint.get('maintenance_retained'):
+            return True
+        if checkpoint.get('maintenance_started'):
+            self._ingress_barrier.fail_quiescence()
+            raise RuntimeError('accepted goal preservation already started; inspect owned attempt')
         from gateway.run import _async_profile_runtime_scope
         home = self._resolve_profile_home_for_source(event.source)
         async with _async_profile_runtime_scope(home, offload=self._run_in_executor_with_context):
@@ -462,7 +467,7 @@ class GatewayGoalsMixin:
             inputs['origin_session_id'] = checkpoint['session_id']
             retained = await self._defer_goal_for_maintenance(
                 mgr, event.source, event.text, checkpoint['final_response'], expected_goal=expected,
-                input_context=inputs, ownership_conflict=conflict)
+                input_context=inputs, ownership_conflict=conflict, admission_checkpoint=checkpoint)
             if retained:
                 checkpoint['maintenance_retained'] = True
             return retained
@@ -573,7 +578,7 @@ class GatewayGoalsMixin:
         # Count done tasks until terminal callback registers cleanup or confirms handoff.
         self._track_deferred_agent_worker(task, None)
 
-    async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None, expected_goal=None, ownership_conflict=None):
+    async def _defer_goal_for_maintenance(self, mgr, source, prompt, final_response, *, input_context=None, expected_goal=None, ownership_conflict=None, admission_checkpoint=None):
         """Retain a not-yet-started continuation as an owned, actionable maintenance checkpoint."""
         barrier = getattr(self, '_ingress_barrier', None)
         closed = (getattr(self, '_draining', False) or getattr(self, '_external_drain_active', False)
@@ -595,7 +600,23 @@ class GatewayGoalsMixin:
                 logger.error('Goal maintenance checkpoint unconfirmed for %s; quiescence blocked',
                              mgr.session_id, exc_info=True)
                 raise
-        receipt = await self._run_in_executor_with_context(pause)
+        if admission_checkpoint is not None:
+            if admission_checkpoint.get('maintenance_retained'):
+                return True
+            if admission_checkpoint.get('maintenance_started'):
+                barrier.fail_quiescence()
+                raise RuntimeError('accepted goal preservation already started; inspect owned attempt')
+            # All pre-entry and terminal callers share this envelope. Mark before
+            # launching physical storage work; cancellation cannot authorize another writer.
+            admission_checkpoint['maintenance_started'] = True
+        try:
+            receipt = await self._run_in_executor_with_context(pause)
+        except BaseException:
+            if barrier is not None:
+                barrier.fail_quiescence()
+            raise
+        if admission_checkpoint is not None:
+            admission_checkpoint['maintenance_retained'] = True
         if not receipt['pause_applied']:
             if barrier is not None:
                 barrier.fail_quiescence()

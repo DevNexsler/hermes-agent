@@ -351,7 +351,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 check=False,
             )
             if proc.returncode != 0:
-                return False
+                return True  # Failed secondary query cannot overturn positive PID existence.
             if "Z" in (proc.stdout or "").strip():
                 return False
         except (OSError, subprocess.SubprocessError, TimeoutError):

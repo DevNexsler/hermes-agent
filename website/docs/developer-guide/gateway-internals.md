@@ -395,6 +395,17 @@ closes UNKNOWN before preserving its exact maintenance handoff; it is never sile
 Ordinary unleased human hook skips retain their existing behavior. Physical receipt writers stay
 owned after waiter cancellation. These controls provide no restart or business-completion proof.
 
+Every pre-entry and terminal preservation path shares one attempt witness on the accepted goal
+envelope, set before physical receipt storage starts. Cancellation cannot authorize a second
+writer, including cancellation of Base's first check, the post-`agent:start` check, or a later
+capacity refusal. Confirmed retention is idempotent; an unconfirmed started attempt stays UNKNOWN.
+Automatic loop/goal mixing checks inspect satisfied waits without clearing or saving cached goal
+state. User pause/clear remains authoritative; normal goal evaluation keeps its existing CAS.
+Native worker liveness keeps a positive PID-existence result when a secondary macOS `ps` query
+fails. A failed or empty query cannot authorize terminal-worker cleanup; a confirmed zombie or
+observed exit keeps the existing cleanup contract. Native macOS fault-path qualification remains
+required separately from Linux tests.
+
 These pauses never resume automatically. Before fence release, the maintenance owner must inventory
 every profile's receipts and leave a named, actionable `/goal resume` handoff. A rollout must not
 resume user/foreign/changed pauses. No automatic maintenance-resume API is supplied here; source

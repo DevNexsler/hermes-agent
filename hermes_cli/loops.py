@@ -651,7 +651,7 @@ def goal_blocks_loop_tick(session_id: str, *, strict: bool = False) -> bool:
         from hermes_cli.goals import GoalManager
 
         mgr = GoalManager(session_id=session_id, strict=strict)
-        return mgr.is_active() and not mgr.is_waiting()
+        return mgr.is_active() and not mgr.is_waiting(clear_satisfied=False)
     except Exception:
         if strict:
             from gateway.admission import mark_native_work_uncertain
