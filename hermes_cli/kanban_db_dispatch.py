@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -364,6 +365,18 @@ def _pid_alive(pid: Optional[int]) -> bool:
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
 
+def _worker_fingerprint_parts(value):
+    """Partial epoch witnesses cannot prove identity or replacement across restarts."""
+    try:
+        epoch, start = value.rsplit('|', 1)
+        boot, pid1 = epoch.rsplit(':', 1)
+        if not pid1.isdecimal() or not start.isdecimal():
+            return None
+        return uuid.UUID(boot), int(pid1), int(start)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _process_fingerprint(pid: int) -> Optional[str]:
     """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
     time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
@@ -375,7 +388,8 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     start = get_process_start_time(int(pid))
     if start is None:
         return None
-    return f"{current_instantiation_epoch()}|{start}"
+    value = f"{current_instantiation_epoch()}|{start}"
+    return value if _worker_fingerprint_parts(value) is not None else None
 
 
 def _worker_alive(pid: Optional[int], started_at) -> bool:
@@ -401,8 +415,9 @@ def _pid_recycled(pid: Optional[int], started_at) -> Optional[bool]:
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return None
     if isinstance(started_at, str) and "|" in started_at:
-        current = _process_fingerprint(int(pid))
-        return None if current is None else current != started_at
+        recorded = _worker_fingerprint_parts(started_at)
+        current = _worker_fingerprint_parts(_process_fingerprint(int(pid)))
+        return None if recorded is None or current is None else current != recorded
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:

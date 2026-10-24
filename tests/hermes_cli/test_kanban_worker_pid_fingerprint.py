@@ -95,7 +95,7 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     assert kbd._worker_alive(os.getpid(), live_fingerprint) is True
 
     # Same PID, same start tick, different boot identity.
-    other_boot = "deadbeef-boot:1|" + live_fingerprint.split("|", 1)[1]
+    other_boot = "00000000-0000-4000-8000-000000000001:1|" + live_fingerprint.split("|", 1)[1]
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?", (other_boot, tid))
     assert kbd._worker_alive(os.getpid(), other_boot) is False

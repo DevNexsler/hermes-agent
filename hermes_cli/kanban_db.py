@@ -1884,6 +1884,8 @@ def add_attachment(
     now = int(time.time())
     with write_txn(conn):
         _require_task(conn, task_id)
+        if not Path(stored_path).is_file():
+            raise ValueError('attachment blob missing or unreadable; no reference recorded')
         cur = conn.execute(
             "INSERT INTO task_attachments "
             "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
@@ -4300,6 +4302,7 @@ def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[
     ``--log-retention-days 0`` to "disabled" before calling this.
     """
     older_than_seconds = _retention_seconds(older_than_seconds)
+    board = _normalize_board_slug(board) or get_current_board()
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0

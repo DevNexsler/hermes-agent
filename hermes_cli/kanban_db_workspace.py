@@ -35,14 +35,14 @@ def delete_attachment(conn, attachment_id):
             return None
         require_settled_task_ownership(conn, att.task_id)
         conn.execute('DELETE FROM task_attachments WHERE id=?', (attachment_id,))
-        has_reference = conn.execute('SELECT 1 FROM task_attachments WHERE stored_path=? LIMIT 1',
-                                     (att.stored_path,)).fetchone() is not None
+        path = Path(att.stored_path)
+        has_reference = any(Path(row[0]).resolve() == path.resolve()
+                            for row in conn.execute('SELECT stored_path FROM task_attachments'))
         _kb._append_event(conn, att.task_id, 'attachment_removed', {'filename': att.filename})
-    if not has_reference:
-        with contextlib.suppress(OSError):
-            path = Path(att.stored_path)
-            if path.is_file():
-                path.unlink()
+        if not has_reference:
+            with contextlib.suppress(OSError):
+                if path.is_file():
+                    path.unlink()
     return att
 
 

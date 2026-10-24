@@ -262,7 +262,9 @@ body and hoping it finds them.
   link and a remove (×) control. Removing an attachment deletes its
   metadata row; the on-disk file is deleted only when no other attachment
   row still references it (a file shared by several tasks stays until its
-  last reference is removed). From the CLI, `hermes kanban attach-rm
+  last reference is removed). Registration and removal serialize through the
+  board database; registering a missing blob refuses without recording a reference.
+  From the CLI, `hermes kanban attach-rm
   ATTACHMENT_ID` removes an attachment the same way.
 
 :::note Remote terminal backends

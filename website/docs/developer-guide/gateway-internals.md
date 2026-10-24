@@ -574,6 +574,10 @@ The same retained set protects events, current/rotated logs, attachment removal 
 including ancestor handoffs and the completion-before-physical-exit window. Unreadable process
 fingerprints retain ownership without authorizing signals or automatic reclaim. Log GC refuses a
 database override that differs from the log board, and never creates a missing ownership database.
+Both persisted and current composed worker fingerprints require complete boot-ID/PID1/start witnesses;
+partial epochs remain unknown. Log GC pins the effective board before selecting logs and database.
+Attachment reference checks and unlink share the writer transaction, including legacy path aliases;
+a registration queued behind deletion refuses a missing blob before recording metadata or history.
 Any notification attention (including malformed/foreign)
 also keeps strict readiness UNKNOWN across restart. Normal completion/archive semantics remain;
 ordinary settled deletion/GC becomes eligible after physical ownership and attention both settle.
